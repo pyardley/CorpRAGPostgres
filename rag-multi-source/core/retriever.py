@@ -17,6 +17,7 @@ def build_filter(
     project_keys: Optional[list[str]] = None,
     space_keys: Optional[list[str]] = None,
     db_names: Optional[list[str]] = None,
+    git_branches: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """
     Construct a Pinecone metadata filter dict.
@@ -38,6 +39,8 @@ def build_filter(
         sub_conditions.append({"space_key": {"$in": space_keys}})
     if db_names:
         sub_conditions.append({"db_name": {"$in": db_names}})
+    if git_branches:
+        sub_conditions.append({"branch": {"$in": git_branches}})
 
     if sub_conditions:
         if len(sub_conditions) == 1:
@@ -55,6 +58,7 @@ def retrieve(
     project_keys: Optional[list[str]] = None,
     space_keys: Optional[list[str]] = None,
     db_names: Optional[list[str]] = None,
+    git_branches: Optional[list[str]] = None,
     top_k: int = 8,
 ) -> list[Document]:
     """
@@ -72,6 +76,7 @@ def retrieve(
         project_keys=project_keys,
         space_keys=space_keys,
         db_names=db_names,
+        git_branches=git_branches,
     )
 
     logger.debug("Retrieval filter: {}", filt)

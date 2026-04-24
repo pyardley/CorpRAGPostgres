@@ -72,6 +72,10 @@ def _build_source_label(n: int, meta: dict[str, Any]) -> str:
         obj = meta.get("object_name", "")
         obj_type = meta.get("object_type", "object").upper()
         return f"SQL Server • {db} • {obj} ({obj_type})"
+    if src == "git":
+        repo = meta.get("repo_name", "")
+        git_type = meta.get("git_type", "")
+        return f"Git • {repo} • {title} ({git_type})"
     return title
 
 
@@ -111,6 +115,21 @@ def _render_citations(sources: list[dict[str, Any]]) -> None:
             obj_name = src.get("object_name", "")
             st.markdown(f"**[{n}]** 🟠 `{db}` › `{obj_name}` ({obj_type})")
 
+        elif source_type == "git":
+            repo = src.get("repo_name", "")
+            git_type = src.get("git_type", "")
+            sha = src.get("sha", "")
+            file_path = src.get("file_path", "")
+            branch = src.get("branch", "")
+            if git_type == "commit":
+                label = f"`{sha}` {title}"
+            else:
+                label = f"`{file_path}` @ `{branch}`"
+            if url:
+                st.markdown(f"**[{n}]** 🟣 [{label}]({url}) `{repo}`")
+            else:
+                st.markdown(f"**[{n}]** 🟣 {label} `{repo}`")
+
         else:
             st.markdown(f"**[{n}]** {title}")
 
@@ -129,6 +148,7 @@ def answer_query(
     project_keys = None if state.jira_projects == ["all"] else state.jira_projects
     space_keys = None if state.confluence_spaces == ["all"] else state.confluence_spaces
     db_names = None if state.sql_databases == ["all"] else state.sql_databases
+    git_branches = None if state.git_branches == ["all"] else state.git_branches
     sources = state.sources if state.sources else None
 
     from app.config import settings
@@ -140,6 +160,7 @@ def answer_query(
         project_keys=project_keys,
         space_keys=space_keys,
         db_names=db_names,
+        git_branches=git_branches,
         top_k=settings.TOP_K,
     )
 
@@ -180,6 +201,8 @@ def render_chat(state: SelectionState) -> None:
             badge_parts.append("🟢 Confluence")
         if "sql" in state.sources:
             badge_parts.append("🟠 SQL Server")
+        if "git" in state.sources:
+            badge_parts.append("🟣 Git")
         st.caption("Searching across: " + " · ".join(badge_parts))
     else:
         st.warning("No data sources selected. Enable at least one source in the sidebar.")

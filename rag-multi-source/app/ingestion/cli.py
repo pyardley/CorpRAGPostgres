@@ -59,6 +59,9 @@ def _get_ingestor(source: str, user_id: str):
         return ConfluenceIngestor(user_id=user_id, credentials=creds)
     if source == "sql":
         return SQLIngestor(user_id=user_id, credentials=creds)
+    if source == "git":
+        from app.ingestion.git_ingestor import GitIngestor
+        return GitIngestor(user_id=user_id, credentials=creds)
 
     raise ValueError(f"Unknown source: {source}")
 
@@ -69,7 +72,7 @@ def run_ingestion(
     mode: str,
     scope: str,
 ) -> None:
-    ALL_SOURCES = ["jira", "confluence", "sql"]
+    ALL_SOURCES = ["jira", "confluence", "sql", "git"]
     sources_to_run = ALL_SOURCES if source == "all" else [source]
 
     for src in sources_to_run:
@@ -94,7 +97,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--source",
-        choices=["jira", "confluence", "sql", "all"],
+        choices=["jira", "confluence", "sql", "git", "all"],
         required=True,
         help="Which source to ingest (use 'all' for every source).",
     )

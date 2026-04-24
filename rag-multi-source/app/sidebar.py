@@ -23,6 +23,7 @@ class SelectionState:
     jira_projects: list[str] = field(default_factory=lambda: ["all"])
     confluence_spaces: list[str] = field(default_factory=lambda: ["all"])
     sql_databases: list[str] = field(default_factory=lambda: ["all"])
+    git_branches: list[str] = field(default_factory=lambda: ["all"])
 
 
 # ── Cache dynamic lists from APIs ─────────────────────────────────────────────
@@ -66,6 +67,20 @@ def _cached_sql_databases(user_id: str) -> list[dict]:
         return SQLIngestor(user_id=user_id, credentials=creds).list_scopes()
     except Exception as exc:
         logger.warning("Could not load SQL databases: {}", exc)
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_git_branches(user_id: str) -> list[dict]:
+    try:
+        from app.ingestion.git_ingestor import GitIngestor
+        with get_db() as db:
+            creds = load_all_credentials(db, user_id, "git")
+        if not creds:
+            return []
+        return GitIngestor(user_id=user_id, credentials=creds).list_scopes()
+    except Exception as exc:
+        logger.warning("Could not load Git branches: {}", exc)
         return []
 
 
@@ -147,6 +162,7 @@ def render_sidebar() -> SelectionState:
         use_jira = st.checkbox("Jira", value=True)
         use_confluence = st.checkbox("Confluence", value=True)
         use_sql = st.checkbox("SQL Server", value=True)
+        use_git = st.checkbox("Git", value=True)
 
         if use_jira:
             state.sources.append("jira")
@@ -154,6 +170,8 @@ def render_sidebar() -> SelectionState:
             state.sources.append("confluence")
         if use_sql:
             state.sources.append("sql")
+        if use_git:
+            state.sources.append("git")
 
         st.divider()
 
@@ -211,11 +229,29 @@ def render_sidebar() -> SelectionState:
                 else:
                     st.caption("No databases found. Configure credentials below.")
 
+        # ── Git scope ─────────────────────────────────────────────────────────
+        if use_git:
+            with st.expander("🟣 Git scope", expanded=True):
+                branches = _cached_git_branches(user["id"])
+                if branches:
+                    branch_options = ["all"] + [b["key"] for b in branches]
+                    branch_labels = ["All branches"] + [b["name"] for b in branches]
+                    idx = st.multiselect(
+                        "Branches",
+                        options=branch_options,
+                        default=["all"],
+                        format_func=lambda k: branch_labels[branch_options.index(k)],
+                        key="git_scope",
+                    )
+                    state.git_branches = idx if idx else ["all"]
+                else:
+                    st.caption("No branches found. Configure credentials below.")
+
         st.divider()
 
         # ── Credential settings ───────────────────────────────────────────────
         with st.expander("🔑 Credentials & Settings"):
-            tab_j, tab_c, tab_s = st.tabs(["Jira", "Confluence", "SQL"])
+            tab_j, tab_c, tab_s, tab_g = st.tabs(["Jira", "Confluence", "SQL", "Git"])
 
             with tab_j:
                 _credential_form(
@@ -277,6 +313,27 @@ def render_sidebar() -> SelectionState:
                             "Connection string (e.g. DRIVER={ODBC Driver 18 for SQL Server};SERVER=...;UID=...;PWD=...)",
                             True,
                         ),
+                    ],
+                )
+
+            with tab_g:
+                st.caption(
+                    "Connect to a GitHub repository. For **private** repos, create a "
+                    "Personal Access Token (classic) at "
+                    "github.com → Settings → Developer settings → Personal access tokens "
+                    "with **repo** scope."
+                )
+                _credential_form(
+                    "git",
+                    [
+                        ("url", "GitHub repository URL (e.g. https://github.com/owner/repo)", False),
+                        ("access_token", "Personal Access Token (required for private repos)", True),
+                        (
+                            "file_extensions",
+                            "File extensions to index, comma-separated (default: .py .md .txt .yml .yaml .json)",
+                            False,
+                        ),
+                        ("max_commits", "Max commits to index (default: 200)", False),
                     ],
                 )
 
