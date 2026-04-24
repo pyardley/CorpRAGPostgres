@@ -1,0 +1,37 @@
+# Secrets and local config
+.env
+*.db
+*.sqlite3
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Diagnostic / one-off scripts
+_diag*.py
+import_chroma_ts.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker volumes / data
+data/

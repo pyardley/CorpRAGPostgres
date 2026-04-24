@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Persist the SQLite database outside the container
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: sqlite:////app/data/rag_system.db
+    restart: unless-stopped
+
+  # Optional: scheduled incremental ingestion via cron-like service
+  # Uncomment and customise to run ingestion on a schedule.
+  #
+  # ingestor:
+  #   build: .
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #   environment:
+  #     DATABASE_URL: sqlite:////app/data/rag_system.db
+  #   command: >
+  #     sh -c "while true; do
+  #       python -m app.ingestion.cli
+  #         --source all
+  #         --mode incremental
+  #         --email $$INGEST_USER_EMAIL
+  #         --password $$INGEST_USER_PASSWORD;
+  #       sleep 3600;
+  #     done"
+  #   environment:
+  #     INGEST_USER_EMAIL: admin@example.com
+  #     INGEST_USER_PASSWORD: ""   # set in .env
+  #   restart: unless-stopped

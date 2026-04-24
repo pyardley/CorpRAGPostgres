@@ -1,0 +1,55 @@
+# Python 3.11 or 3.12 required.
+# The LangChain / Pinecone ecosystem does not yet support Python 3.13+.
+
+# ── Core framework ─────────────────────────────────────────────────────────
+streamlit>=1.40.0,<2.0
+python-dotenv>=1.0.1
+loguru>=0.7.2
+pydantic-settings>=2.6.1,<3.0
+pydantic>=2.9.2,<3.0
+tenacity>=9.0.0,<10.0
+
+# ── LangChain ecosystem ────────────────────────────────────────────────────
+langchain>=0.3.7,<0.4
+langchain-community>=0.3.7,<0.4
+langchain-openai>=0.2.12,<0.3
+langchain-anthropic>=0.2.4,<0.3
+langchain-pinecone>=0.2.0,<0.3
+langchain-huggingface>=0.1.2,<0.2
+
+# ── Vector DB ──────────────────────────────────────────────────────────────
+pinecone>=5.0.0,<6.0
+
+# ── Embeddings ─────────────────────────────────────────────────────────────
+openai>=1.57.0,<2.0
+tiktoken>=0.8.0
+sentence-transformers>=3.3.0
+
+# ── LLM clients ────────────────────────────────────────────────────────────
+anthropic>=0.40.0,<1.0
+
+# ── Atlassian (Jira + Confluence) ──────────────────────────────────────────
+atlassian-python-api>=3.41.0
+
+# ── Database ───────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.36,<3.0
+alembic>=1.14.0,<2.0
+
+# ── SQL Server driver ──────────────────────────────────────────────────────
+pyodbc>=5.1.0
+
+# ── Security ───────────────────────────────────────────────────────────────
+cryptography>=43.0.0
+bcrypt>=4.2.0
+
+# ── HTTP ───────────────────────────────────────────────────────────────────
+httpx>=0.28.0
+requests>=2.32.0
+
+# ── HTML/content parsing ───────────────────────────────────────────────────
+beautifulsoup4>=4.12.0
+lxml>=5.3.0
+markdownify>=0.14.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────
+python-dateutil>=2.9.0
