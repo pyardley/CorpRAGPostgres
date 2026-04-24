@@ -89,14 +89,19 @@ the second site requires different credentials.
 Required for private repositories. Public repositories can be indexed without a token, but
 providing one avoids rate limiting.
 
-1. Go to github.com → **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**.
-2. Click **Generate new token (classic)**.
-3. Give it a descriptive name (e.g. "CorporateRAG") and set an expiry.
-4. Under **Select scopes**, tick **repo** (grants read access to private repos).
-5. Click **Generate token** and copy it immediately — it won't be shown again.
-6. Paste it into the **Git** credentials tab in the sidebar as **Personal Access Token**.
+1. On any GitHub page, click your **profile picture** in the top-right corner.
+2. Click **Settings** (this opens your account settings — not the repository settings).
+3. Scroll to the bottom of the left sidebar and click **Developer settings**.
+4. Click **Personal access tokens** → **Tokens (classic)**.
+5. Click **Generate new token** → **Generate new token (classic)**.
+6. Give it a name (e.g. "CorporateRAG"), set an expiry, and tick the **repo** checkbox under Select scopes.
+7. Click **Generate token** at the bottom and copy it immediately — it won't be shown again.
+8. Paste it into the **Git** credentials tab in the sidebar as **Personal Access Token**.
 
-For fine-grained tokens: create under **Fine-grained tokens**, select the target repository,
+> The direct URL is `https://github.com/settings/tokens` — note this is `github.com/settings`,
+> not the repository's own settings page.
+
+For fine-grained tokens: use **Fine-grained tokens** instead, select the target repository,
 and grant **Contents: Read-only** permission.
 
 ---
