@@ -1,6 +1,6 @@
 # CorporateRAG
 
-A production-ready, multi-source RAG (Retrieval-Augmented Generation) system that lets your team ask natural-language questions across **Jira**, **Confluence**, and **SQL Server** — all from a clean Streamlit chat interface.
+A production-ready, multi-source RAG (Retrieval-Augmented Generation) system that lets your team ask natural-language questions across **Jira**, **Confluence**, **SQL Server**, and **Git repositories** — all from a clean Streamlit chat interface.
 
 ---
 
@@ -9,13 +9,13 @@ A production-ready, multi-source RAG (Retrieval-Augmented Generation) system tha
 ```
 User → Streamlit UI
          │
-         ├─ Sidebar: source/project selection, credential setup, ingestion controls
+         ├─ Sidebar: source/project/branch selection, credential setup, ingestion controls
          │
          └─ Chat: query → Pinecone retrieval (filtered by user + source + scope)
                          → LLM (OpenAI / Anthropic / Grok)
                          → Answer with clickable source citations
 
-Ingestion CLI → Jira API / Confluence API / SQL Server
+Ingestion CLI → Jira API / Confluence API / SQL Server / GitHub API
               → Chunk + embed (OpenAI or HuggingFace)
               → Pinecone serverless index (one shared index, metadata-filtered)
               → SQLite ingestion log (tracks last-modified timestamps)
@@ -29,12 +29,13 @@ Ingestion CLI → Jira API / Confluence API / SQL Server
 
 | Requirement                                                                 | Free tier?            |
 | --------------------------------------------------------------------------- | --------------------- |
-| Python 3.11+                                                                | ✅                    |
+| Python 3.11+ (3.12 recommended)                                             | ✅                    |
 | [Pinecone account](https://www.pinecone.io/) – Serverless Starter           | ✅ Free               |
 | OpenAI API key (embeddings + LLM) **or** HuggingFace (zero-cost embeddings) | 💰 ~$0.10 / 1M tokens |
 | Atlassian Cloud account (Jira + Confluence)                                 | Existing              |
 | SQL Server (any edition, including Express)                                 | Existing              |
 | ODBC Driver 17 or 18 for SQL Server                                         | ✅ Free               |
+| GitHub account + Personal Access Token (for Git source)                     | ✅ Free               |
 
 ---
 
@@ -74,6 +75,29 @@ Copy everything up to (but **not** including) `/wiki`, for example:
 https://yoursite-1234567890.atlassian.net
 ```
 This may be different from your Jira URL — do not assume they are the same.
+
+**Multiple Confluence instances:**
+If your content spans two Atlassian sites (e.g. a legacy instance and a newer one), expand
+**Additional Confluence instance (optional)** in the sidebar's Confluence credentials tab and
+enter the second site's URL. The primary email and API token are reused automatically unless
+the second site requires different credentials.
+
+---
+
+### GitHub Personal Access Token (Git source)
+
+Required for private repositories. Public repositories can be indexed without a token, but
+providing one avoids rate limiting.
+
+1. Go to github.com → **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**.
+2. Click **Generate new token (classic)**.
+3. Give it a descriptive name (e.g. "CorporateRAG") and set an expiry.
+4. Under **Select scopes**, tick **repo** (grants read access to private repos).
+5. Click **Generate token** and copy it immediately — it won't be shown again.
+6. Paste it into the **Git** credentials tab in the sidebar as **Personal Access Token**.
+
+For fine-grained tokens: create under **Fine-grained tokens**, select the target repository,
+and grant **Contents: Read-only** permission.
 
 ---
 
@@ -120,6 +144,7 @@ Use `ODBC Driver 17` in the string if that is the version you have installed. Th
 ```bash
 git clone <repo-url> corporaterag
 cd corporaterag/rag-multi-source
+
 # Python 3.12 is strongly recommended. The LangChain/Pinecone ecosystem
 # does not yet support Python 3.13+. Install 3.12 with:
 #   winget install Python.Python.3.12   (Windows, then reopen terminal)
@@ -193,18 +218,32 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 1. Click "Create account" and register with your email.
 2. Expand **🔑 Credentials & Settings** in the sidebar.
-3. Enter credentials for each source:
-   - **Jira**: your Jira site URL (e.g. `https://yoursite.atlassian.net`), email, and API token.
-   - **Confluence**: your **Confluence** site URL — this can differ from the Jira URL. Find it in
-     your browser while viewing any Confluence page and copy everything up to (but **not**
-     including) `/wiki`. Example: `https://yoursite-1234567890.atlassian.net`. Do not include `/wiki`.
-   - **SQL Server**: see below.
-4. For SQL Server, enter a pyodbc connection string, e.g.:
-   ```
-   DRIVER=DRIVER={ODBC Driver 18 for SQL Server};SERVER=DESKTOP-FA67GSO\MSSQLSERVER01;Trusted_Connection=yes;TrustServerCertificate=yes;Encrypt=yes
-   ```
-5. Run an initial ingestion (see below).
-6. Start chatting!
+3. Enter credentials for each source you want to use:
+
+   **Jira tab**
+   - Site URL: `https://yourorg.atlassian.net`
+   - Atlassian account email
+   - API token (see Prerequisites above)
+
+   **Confluence tab**
+   - Site URL: everything up to but **not** including `/wiki`, e.g. `https://yourorg-1234567890.atlassian.net`
+   - Atlassian account email and API token
+   - If you have a second Atlassian instance, expand **Additional Confluence instance** and enter only its URL (credentials are reused automatically)
+
+   **SQL tab**
+   - Full pyodbc connection string, e.g.:
+     ```
+     DRIVER={ODBC Driver 18 for SQL Server};SERVER=MYPC\SQLEXPRESS;Trusted_Connection=yes;TrustServerCertificate=yes
+     ```
+
+   **Git tab**
+   - GitHub repository URL, e.g. `https://github.com/yourorg/yourrepo`
+   - Personal Access Token with **repo** scope (required for private repos)
+   - File extensions to index (optional — defaults to `.py .md .txt .yml .yaml .json .js .ts .sh .sql`)
+   - Max commits to index (optional — defaults to 200)
+
+4. Run an initial ingestion (see below).
+5. Start chatting!
 
 ---
 
@@ -219,12 +258,16 @@ Ingestion is run via the CLI or triggered from the Streamlit UI sidebar (⚙️ 
 python -m app.ingestion.cli --source all --mode full --email you@company.com
 
 # One specific source
-python -m app.ingestion.cli --source jira --mode full --email you@company.com
+python -m app.ingestion.cli --source jira       --mode full --email you@company.com
+python -m app.ingestion.cli --source confluence --mode full --email you@company.com
+python -m app.ingestion.cli --source sql        --mode full --email you@company.com
+python -m app.ingestion.cli --source git        --mode full --email you@company.com
 
-# One specific project/space/database
-python -m app.ingestion.cli --source jira  --mode full --scope PROJ  --email you@company.com
-python -m app.ingestion.cli --source confluence --mode full --scope MYSPACE --email you@company.com
-python -m app.ingestion.cli --source sql   --mode full --scope mydb  --email you@company.com
+# Narrow to a specific project / space / database / branch
+python -m app.ingestion.cli --source jira       --mode full --scope PROJ     --email you@company.com
+python -m app.ingestion.cli --source confluence --mode full --scope MYSPACE  --email you@company.com
+python -m app.ingestion.cli --source sql        --mode full --scope mydb     --email you@company.com
+python -m app.ingestion.cli --source git        --mode full --scope main     --email you@company.com
 ```
 
 ### Incremental update (only new/changed items)
@@ -234,6 +277,10 @@ python -m app.ingestion.cli --source all --mode incremental --email you@company.
 ```
 
 Incremental mode reads the `last_item_updated_at` timestamp from the most recent successful ingestion log and fetches only items modified after that point.
+
+For the Git source, incremental mode fetches only commits pushed after the last ingestion.
+File contents are always re-indexed in full (files have no reliable modification timestamp
+via the GitHub API without per-file commit history lookups).
 
 ### Scheduled ingestion (Render.com free tier)
 
@@ -252,7 +299,7 @@ Incremental mode reads the `last_item_updated_at` timestamp from the most recent
 
 1. Push this repo to GitHub.
 2. Go to [share.streamlit.io](https://share.streamlit.io) → "New app".
-3. Set **Main file path** to `app/main.py`.
+3. Set **Main file path** to `rag-multi-source/app/main.py`.
 4. Add all `.env` variables as **Secrets** in the Streamlit Cloud UI.
 5. Deploy. The free tier provides 1 GB RAM and sleeps after inactivity.
 
@@ -274,8 +321,8 @@ Access at `http://localhost:8501`.
 ### Option C: Render.com Web Service
 
 1. Create a **Web Service** on Render, point to your GitHub repo.
-2. Set build command: `pip install -r requirements.txt`
-3. Set start command: `streamlit run app/main.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true`
+2. Set build command: `pip install -r rag-multi-source/requirements.txt`
+3. Set start command: `streamlit run rag-multi-source/app/main.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true`
 4. Add all env vars in the Render dashboard.
 5. For ODBC driver on Render, add a `build.sh` that installs `msodbcsql18` (see Dockerfile for the apt commands).
 
@@ -306,6 +353,15 @@ Access at `http://localhost:8501`.
 | `TOP_K`               |                 | Docs to retrieve per query (default: 8)  |
 | `SCORE_THRESHOLD`     |                 | Min cosine similarity (default: 0.35)    |
 
+**Source credentials** (stored encrypted in SQLite, entered via the sidebar — not in `.env`):
+
+| Source     | Credential keys                                                  |
+| ---------- | ---------------------------------------------------------------- |
+| Jira       | `url`, `email`, `api_token`                                      |
+| Confluence | `url`, `email`, `api_token` + optional `url_2` for a second site |
+| SQL Server | `conn_str` (full pyodbc connection string)                       |
+| Git        | `url`, `access_token`, `file_extensions`, `max_commits`         |
+
 ---
 
 ## Adding a New Data Source
@@ -314,49 +370,52 @@ Access at `http://localhost:8501`.
 2. Implement `list_scopes()` and `load_documents()`.
    - Each `Document.metadata` must include `user_id`, `source`, `title`, `url`, `last_updated`.
 3. Add a `_scope_filter()` override for full-load deletion.
-4. Register the new source in `app/ingestion/cli.py` (`_get_ingestor` function).
-5. Add a credential form tab in `app/sidebar.py` (`_credential_form` calls).
-6. Add citation rendering logic in `app/chat.py` (`_render_citations` function).
-7. Add `_cached_<source>_scopes()` in `app/sidebar.py` for dynamic dropdowns.
+4. Register the new source in `app/ingestion/cli.py` (`_get_ingestor` function and `ALL_SOURCES` list).
+5. Add a checkbox and scope expander in `app/sidebar.py`, a `_cached_<source>_scopes()` function, and a credentials tab.
+6. Add a `SelectionState` field and pass it through `answer_query` → `retrieve` → `build_filter` in `app/chat.py` and `core/retriever.py`.
+7. Add citation label and rendering logic in `app/chat.py` (`_build_source_label` and `_render_citations`).
 
 ---
 
 ## Project Structure
 
 ```
-rag-multi-source/
-├── app/
-│   ├── main.py               # Streamlit entry point
-│   ├── config.py             # All settings (pydantic-settings + .env)
-│   ├── auth.py               # Register / login / session
-│   ├── sidebar.py            # Source selection, credentials, ingestion UI
-│   ├── chat.py               # Chat logic, retrieval, LLM, citations
-│   ├── utils.py              # DB session, Fernet encryption helpers
-│   └── ingestion/
-│       ├── base.py           # Abstract BaseIngestor (chunk, embed, upsert)
-│       ├── jira_ingestor.py  # Jira issues + comments
-│       ├── confluence_ingestor.py  # Confluence pages
-│       ├── sql_ingestor.py   # Stored procs, functions, views, table schemas
-│       └── cli.py            # python -m app.ingestion.cli
-├── core/
-│   ├── vector_store.py       # Pinecone index lifecycle + helpers
-│   ├── retriever.py          # Metadata-filtered similarity search
-│   └── llm.py                # LLM + embeddings factory
-├── models/
-│   ├── base.py               # SQLAlchemy declarative base
-│   ├── user.py               # User + UserCredential (encrypted creds)
-│   └── ingestion_log.py      # Ingestion run log + timestamps
-├── requirements.txt
-├── .env.example
-├── Dockerfile
-└── docker-compose.yml
+CorporateRAG/
+├── .gitignore
+└── rag-multi-source/
+    ├── app/
+    │   ├── main.py                    # Streamlit entry point
+    │   ├── config.py                  # All settings (pydantic-settings + .env)
+    │   ├── auth.py                    # Register / login / session
+    │   ├── sidebar.py                 # Source selection, credentials, ingestion UI
+    │   ├── chat.py                    # Chat logic, retrieval, LLM, citations
+    │   ├── utils.py                   # DB session, Fernet encryption helpers
+    │   └── ingestion/
+    │       ├── base.py                # Abstract BaseIngestor (chunk, embed, upsert)
+    │       ├── cli.py                 # python -m app.ingestion.cli
+    │       ├── jira_ingestor.py       # Jira issues + comments (ADF body parsing)
+    │       ├── confluence_ingestor.py # Confluence pages; multi-instance support
+    │       ├── sql_ingestor.py        # Stored procs, functions, views, table schemas
+    │       └── git_ingestor.py        # GitHub commits + file contents via PyGithub
+    ├── core/
+    │   ├── vector_store.py            # Pinecone index lifecycle + helpers
+    │   ├── retriever.py               # Metadata-filtered similarity search
+    │   └── llm.py                     # LLM + embeddings factory
+    ├── models/
+    │   ├── base.py                    # SQLAlchemy declarative base
+    │   ├── user.py                    # User + UserCredential (encrypted creds)
+    │   └── ingestion_log.py           # Ingestion run log + timestamps
+    ├── requirements.txt
+    ├── .env.example
+    ├── Dockerfile
+    └── docker-compose.yml
 ```
 
 ---
 
 ## Security Notes
 
-- **Credentials** (Jira token, SQL connection string) are encrypted with Fernet (AES-128-CBC + HMAC) before being stored in SQLite. The key lives only in your `.env` / environment.
+- **Credentials** (API tokens, SQL connection strings, GitHub PATs) are encrypted with Fernet (AES-128-CBC + HMAC) before being stored in SQLite. The encryption key lives only in your `.env` / environment.
 - **Multi-tenancy**: every Pinecone vector carries `user_id` in metadata, and every retrieval query includes `{"user_id": {"$eq": current_user_id}}` — users are cryptographically isolated at the vector store level.
 - **Passwords** are hashed with bcrypt (cost factor 12).
-- Keep `ENCRYPTION_KEY` and `APP_SECRET_KEY` out of version control.
+- Keep `ENCRYPTION_KEY` and `APP_SECRET_KEY` out of version control. The `.gitignore` excludes `.env` and `*.db` by default.
