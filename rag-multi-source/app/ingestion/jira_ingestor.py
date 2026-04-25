@@ -1,213 +1,255 @@
-"""Jira ingestor – fetches issues (with comments) and indexes them."""
+"""
+Jira Cloud ingestor.
+
+resource_id format: ``jira:{ISSUE_KEY}``  (e.g. ``jira:PROJ-123``)
+resource_identifier (for the access table): the project key (e.g. ``PROJ``).
+
+Required credential keys (stored encrypted in user_credentials):
+  url        - e.g. ``https://your-org.atlassian.net``
+  email      - Atlassian account email
+  api_token  - https://id.atlassian.com/manage-profile/security/api-tokens
+"""
 
 from __future__ import annotations
 
-import time
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Iterable, Optional
 
-from langchain_core.documents import Document
+import requests
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.ingestion.base import BaseIngestor
-
-
-def _adf_to_text(node) -> str:
-    """
-    Recursively convert an Atlassian Document Format (ADF) node to plain text.
-    Jira Cloud returns description and comment bodies as ADF dicts, not strings.
-    Falls back gracefully if the value is already a string or empty.
-    """
-    if not node:
-        return ""
-    if isinstance(node, str):
-        return node
-
-    if not isinstance(node, dict):
-        return str(node)
-
-    node_type = node.get("type", "")
-
-    if node_type == "text":
-        return node.get("text", "")
-
-    if node_type == "hardBreak":
-        return "\n"
-
-    if node_type == "mention":
-        attrs = node.get("attrs", {})
-        return attrs.get("text", "@mention")
-
-    if node_type == "inlineCard":
-        attrs = node.get("attrs", {})
-        return attrs.get("url", "")
-
-    children = [_adf_to_text(c) for c in node.get("content", [])]
-
-    if node_type in ("paragraph", "heading"):
-        return "".join(children).strip()
-
-    if node_type in ("bulletList", "orderedList"):
-        return "\n".join(f"• {c.strip()}" for c in children if c.strip())
-
-    if node_type == "listItem":
-        return "".join(children).strip()
-
-    if node_type == "codeBlock":
-        return "```\n" + "".join(children) + "\n```"
-
-    if node_type == "blockquote":
-        return "> " + "\n> ".join("".join(children).splitlines())
-
-    # doc, table, tableRow, tableCell, etc. — join non-empty children
-    return "\n".join(c for c in children if c.strip())
+from app.ingestion.base import BaseIngestor, SourceResource
 
 
 class JiraIngestor(BaseIngestor):
-    SOURCE = "jira"
+    source = "jira"
+    PAGE_SIZE = 50
+    # Cap how many comments we embed per issue. Inline `comment` field returns
+    # at most 50 by default; we'll fetch more from the per-issue comment
+    # endpoint if there's overflow.
+    MAX_COMMENTS_PER_ISSUE = 200
 
-    # Fields to include in issue text
-    _INCLUDE_FIELDS = "summary,description,status,priority,issuetype,assignee,reporter,updated,comment"
+    # HTTP helpers
+    def _session(self) -> requests.Session:
+        session = requests.Session()
+        session.auth = (self.credentials["email"], self.credentials["api_token"])
+        session.headers.update(
+            {"Accept": "application/json", "Content-Type": "application/json"}
+        )
+        return session
 
-    def __init__(self, user_id: str, credentials: dict[str, str]) -> None:
-        super().__init__(user_id, credentials)
-        self._client = self._make_client()
+    def _base_url(self) -> str:
+        return self.credentials["url"].rstrip("/")
 
-    def _make_client(self):
-        from atlassian import Jira
+    # Abstract API
+    def scope_filter(self) -> dict[str, Any]:
+        if self.scope == "all":
+            return {"source": "jira"}
+        return {"source": "jira", "project_key": self.scope}
 
-        url = self.credentials.get("url", "")
-        email = self.credentials.get("email", "")
-        token = self.credentials.get("api_token", "")
+    def resource_identifier_for(self, resource: SourceResource) -> str:
+        return resource.metadata["project_key"]
 
-        if not all([url, email, token]):
-            raise ValueError("Jira credentials incomplete: need url, email, api_token.")
-
-        return Jira(url=url, username=email, password=token, cloud=True)
-
-    # ── Abstract implementations ──────────────────────────────────────────────
-
-    def list_scopes(self) -> list[dict[str, str]]:
-        """Return all projects the authenticated user can see."""
-        projects = self._client.get_all_projects()
-        return [{"key": p["key"], "name": p["name"]} for p in projects]
-
-    def load_documents(
-        self, scope_key: str, since: Optional[str] = None
-    ) -> list[Document]:
+    def fetch_resources(
+        self, since: Optional[datetime] = None
+    ) -> Iterable[SourceResource]:
         """
-        Load all issues from *scope_key* (or all projects if "all").
-        *since* is an ISO-8601 datetime string for incremental mode.
+        Iterate over matching issues using the new ``POST /rest/api/3/search/jql``
+        endpoint. Atlassian retired the legacy ``GET /rest/api/3/search`` (and
+        its ``startAt`` pagination) for Jira Cloud in May 2025 - calls return
+        ``410 Gone``. The new endpoint uses cursor pagination via
+        ``nextPageToken``.
         """
-        if scope_key == "all":
-            scopes = [s["key"] for s in self.list_scopes()]
-        else:
-            scopes = [scope_key]
-
-        docs: list[Document] = []
-        for proj_key in scopes:
-            docs.extend(self._load_project(proj_key, since))
-
-        return docs
-
-    # ── Per-project loading ───────────────────────────────────────────────────
-
-    def _load_project(self, project_key: str, since: Optional[str]) -> list[Document]:
-        jql = f"project = {project_key} ORDER BY updated DESC"
+        session = self._session()
+        jql_parts: list[str] = []
+        if self.scope != "all":
+            jql_parts.append(f'project = "{self.scope}"')
         if since:
-            # Jira uses "updated >= 'YYYY-MM-DD HH:MM'" format
-            since_fmt = since[:16].replace("T", " ")
-            jql = f"project = {project_key} AND updated >= '{since_fmt}' ORDER BY updated DESC"
+            iso = since.strftime("%Y-%m-%d %H:%M")
+            jql_parts.append(f'updated >= "{iso}"')
+        if not jql_parts:
+            jql_parts.append('created >= "1970-01-01"')
 
-        docs: list[Document] = []
-        start = 0
-        page_size = 50
+        jql = " AND ".join(jql_parts) + " ORDER BY updated DESC"
 
-        while True:
-            logger.debug("[jira] JQL={!r} start={}", jql, start)
-            response = self._safe_jql(jql, start, page_size)
-
-            issues = response.get("issues", [])
-            if not issues:
-                break
-
-            for issue in issues:
-                doc = self._issue_to_document(issue, project_key)
-                if doc:
-                    docs.append(doc)
-
-            total = response.get("total", 0)
-            start += len(issues)
-            if start >= total:
-                break
-
-            time.sleep(self.RATE_LIMIT_SLEEP)
-
-        logger.info("[jira] Loaded {} issues from project {}.", len(docs), project_key)
-        return docs
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _safe_jql(self, jql: str, start: int, limit: int) -> dict:
-        return self._client.jql(jql, limit=limit, start=start, fields=self._INCLUDE_FIELDS)
-
-    # ── Document conversion ───────────────────────────────────────────────────
-
-    def _issue_to_document(self, issue: dict, project_key: str) -> Optional[Document]:
-        fields = issue.get("fields", {})
-        key = issue.get("key", "")
-        summary = fields.get("summary", "(no summary)")
-        description = _adf_to_text(fields.get("description") or "")
-        status = (fields.get("status") or {}).get("name", "")
-        priority = (fields.get("priority") or {}).get("name", "")
-        issue_type = (fields.get("issuetype") or {}).get("name", "")
-        assignee_obj = fields.get("assignee") or {}
-        assignee = assignee_obj.get("displayName", "Unassigned")
-        reporter_obj = fields.get("reporter") or {}
-        reporter = reporter_obj.get("displayName", "")
-        updated = fields.get("updated", "")
-
-        # Collect comments
-        comment_texts: list[str] = []
-        comments_container = (fields.get("comment") or {})
-        for comment in comments_container.get("comments", []):
-            author = (comment.get("author") or {}).get("displayName", "")
-            body = _adf_to_text(comment.get("body", ""))
-            if body:
-                comment_texts.append(f"[Comment by {author}]: {body}")
-
-        base_url = self.credentials.get("url", "").rstrip("/")
-        url = f"{base_url}/browse/{key}"
-
-        text_parts = [
-            f"Jira Issue: {key}",
-            f"Summary: {summary}",
-            f"Type: {issue_type}  Status: {status}  Priority: {priority}",
-            f"Reporter: {reporter}  Assignee: {assignee}",
-            f"Description:\n{description}",
+        url = f"{self._base_url()}/rest/api/3/search/jql"
+        fields = [
+            "summary", "description", "status", "issuetype", "project",
+            "updated", "assignee", "reporter", "labels",
+            # `comment` returns the first ~50 comments inline. For tickets
+            # with more, _fetch_overflow_comments() fills in the rest from
+            # /rest/api/3/issue/{key}/comment.
+            "comment",
         ]
-        if comment_texts:
-            text_parts.append("Comments:\n" + "\n".join(comment_texts))
 
-        page_content = "\n\n".join(text_parts)
+        next_page_token: Optional[str] = None
+        while True:
+            body: dict[str, Any] = {
+                "jql": jql,
+                "fields": fields,
+                "maxResults": self.PAGE_SIZE,
+            }
+            if next_page_token:
+                body["nextPageToken"] = next_page_token
 
-        metadata: dict[str, Any] = {
-            "user_id": self.user_id,
-            "source": "jira",
-            "project_key": project_key,
-            "issue_key": key,
-            "title": f"{key}: {summary}",
-            "url": url,
-            "status": status,
-            "priority": priority,
-            "last_updated": updated,
-        }
+            response = session.post(url, json=body, timeout=30)
+            if not response.ok:
+                logger.error(
+                    "[jira] {} {} -> {}\n  request body: {}\n  response body: {}",
+                    response.request.method,
+                    response.url,
+                    response.status_code,
+                    body,
+                    response.text[:1000],
+                )
+                response.raise_for_status()
+            payload = response.json()
 
-        return Document(page_content=page_content, metadata=metadata)
+            issues = payload.get("issues", []) or []
+            for issue in issues:
+                yield self._issue_to_resource(issue, session)
 
-    # ── Scope filter for full-load deletion ───────────────────────────────────
+            next_page_token = payload.get("nextPageToken")
+            is_last = payload.get("isLast")
+            if is_last is True or not next_page_token:
+                break
 
-    def _scope_filter(self, scope_key: str) -> dict:
-        filt: dict = {"source": "jira"}
-        if scope_key != "all":
-            filt["project_key"] = scope_key
-        return filt
+    # Helpers
+    def _issue_to_resource(
+        self, issue: dict[str, Any], session: requests.Session
+    ) -> SourceResource:
+        key = issue["key"]
+        fields = issue.get("fields", {})
+        summary = fields.get("summary") or ""
+        description = _extract_adf_text(fields.get("description")) or ""
+        status = (fields.get("status") or {}).get("name") or ""
+        issue_type = (fields.get("issuetype") or {}).get("name") or ""
+        project_key = ((fields.get("project") or {}).get("key")) or key.split("-")[0]
+        updated = fields.get("updated") or datetime.utcnow().isoformat()
+        assignee = ((fields.get("assignee") or {}).get("displayName")) or "Unassigned"
+        reporter = ((fields.get("reporter") or {}).get("displayName")) or ""
+        labels = ", ".join(fields.get("labels") or [])
+
+        comments_block = self._format_comments(key, fields, session)
+        comment_count = comments_block.count("\n--- comment ")
+
+        text = (
+            f"# {key}: {summary}\n\n"
+            f"Type: {issue_type}\n"
+            f"Status: {status}\n"
+            f"Assignee: {assignee}\n"
+            f"Reporter: {reporter}\n"
+            f"Labels: {labels}\n\n"
+            f"## Description\n{description or '(no description)'}\n"
+            f"{comments_block}"
+        )
+
+        return SourceResource(
+            resource_id=f"jira:{key}",
+            title=f"{key} - {summary}",
+            text=text,
+            url=f"{self._base_url()}/browse/{key}",
+            last_updated=updated,
+            metadata={
+                "project_key": project_key,
+                "object_name": key,
+                "issue_type": issue_type,
+                "status": status,
+                "comment_count": comment_count,
+            },
+        )
+
+    # Comments
+    def _format_comments(
+        self, issue_key: str, fields: dict[str, Any], session: requests.Session
+    ) -> str:
+        """
+        Return a markdown-ish block summarising the issue's comments, ready
+        to append to the chunk text. Empty string if no comments.
+        """
+        comment_field = fields.get("comment") or {}
+        comments = list(comment_field.get("comments") or [])
+        total = comment_field.get("total")
+
+        if (
+            isinstance(total, int)
+            and total > len(comments)
+            and len(comments) < self.MAX_COMMENTS_PER_ISSUE
+        ):
+            comments.extend(
+                self._fetch_overflow_comments(
+                    issue_key,
+                    session,
+                    skip=len(comments),
+                    cap=self.MAX_COMMENTS_PER_ISSUE - len(comments),
+                )
+            )
+
+        if not comments:
+            return ""
+
+        comments = comments[: self.MAX_COMMENTS_PER_ISSUE]
+        out_lines = ["\n## Comments"]
+        for i, c in enumerate(comments, start=1):
+            author = ((c.get("author") or {}).get("displayName")) or "Unknown"
+            created = c.get("created") or ""
+            body = _extract_adf_text(c.get("body")).strip()
+            if not body:
+                continue
+            out_lines.append(f"\n--- comment {i} by {author} ({created}) ---\n{body}")
+        return "\n".join(out_lines)
+
+    def _fetch_overflow_comments(
+        self,
+        issue_key: str,
+        session: requests.Session,
+        skip: int,
+        cap: int,
+    ) -> list[dict[str, Any]]:
+        """Paginate /rest/api/3/issue/{key}/comment for comments beyond the inline batch."""
+        out: list[dict[str, Any]] = []
+        url = f"{self._base_url()}/rest/api/3/issue/{issue_key}/comment"
+        start_at = skip
+        page_size = 50
+        while len(out) < cap:
+            try:
+                r = session.get(
+                    url,
+                    params={"startAt": start_at, "maxResults": page_size},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                payload = r.json()
+            except Exception as exc:
+                logger.warning(
+                    "[jira] overflow-comments fetch failed for {}: {}", issue_key, exc
+                )
+                break
+            batch = payload.get("comments") or []
+            if not batch:
+                break
+            out.extend(batch)
+            total = payload.get("total")
+            start_at += len(batch)
+            if isinstance(total, int) and start_at >= total:
+                break
+        return out[:cap]
+
+
+# ADF -> plain text
+def _extract_adf_text(node: Any) -> str:
+    """Walk an ADF document and concatenate its text leaves."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(_extract_adf_text(n) for n in node)
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            return node.get("text", "")
+        out = _extract_adf_text(node.get("content"))
+        if node.get("type") in {"paragraph", "heading", "bulletList", "orderedList"}:
+            out += "\n"
+        return out
+    return ""

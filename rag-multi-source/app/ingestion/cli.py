@@ -3,10 +3,11 @@ CLI entry point for triggering ingestion.
 
 Usage:
     python -m app.ingestion.cli --help
-    python -m app.ingestion.cli --source jira --mode full --scope PROJ
+    python -m app.ingestion.cli --source jira       --mode full        --scope PROJ
     python -m app.ingestion.cli --source confluence --mode incremental --scope MYSPACE
-    python -m app.ingestion.cli --source sql --mode full --scope mydb
-    python -m app.ingestion.cli --source all --mode incremental
+    python -m app.ingestion.cli --source sql        --mode full        --scope mydb
+    python -m app.ingestion.cli --source git        --mode incremental --scope main
+    python -m app.ingestion.cli --source all        --mode incremental
 """
 
 from __future__ import annotations
@@ -18,11 +19,11 @@ from typing import Optional
 
 from loguru import logger
 
-from app.utils import get_db, init_db
+from app.utils import get_db, init_db, load_all_credentials
 
 
 def _authenticate(email: str, password: Optional[str] = None) -> dict:
-    """Verify credentials and return user dict."""
+    """Verify credentials and return a {"id", "email"} dict."""
     from app.auth import get_user_by_email, verify_password
 
     if password is None:
@@ -36,55 +37,56 @@ def _authenticate(email: str, password: Optional[str] = None) -> dict:
         return {"id": user.id, "email": user.email}
 
 
-def _get_ingestor(source: str, user_id: str):
-    from app.ingestion.jira_ingestor import JiraIngestor
-    from app.ingestion.confluence_ingestor import ConfluenceIngestor
-    from app.ingestion.sql_ingestor import SQLIngestor
-    from app.utils import load_all_credentials
-
-    with get_db() as db:
-        creds = load_all_credentials(db, user_id, source)
-
+def _make_ingestor(db, source: str, user_id: str, scope: str, mode: str):
+    creds = load_all_credentials(db, user_id, source)
     if not creds:
-        logger.error(
-            "No credentials found for source '{}'. "
-            "Please configure them in the Streamlit UI under Settings.",
-            source,
+        raise RuntimeError(
+            f"No credentials found for source '{source}'. "
+            "Please configure them in the Streamlit UI under Settings."
         )
-        sys.exit(1)
 
     if source == "jira":
-        return JiraIngestor(user_id=user_id, credentials=creds)
+        from app.ingestion.jira_ingestor import JiraIngestor
+        return JiraIngestor(
+            db=db, user_id=user_id, credentials=creds, scope=scope, mode=mode
+        )
     if source == "confluence":
-        return ConfluenceIngestor(user_id=user_id, credentials=creds)
+        from app.ingestion.confluence_ingestor import ConfluenceIngestor
+        return ConfluenceIngestor(
+            db=db, user_id=user_id, credentials=creds, scope=scope, mode=mode
+        )
     if source == "sql":
-        return SQLIngestor(user_id=user_id, credentials=creds)
+        from app.ingestion.sql_ingestor import SQLIngestor
+        return SQLIngestor(
+            db=db, user_id=user_id, credentials=creds, scope=scope, mode=mode
+        )
     if source == "git":
         from app.ingestion.git_ingestor import GitIngestor
-        return GitIngestor(user_id=user_id, credentials=creds)
+        return GitIngestor(
+            db=db, user_id=user_id, credentials=creds, scope=scope, mode=mode
+        )
 
     raise ValueError(f"Unknown source: {source}")
 
 
-def run_ingestion(
-    user_id: str,
-    source: str,
-    mode: str,
-    scope: str,
-) -> None:
-    ALL_SOURCES = ["jira", "confluence", "sql", "git"]
+ALL_SOURCES = ["jira", "confluence", "sql", "git"]
+
+
+def run_ingestion(user_id: str, source: str, mode: str, scope: str) -> None:
     sources_to_run = ALL_SOURCES if source == "all" else [source]
 
     for src in sources_to_run:
-        logger.info("── Starting {} / {} / scope={} ──", src, mode, scope)
+        logger.info("Starting {} / {} / scope={}", src, mode, scope)
         try:
-            ingestor = _get_ingestor(src, user_id)
-            log = ingestor.run(scope_key=scope, mode=mode)
+            with get_db() as db:
+                ingestor = _make_ingestor(db, src, user_id, scope, mode)
+                result = ingestor.run()
             logger.info(
-                "── Finished: status={} items={} vectors={}",
-                log.status,
-                log.items_processed,
-                log.vectors_upserted,
+                "Finished {}: items={} vectors={} last_updated={}",
+                src,
+                result.items_processed,
+                result.vectors_upserted,
+                result.last_item_updated_at,
             )
         except Exception as exc:
             logger.exception("Failed to run ingestor for {}: {}", src, exc)
@@ -97,7 +99,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--source",
-        choices=["jira", "confluence", "sql", "git", "all"],
+        choices=ALL_SOURCES + ["all"],
         required=True,
         help="Which source to ingest (use 'all' for every source).",
     )
@@ -105,17 +107,23 @@ def main() -> None:
         "--mode",
         choices=["full", "incremental"],
         default="incremental",
-        help="full: clear + re-ingest everything. incremental: only new/changed items.",
+        help=(
+            "full: wipe-then-rebuild for the scope (delete by metadata filter "
+            "first). incremental: only new/changed items since the last "
+            "successful run."
+        ),
     )
     parser.add_argument(
         "--scope",
         default="all",
         help=(
             "Scope within the source: Jira project key, Confluence space key, "
-            "SQL database name, or 'all'."
+            "SQL database name, Git branch, or 'all'."
         ),
     )
-    parser.add_argument("--email", required=True, help="Your CorporateRAG account email.")
+    parser.add_argument(
+        "--email", required=True, help="Your CorporateRAG account email."
+    )
     parser.add_argument(
         "--password",
         default=None,
@@ -124,14 +132,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Bootstrap DB
     init_db()
 
-    # Auth
     user = _authenticate(args.email, args.password)
     logger.info("Authenticated as {} ({})", user["email"], user["id"])
 
-    # Run
     run_ingestion(
         user_id=user["id"],
         source=args.source,

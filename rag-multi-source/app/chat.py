@@ -1,250 +1,164 @@
-"""Chat interface: retrieval, LLM call, citation formatting, Streamlit rendering."""
+"""
+Chat UI - turns each user message into a Pinecone metadata-filtered retrieval
+plus an LLM call, and renders the result with citations.
+
+Multi-tenancy is enforced *here* at query time. The retriever does NOT inject
+``user_id`` into the filter; instead we build a filter from
+:class:`SelectionState` (sidebar) + the user's accessible-resources rows.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import streamlit as st
-from langchain_core.messages import HumanMessage, SystemMessage
 from loguru import logger
 
 from app.auth import current_user
 from app.sidebar import SelectionState
-from core.llm import get_llm
-from core.retriever import retrieve
-
-# ── Prompt templates ──────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = """\
-You are CorporateRAG, an expert assistant that answers questions using information \
-from the company's Jira tickets, Confluence pages, and SQL Server database objects.
-
-RULES:
-1. Answer ONLY from the provided context. If the context does not contain the answer, \
-say so clearly — do not hallucinate.
-2. For every claim, cite the source inline using [N] notation (e.g. [1], [2]).
-3. Do NOT add a sources list at the end — the UI displays sources automatically.
-4. Write in markdown. Be concise but complete.
-
-Context (numbered sources):
-{context}
-"""
-
-_NO_RESULTS_MSG = (
-    "I couldn't find any relevant information in the selected sources for your query.\n\n"
-    "**Suggestions:**\n"
-    "- Check that you have ingested data for the selected sources/projects.\n"
-    "- Try rephrasing your question.\n"
-    "- Expand your source or project selection in the sidebar."
-)
+from core.rag_chain import RAGAnswer, answer_question
+from core.retriever import RetrievedChunk, retrieve
+from core.vector_store import build_query_filter
 
 
-# ── Citation helpers ──────────────────────────────────────────────────────────
-
-def _format_context(docs) -> tuple[str, list[dict[str, Any]]]:
-    """
-    Build a numbered context string and a parallel list of source metadata dicts.
-    Returns (context_text, sources_list).
-    """
-    parts: list[str] = []
-    sources: list[dict[str, Any]] = []
-
-    for i, doc in enumerate(docs, 1):
-        meta = doc.metadata
-        source_label = _build_source_label(i, meta)
-        parts.append(f"[{i}]\n{source_label}\n{doc.page_content}")
-        sources.append({"index": i, "label": source_label, **meta})
-
-    return "\n\n---\n\n".join(parts), sources
-
-
-def _build_source_label(n: int, meta: dict[str, Any]) -> str:
-    src = meta.get("source", "")
-    title = meta.get("title", "(untitled)")
-    url = meta.get("url")
-
-    if src == "jira":
-        return f"Jira • {title}"
-    if src == "confluence":
-        return f"Confluence • {title}"
-    if src == "sql":
-        db = meta.get("db_name", "")
-        obj = meta.get("object_name", "")
-        obj_type = meta.get("object_type", "object").upper()
-        return f"SQL Server • {db} • {obj} ({obj_type})"
-    if src == "git":
-        repo = meta.get("repo_name", "")
-        git_type = meta.get("git_type", "")
-        return f"Git • {repo} • {title} ({git_type})"
-    return title
-
-
-def _render_citations(sources: list[dict[str, Any]]) -> None:
-    """Render a compact citations block below the AI answer."""
-    if not sources:
-        return
-
-    st.markdown("---")
-    st.markdown("**Sources used:**")
-
-    for src in sources:
-        n = src["index"]
-        source_type = src.get("source", "")
-        title = src.get("title", "(untitled)")
-        url = src.get("url")
-
-        if source_type == "jira":
-            issue_key = src.get("issue_key", "")
-            status = src.get("status", "")
-            badge = f"`{status}`" if status else ""
-            if url:
-                st.markdown(f"**[{n}]** 🔵 [{title}]({url}) {badge}")
-            else:
-                st.markdown(f"**[{n}]** 🔵 {title} {badge}")
-
-        elif source_type == "confluence":
-            space = src.get("space_key", "")
-            if url:
-                st.markdown(f"**[{n}]** 🟢 [{title}]({url}) `{space}`")
-            else:
-                st.markdown(f"**[{n}]** 🟢 {title} `{space}`")
-
-        elif source_type == "sql":
-            db = src.get("db_name", "")
-            obj_type = src.get("object_type", "object").upper()
-            obj_name = src.get("object_name", "")
-            st.markdown(f"**[{n}]** 🟠 `{db}` › `{obj_name}` ({obj_type})")
-
-        elif source_type == "git":
-            repo = src.get("repo_name", "")
-            git_type = src.get("git_type", "")
-            sha = src.get("sha", "")
-            file_path = src.get("file_path", "")
-            branch = src.get("branch", "")
-            if git_type == "commit":
-                label = f"`{sha}` {title}"
-            else:
-                label = f"`{file_path}` @ `{branch}`"
-            if url:
-                st.markdown(f"**[{n}]** 🟣 [{label}]({url}) `{repo}`")
-            else:
-                st.markdown(f"**[{n}]** 🟣 {label} `{repo}`")
-
-        else:
-            st.markdown(f"**[{n}]** {title}")
-
-
-# ── Core answer function ──────────────────────────────────────────────────────
-
-def answer_query(
-    query: str,
-    user_id: str,
-    state: SelectionState,
-) -> tuple[str, list[dict[str, Any]]]:
-    """
-    Retrieve context, call the LLM, return (answer_text, sources_list).
-    """
-    # Build per-dimension scope lists (None = no filter = "all")
-    project_keys = None if state.jira_projects == ["all"] else state.jira_projects
-    space_keys = None if state.confluence_spaces == ["all"] else state.confluence_spaces
-    db_names = None if state.sql_databases == ["all"] else state.sql_databases
-    git_branches = None if state.git_branches == ["all"] else state.git_branches
-    sources = state.sources if state.sources else None
-
-    from app.config import settings
-
-    docs = retrieve(
-        query=query,
-        user_id=user_id,
-        sources=sources,
-        project_keys=project_keys,
-        space_keys=space_keys,
-        db_names=db_names,
-        git_branches=git_branches,
-        top_k=settings.TOP_K,
+def _build_filter(state: SelectionState) -> dict[str, Any]:
+    """Translate the SelectionState into a Pinecone metadata filter."""
+    return build_query_filter(
+        selected_sources=state.sources,
+        accessible_jira_projects=state.jira_projects,
+        accessible_confluence_spaces=state.confluence_spaces,
+        accessible_databases=state.sql_databases,
+        accessible_git_scopes=state.git_scopes,
     )
 
-    if not docs:
-        return _NO_RESULTS_MSG, []
 
-    context, source_metas = _format_context(docs)
-    prompt = _SYSTEM_PROMPT.format(context=context)
+def _render_citations(citations: list[RetrievedChunk]) -> None:
+    if not citations:
+        return
+    st.markdown("---")
+    st.markdown("**Sources:**")
+    for i, c in enumerate(citations, start=1):
+        if c.source == "jira":
+            badge = "\U0001F535 Jira"
+            label = c.title or c.resource_id
+        elif c.source == "confluence":
+            badge = "\U0001F7E2 Confluence"
+            label = c.title or c.resource_id
+        elif c.source == "sql":
+            badge = "\U0001F7E0 SQL"
+            obj = c.metadata.get("object_name", "")
+            db = c.metadata.get("db_name", "")
+            obj_type = c.metadata.get("object_type", "object").upper()
+            label = f"{db} \u203a {obj} ({obj_type})"
+        elif c.source == "git":
+            badge = "\U0001F7E3 Git"
+            repo = c.metadata.get("repo_name", "")
+            branch = c.metadata.get("branch", "")
+            git_type = c.metadata.get("git_type", "")
+            if git_type == "commit":
+                sha = c.metadata.get("sha", "")
+                label = f"{repo}@{branch} \u00b7 `{sha}` {c.title}"
+            else:
+                file_path = c.metadata.get("file_path", "")
+                label = f"{repo}@{branch} \u00b7 `{file_path}`"
+        else:
+            badge = "\u2022"
+            label = c.title or c.resource_id
 
-    llm = get_llm()
-    messages = [SystemMessage(content=prompt), HumanMessage(content=query)]
+        if c.url:
+            st.markdown(
+                f"**[{i}]** {badge} \u2014 [{label}]({c.url})  *(score {c.score:.2f})*"
+            )
+        else:
+            st.markdown(
+                f"**[{i}]** {badge} \u2014 {label}  *(score {c.score:.2f})*"
+            )
 
-    logger.info("Calling LLM with {} context docs.", len(docs))
-    response = llm.invoke(messages)
-    answer = response.content if hasattr(response, "content") else str(response)
 
-    return answer, source_metas
+def _badges(state: SelectionState) -> str:
+    parts: list[str] = []
+    if "jira" in state.sources and state.jira_projects:
+        parts.append(f"\U0001F535 Jira ({len(state.jira_projects)})")
+    if "confluence" in state.sources and state.confluence_spaces:
+        parts.append(f"\U0001F7E2 Confluence ({len(state.confluence_spaces)})")
+    if "sql" in state.sources and state.sql_databases:
+        parts.append(f"\U0001F7E0 SQL ({len(state.sql_databases)})")
+    if "git" in state.sources and state.git_scopes:
+        parts.append(f"\U0001F7E3 Git ({len(state.git_scopes)})")
+    return " \u00b7 ".join(parts) if parts else ""
 
-
-# ── Streamlit chat renderer ───────────────────────────────────────────────────
 
 def render_chat(state: SelectionState) -> None:
-    """Render the main chat interface."""
     user = current_user()
     if not user:
         return
 
-    # Initialise session state for chat
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    st.title("🔍 CorporateRAG")
-    if state.sources:
-        badge_parts = []
-        if "jira" in state.sources:
-            badge_parts.append("🔵 Jira")
-        if "confluence" in state.sources:
-            badge_parts.append("🟢 Confluence")
-        if "sql" in state.sources:
-            badge_parts.append("🟠 SQL Server")
-        if "git" in state.sources:
-            badge_parts.append("🟣 Git")
-        st.caption("Searching across: " + " · ".join(badge_parts))
-    else:
-        st.warning("No data sources selected. Enable at least one source in the sidebar.")
+    # Header row: title on the left, Clear-chat button on the right (only
+    # when there is something to clear). We render this on every render so
+    # the button is reachable immediately after the model has answered.
+    title_col, button_col = st.columns([6, 1])
+    with title_col:
+        st.title("\U0001F50D CorporateRAG")
+    with button_col:
+        if st.session_state.messages:
+            st.write("")  # spacer to vertically align with the title
+            if st.button(
+                "\U0001F5D1 Clear chat",
+                key="clear_chat",
+                use_container_width=True,
+            ):
+                st.session_state.messages = []
+                st.rerun()
 
-    # Render history
+    badges = _badges(state)
+    if badges:
+        st.caption("Searching across: " + badges)
+    else:
+        st.warning(
+            "No queryable scopes selected. Enable a source and run an "
+            "ingestion to grant yourself access, then come back here."
+        )
+
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg.get("sources"):
-                _render_citations(msg["sources"])
+            if msg.get("citations"):
+                _render_citations(msg["citations"])
 
-    # New input
-    if prompt := st.chat_input("Ask anything about your Jira, Confluence, or SQL data…"):
-        # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    prompt = st.chat_input(
+        "Ask anything about your Jira, Confluence, SQL, or Git data\u2026"
+    )
+    if not prompt:
+        return
 
-        # Generate assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Searching & reasoning…"):
-                try:
-                    answer, sources = answer_query(
-                        query=prompt,
-                        user_id=user["id"],
-                        state=state,
-                    )
-                except Exception as exc:
-                    logger.exception("Error answering query.")
-                    answer = f"Sorry, an error occurred: {exc}"
-                    sources = []
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-            st.markdown(answer)
-            if sources:
-                _render_citations(sources)
+    with st.chat_message("assistant"):
+        with st.spinner("Searching & reasoning\u2026"):
+            try:
+                filter_dict = _build_filter(state)
+                logger.debug("Chat filter: {}", filter_dict)
+                hits = retrieve(prompt, filter_dict)
+                history = [
+                    (m["role"], m["content"])
+                    for m in st.session_state.messages
+                    if m["role"] in {"user", "assistant"}
+                ][:-1]
+                result: RAGAnswer = answer_question(prompt, hits, history)
+            except Exception as exc:
+                logger.exception("Chat error")
+                result = RAGAnswer(
+                    answer=f"Sorry \u2014 an error occurred: {exc}", citations=[]
+                )
 
-        st.session_state.messages.append(
-            {"role": "assistant", "content": answer, "sources": sources}
-        )
+        st.markdown(result.answer)
+        _render_citations(result.citations)
 
-    # Clear chat button
-    if st.session_state.messages:
-        if st.button("🗑 Clear chat", key="clear_chat"):
-            st.session_state.messages = []
-            st.rerun()
+    st.session_state.messages.append(
+        {"role": "assistant", "content": result.answer, "citations": result.citations}
+    )

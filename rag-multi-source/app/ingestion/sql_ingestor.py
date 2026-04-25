@@ -1,17 +1,31 @@
-"""SQL Server ingestor – extracts stored procedures, functions, views, and table schemas."""
+"""
+SQL Server ingestor — extracts stored procedures, functions, views and table
+schemas, one resource per object.
+
+resource_id format:
+    sql:{server}.{db_name}.{schema}.{object_name}
+
+`server` is derived from the connection string (a sanitised SERVER=… value).
+For full-mode wipes the scope is the database name.
+
+resource_identifier (for the access table): the db_name.
+
+Required credentials:
+  conn_str   — a full ODBC connect string, e.g.
+               "DRIVER={ODBC Driver 18 for SQL Server};SERVER=tcp:host,1433;
+                DATABASE=master;UID=user;PWD=secret;TrustServerCertificate=yes"
+"""
 
 from __future__ import annotations
 
-import time
-from typing import Any, Optional
+import re
+from datetime import datetime
+from typing import Any, Iterable, Optional
 
-from langchain_core.documents import Document
 from loguru import logger
 
-from app.ingestion.base import BaseIngestor
+from app.ingestion.base import BaseIngestor, SourceResource
 
-
-# ── SQL to extract object definitions ─────────────────────────────────────────
 
 _SQL_ROUTINES = """
 SELECT
@@ -31,24 +45,16 @@ SELECT
     v.TABLE_SCHEMA     AS schema_name,
     v.TABLE_NAME       AS object_name,
     'VIEW'             AS object_type,
-    v.VIEW_DEFINITION  AS definition,
-    NULL               AS last_altered
+    v.VIEW_DEFINITION  AS definition
 FROM INFORMATION_SCHEMA.VIEWS v
 WHERE v.VIEW_DEFINITION IS NOT NULL
 ORDER BY v.TABLE_SCHEMA, v.TABLE_NAME
 """
 
-_SQL_TABLES = """
+_SQL_TABLE_COLS = """
 SELECT
-    c.TABLE_SCHEMA                    AS schema_name,
-    c.TABLE_NAME                      AS object_name,
-    'TABLE'                           AS object_type,
-    c.COLUMN_NAME                     AS column_name,
-    c.DATA_TYPE                       AS data_type,
-    c.CHARACTER_MAXIMUM_LENGTH        AS max_length,
-    c.IS_NULLABLE                     AS is_nullable,
-    c.COLUMN_DEFAULT                  AS column_default,
-    t.TABLE_TYPE                      AS table_type
+    c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
+    c.CHARACTER_MAXIMUM_LENGTH, c.IS_NULLABLE, c.COLUMN_DEFAULT
 FROM INFORMATION_SCHEMA.COLUMNS c
 JOIN INFORMATION_SCHEMA.TABLES t
   ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
@@ -58,207 +64,235 @@ ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
 
 
 class SQLIngestor(BaseIngestor):
-    SOURCE = "sql"
+    source = "sql"
 
-    def __init__(self, user_id: str, credentials: dict[str, str]) -> None:
-        super().__init__(user_id, credentials)
-        # conn_str may be set at the user level; db_name scopes it further
-        self._base_conn_str = credentials.get("conn_str", "")
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._base_conn_str = (self.credentials.get("conn_str") or "").strip()
         if not self._base_conn_str:
             raise ValueError("SQL credentials incomplete: need conn_str.")
+        self._server = _extract_server(self._base_conn_str)
+
+    # ── Engine ───────────────────────────────────────────────────────────────
 
     def _make_engine(self, db_name: Optional[str] = None):
-        import re
         from sqlalchemy import create_engine
         from sqlalchemy.engine import URL
 
         conn_str = self._base_conn_str
         if db_name and db_name != "all":
             if "DATABASE=" in conn_str.upper():
-                conn_str = re.sub(r"DATABASE=[^;]+", f"DATABASE={db_name}", conn_str, flags=re.IGNORECASE)
+                conn_str = re.sub(
+                    r"DATABASE=[^;]+",
+                    f"DATABASE={db_name}",
+                    conn_str,
+                    flags=re.IGNORECASE,
+                )
             else:
                 conn_str += f";DATABASE={db_name}"
 
-        # Use URL.create so SQLAlchemy handles percent-encoding of the ODBC
-        # connect string — passing it raw in an f-string breaks on the braces
-        # and spaces in e.g. DRIVER={ODBC Driver 18 for SQL Server}.
         url = URL.create("mssql+pyodbc", query={"odbc_connect": conn_str})
         return create_engine(url, fast_executemany=True)
 
-    # ── Abstract implementations ──────────────────────────────────────────────
+    # ── Abstract API ─────────────────────────────────────────────────────────
 
-    def list_scopes(self) -> list[dict[str, str]]:
-        """Return databases accessible via the connection string."""
+    def scope_filter(self) -> dict[str, Any]:
+        if self.scope == "all":
+            return {"source": "sql"}
+        return {"source": "sql", "db_name": self.scope}
+
+    def resource_identifier_for(self, resource: SourceResource) -> str:
+        return resource.metadata["db_name"]
+
+    def fetch_resources(
+        self, since: Optional[datetime] = None
+    ) -> Iterable[SourceResource]:
+        databases: list[str]
+        if self.scope == "all":
+            databases = self._list_databases()
+        else:
+            databases = [self.scope]
+
+        since_iso = since.isoformat() if since else None
+        for db_name in databases:
+            yield from self._iter_database(db_name, since_iso)
+
+    # ── Database discovery ───────────────────────────────────────────────────
+
+    def _list_databases(self) -> list[str]:
+        from sqlalchemy import text
+
         try:
             engine = self._make_engine()
-            from sqlalchemy import text
             with engine.connect() as conn:
-                rows = conn.execute(text("SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' ORDER BY name")).fetchall()
-            return [{"key": r[0], "name": r[0]} for r in rows]
+                rows = conn.execute(
+                    text(
+                        "SELECT name FROM sys.databases "
+                        "WHERE state_desc = 'ONLINE' "
+                        "AND name NOT IN ('master','tempdb','model','msdb') "
+                        "ORDER BY name"
+                    )
+                ).fetchall()
+            return [r[0] for r in rows]
         except Exception as exc:
             logger.warning("[sql] Could not list databases: {}", exc)
             return []
 
-    def load_documents(
-        self, scope_key: str, since: Optional[str] = None
-    ) -> list[Document]:
-        if scope_key == "all":
-            db_names = [s["key"] for s in self.list_scopes()]
-        else:
-            db_names = [scope_key]
+    # ── Per-database iteration ───────────────────────────────────────────────
 
-        docs: list[Document] = []
-        for db_name in db_names:
-            docs.extend(self._load_database(db_name, since))
-        return docs
-
-    # ── Per-database loading ──────────────────────────────────────────────────
-
-    def _load_database(self, db_name: str, since: Optional[str]) -> list[Document]:
-        docs: list[Document] = []
+    def _iter_database(
+        self, db_name: str, since: Optional[str]
+    ) -> Iterable[SourceResource]:
         try:
             engine = self._make_engine(db_name)
-            docs.extend(self._load_routines(engine, db_name, since))
-            docs.extend(self._load_views(engine, db_name))
-            docs.extend(self._load_tables(engine, db_name))
         except Exception as exc:
-            logger.error("[sql] Failed to load database {}: {}", db_name, exc)
-        return docs
+            logger.error("[sql] Cannot connect to {}: {}", db_name, exc)
+            return
 
-    def _load_routines(self, engine, db_name: str, since: Optional[str]) -> list[Document]:
+        try:
+            yield from self._iter_routines(engine, db_name, since)
+            yield from self._iter_views(engine, db_name)
+            yield from self._iter_tables(engine, db_name)
+        finally:
+            engine.dispose()
+
+    def _iter_routines(
+        self, engine, db_name: str, since: Optional[str]
+    ) -> Iterable[SourceResource]:
         from sqlalchemy import text
-        docs: list[Document] = []
 
         try:
             with engine.connect() as conn:
                 rows = conn.execute(text(_SQL_ROUTINES)).fetchall()
         except Exception as exc:
-            logger.warning("[sql] Could not fetch routines from {}: {}", db_name, exc)
-            return docs
+            logger.warning("[sql] Routines failed for {}: {}", db_name, exc)
+            return
 
-        for row in rows:
-            schema_name, object_name, object_type, definition, last_altered = row
+        for schema_name, object_name, object_type, definition, last_altered in rows:
             last_altered_str = str(last_altered) if last_altered else ""
-
-            if since and last_altered_str and last_altered_str <= since:
+            if since and last_altered_str and last_altered_str < since:
                 continue
 
             full_name = f"{schema_name}.{object_name}"
-            text_content = (
+            text_body = (
                 f"SQL Server {object_type}: {full_name}\n"
                 f"Database: {db_name}\n\n"
                 f"-- Definition:\n{definition or '(definition not available)'}"
             )
+            yield SourceResource(
+                resource_id=f"sql:{self._server}.{db_name}.{full_name}",
+                title=f"{db_name}: {full_name} ({object_type})",
+                text=text_body,
+                url="",
+                last_updated=last_altered_str or datetime.utcnow().isoformat(),
+                metadata={
+                    "db_name": db_name,
+                    "schema_name": schema_name,
+                    "object_name": full_name,
+                    "object_type": object_type.lower(),
+                    "server": self._server,
+                },
+            )
 
-            metadata: dict[str, Any] = {
-                "user_id": self.user_id,
-                "source": "sql",
-                "db_name": db_name,
-                "schema_name": schema_name,
-                "object_name": full_name,
-                "object_type": object_type.lower(),
-                "title": f"{db_name}: {full_name} ({object_type})",
-                "url": "",
-                "last_updated": last_altered_str,
-            }
-            docs.append(Document(page_content=text_content, metadata=metadata))
-
-        return docs
-
-    def _load_views(self, engine, db_name: str) -> list[Document]:
+    def _iter_views(self, engine, db_name: str) -> Iterable[SourceResource]:
         from sqlalchemy import text
-        docs: list[Document] = []
 
         try:
             with engine.connect() as conn:
                 rows = conn.execute(text(_SQL_VIEWS)).fetchall()
         except Exception as exc:
-            logger.warning("[sql] Could not fetch views from {}: {}", db_name, exc)
-            return docs
+            logger.warning("[sql] Views failed for {}: {}", db_name, exc)
+            return
 
-        for row in rows:
-            schema_name, object_name, object_type, definition, _ = row
+        for schema_name, object_name, _object_type, definition in rows:
             full_name = f"{schema_name}.{object_name}"
-            text_content = (
+            text_body = (
                 f"SQL Server VIEW: {full_name}\n"
                 f"Database: {db_name}\n\n"
                 f"-- Definition:\n{definition or '(definition not available)'}"
             )
-            metadata: dict[str, Any] = {
-                "user_id": self.user_id,
-                "source": "sql",
-                "db_name": db_name,
-                "schema_name": schema_name,
-                "object_name": full_name,
-                "object_type": "view",
-                "title": f"{db_name}: {full_name} (VIEW)",
-                "url": "",
-                "last_updated": "",
-            }
-            docs.append(Document(page_content=text_content, metadata=metadata))
+            yield SourceResource(
+                resource_id=f"sql:{self._server}.{db_name}.{full_name}",
+                title=f"{db_name}: {full_name} (VIEW)",
+                text=text_body,
+                url="",
+                last_updated=datetime.utcnow().isoformat(),
+                metadata={
+                    "db_name": db_name,
+                    "schema_name": schema_name,
+                    "object_name": full_name,
+                    "object_type": "view",
+                    "server": self._server,
+                },
+            )
 
-        return docs
-
-    def _load_tables(self, engine, db_name: str) -> list[Document]:
+    def _iter_tables(self, engine, db_name: str) -> Iterable[SourceResource]:
         from sqlalchemy import text
-        docs: list[Document] = []
 
         try:
             with engine.connect() as conn:
-                rows = conn.execute(text(_SQL_TABLES)).fetchall()
+                rows = conn.execute(text(_SQL_TABLE_COLS)).fetchall()
         except Exception as exc:
-            logger.warning("[sql] Could not fetch tables from {}: {}", db_name, exc)
-            return docs
+            logger.warning("[sql] Tables failed for {}: {}", db_name, exc)
+            return
 
-        # Group columns by table
         tables: dict[str, list] = {}
         for row in rows:
-            schema_name, table_name = row[0], row[1]
-            key = f"{schema_name}.{table_name}"
-            tables.setdefault(key, []).append(row)
+            full_name = f"{row[0]}.{row[1]}"
+            tables.setdefault(full_name, []).append(row)
 
         for full_name, cols in tables.items():
             schema_name = cols[0][0]
-            table_name = cols[0][1]
-            col_lines = []
+            ddl_lines: list[str] = []
             for col in cols:
-                col_name = col[3]
-                data_type = col[4]
-                max_len = col[5]
-                nullable = col[6]
-                default = col[7]
-                type_str = data_type
-                if max_len:
-                    type_str += f"({max_len})"
+                col_name = col[2]
+                data_type = col[3]
+                max_len = col[4]
+                nullable = col[5]
+                default = col[6]
+                type_str = data_type + (f"({max_len})" if max_len else "")
                 null_str = "NULL" if nullable == "YES" else "NOT NULL"
                 default_str = f" DEFAULT {default}" if default else ""
-                col_lines.append(f"  {col_name} {type_str} {null_str}{default_str}")
+                ddl_lines.append(f"  {col_name} {type_str} {null_str}{default_str}")
 
-            text_content = (
+            text_body = (
                 f"SQL Server TABLE: {full_name}\n"
                 f"Database: {db_name}\n\n"
                 f"-- Columns:\nCREATE TABLE {full_name} (\n"
-                + ",\n".join(col_lines)
+                + ",\n".join(ddl_lines)
                 + "\n)"
             )
+            yield SourceResource(
+                resource_id=f"sql:{self._server}.{db_name}.{full_name}",
+                title=f"{db_name}: {full_name} (TABLE)",
+                text=text_body,
+                url="",
+                last_updated=datetime.utcnow().isoformat(),
+                metadata={
+                    "db_name": db_name,
+                    "schema_name": schema_name,
+                    "object_name": full_name,
+                    "object_type": "table",
+                    "server": self._server,
+                },
+            )
 
-            metadata: dict[str, Any] = {
-                "user_id": self.user_id,
-                "source": "sql",
-                "db_name": db_name,
-                "schema_name": schema_name,
-                "object_name": full_name,
-                "object_type": "table",
-                "title": f"{db_name}: {full_name} (TABLE)",
-                "url": "",
-                "last_updated": "",
-            }
-            docs.append(Document(page_content=text_content, metadata=metadata))
 
-        return docs
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-    def _scope_filter(self, scope_key: str) -> dict:
-        filt: dict = {"source": "sql"}
-        if scope_key != "all":
-            filt["db_name"] = scope_key
-        return filt
+def _extract_server(conn_str: str) -> str:
+    """
+    Pull a stable server identifier out of an ODBC connect string.
+
+    Strips ``tcp:`` prefix and any port (``,1433``) so the resource_id is
+    stable across deployments that use different transport hints.
+    """
+    match = re.search(r"SERVER\s*=\s*([^;]+)", conn_str, flags=re.IGNORECASE)
+    if not match:
+        return "server"
+    raw = match.group(1).strip()
+    raw = re.sub(r"^tcp:", "", raw, flags=re.IGNORECASE)
+    raw = raw.split(",")[0]              # drop port
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", raw)

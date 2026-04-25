@@ -23,12 +23,13 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """Create all tables (idempotent – safe to call on every startup)."""
-    # Import models so they register with Base metadata
-    import models.user  # noqa: F401
-    import models.ingestion_log  # noqa: F401
+    """Create / migrate all tables (idempotent – safe on every startup)."""
+    # Delegated to models.migrations so additive schema changes
+    # (e.g. the new user_accessible_resources table) are applied automatically
+    # for users coming from the previous version.
+    from models.migrations import run_migrations
 
-    Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
     logger.info("Database tables initialised.")
 
 
@@ -114,3 +115,59 @@ def load_all_credentials(db: Session, user_id: str, source: str) -> dict[str, st
         except Exception:
             logger.warning("Could not decrypt {}/{}/{}", user_id, source, row.credential_key)
     return result
+
+
+# ── Accessible-resource helpers ───────────────────────────────────────────────
+
+def grant_access(
+    db: Session, user_id: str, source: str, resource_identifier: str
+) -> None:
+    """Idempotently record that `user_id` can query `source/resource_identifier`."""
+    from datetime import datetime
+    from models.user_accessible_resource import UserAccessibleResource
+
+    row = (
+        db.query(UserAccessibleResource)
+        .filter_by(
+            user_id=user_id, source=source, resource_identifier=resource_identifier
+        )
+        .first()
+    )
+    if row:
+        row.last_synced = datetime.utcnow()
+    else:
+        db.add(
+            UserAccessibleResource(
+                user_id=user_id,
+                source=source,
+                resource_identifier=resource_identifier,
+            )
+        )
+    db.flush()
+
+
+def list_accessible(db: Session, user_id: str, source: str) -> list[str]:
+    """Return all resource_identifier values the user is allowed to query."""
+    from models.user_accessible_resource import UserAccessibleResource
+
+    rows = (
+        db.query(UserAccessibleResource.resource_identifier)
+        .filter_by(user_id=user_id, source=source)
+        .all()
+    )
+    return [r[0] for r in rows]
+
+
+def revoke_access(
+    db: Session, user_id: str, source: str, resource_identifier: str
+) -> None:
+    from models.user_accessible_resource import UserAccessibleResource
+
+    db.query(UserAccessibleResource).filter_by(
+        user_id=user_id,
+        source=source,
+        resource_identifier=resource_identifier,
+    ).delete()
+    db.flush()
+
+

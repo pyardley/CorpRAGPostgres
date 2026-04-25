@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     TOP_K: int = 8
     SCORE_THRESHOLD: float = 0.10
 
+    # ── Pinecone ops ─────────────────────────────────────────────────────────
+    # Pinecone serverless caps single-call upserts/deletes; 100 is a safe batch.
+    PINECONE_BATCH_SIZE: int = 100
+
     @property
     def embedding_dim(self) -> int:
         if self.EMBEDDINGS_PROVIDER == "huggingface":
