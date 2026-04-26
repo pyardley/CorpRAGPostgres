@@ -16,7 +16,6 @@ What's different from the old version
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -83,24 +82,80 @@ def _credential_form(
             st.rerun()
 
 
-# Ingestion trigger (background thread)
+# Ingestion trigger (synchronous, with live progress via st.status)
 def _trigger_ingestion(user_id: str, source: str, mode: str, scope: str) -> None:
-    from app.ingestion.cli import run_ingestion
+    """
+    Run ingestion in the foreground so the user gets live progress + a clear
+    completion banner. Streamlit is single-threaded per session, so this
+    blocks the rest of the page until done — that's the price of getting
+    real-time progress without a polling loop.
+    """
+    from app.ingestion.cli import _make_ingestor, ALL_SOURCES
     from app.utils import init_db
 
-    def _run():
-        try:
-            init_db()
-            run_ingestion(user_id=user_id, source=source, mode=mode, scope=scope)
-        except Exception:
-            logger.exception("Background ingestion failed.")
+    init_db()
+    sources_to_run = ALL_SOURCES if source == "all" else [source]
 
-    threading.Thread(target=_run, daemon=True).start()
-    st.toast(
-        f"Ingestion started: {source} / {mode} / scope={scope} - refresh the "
-        "page in a minute to see updated scopes.",
-        icon="⚙️",
-    )
+    label = f"Ingesting {source} (scope={scope})…"
+    with st.status(label, expanded=True) as status:
+        totals = {"items": 0, "vectors": 0}
+        any_failed = False
+
+        for src in sources_to_run:
+            status.write(f"**▶ {src}**")
+            placeholder = st.empty()
+
+            def on_progress(snapshot: dict) -> None:
+                stage = snapshot.get("stage", "")
+                if stage == "starting":
+                    placeholder.caption(f"Starting {snapshot['source']}…")
+                elif stage == "processing":
+                    placeholder.caption(
+                        f"{snapshot['source']}: {snapshot['items_processed']} items, "
+                        f"{snapshot['vectors_upserted']} vectors — "
+                        f"latest: {snapshot['current_item'][:80]}"
+                    )
+                elif stage == "done":
+                    placeholder.caption(
+                        f"{snapshot['source']}: done — "
+                        f"{snapshot['items_processed']} items, "
+                        f"{snapshot['vectors_upserted']} vectors."
+                    )
+
+            try:
+                with get_db() as db:
+                    ingestor = _make_ingestor(db, src, user_id, scope, mode)
+                    result = ingestor.run(on_progress=on_progress)
+                totals["items"] += result.items_processed
+                totals["vectors"] += result.vectors_upserted
+                status.write(
+                    f"✅ {src}: {result.items_processed} items, "
+                    f"{result.vectors_upserted} vectors"
+                )
+            except Exception as exc:
+                any_failed = True
+                logger.exception("Ingestion failed for {}", src)
+                status.write(f"❌ {src}: {exc}")
+
+        if any_failed:
+            status.update(
+                label=(
+                    f"Ingestion finished with errors — "
+                    f"{totals['items']} items, {totals['vectors']} vectors total. "
+                    f"See messages above."
+                ),
+                state="error",
+                expanded=True,
+            )
+        else:
+            status.update(
+                label=(
+                    f"Ingestion complete ✓ — {totals['items']} items, "
+                    f"{totals['vectors']} vectors across {len(sources_to_run)} source(s)."
+                ),
+                state="complete",
+                expanded=False,
+            )
 
 
 # Scope picker UI
@@ -145,6 +200,23 @@ def render_sidebar() -> SelectionState:
         st.markdown(f"### 👤 {user['email']}")
         if st.button("Sign out", use_container_width=True):
             logout_session()
+            st.rerun()
+
+        # Clear chat — always rendered (disabled when there's nothing to clear)
+        # so it's visible from the very first page load. We can't gate this on
+        # `messages` being non-empty because the sidebar renders BEFORE the
+        # chat layer populates messages on the first turn — Streamlit doesn't
+        # auto-rerender once the chat appends, so a conditional render would
+        # leave the button missing until the next user interaction.
+        has_messages = bool(st.session_state.get("messages"))
+        if st.button(
+            "🗑 Clear chat",
+            key="clear_chat_sidebar",
+            use_container_width=True,
+            disabled=not has_messages,
+            help=None if has_messages else "No messages to clear yet.",
+        ):
+            st.session_state["messages"] = []
             st.rerun()
 
         st.divider()
@@ -261,27 +333,34 @@ def render_sidebar() -> SelectionState:
                         form_key="creds_git_2",
                     )
 
-        # Ingestion controls
+        # Ingestion controls — incremental only.
+        # Full-mode ingestion is intentionally NOT exposed in the UI: a full
+        # ingest wipes by metadata filter (not by user_id), so a user with a
+        # narrower view than the previous ingestor would silently delete the
+        # other user's vectors. Run full ingests from the CLI on an admin
+        # account that owns the union of all scopes:
+        #   python -m app.ingestion.cli --source <src> --mode full --scope <key>
         with st.expander("⚙️ Ingest data"):
-            col_src, col_mode = st.columns(2)
-            with col_src:
-                ing_source = st.selectbox(
-                    "Source",
-                    ["all", "jira", "confluence", "sql", "git"],
-                    key="ing_source",
-                )
-            with col_mode:
-                ing_mode = st.selectbox(
-                    "Mode", ["incremental", "full"], key="ing_mode"
-                )
+            ing_source = st.selectbox(
+                "Source",
+                ["all", "jira", "confluence", "sql", "git"],
+                key="ing_source",
+            )
             ing_scope = st.text_input(
                 "Scope (project_key / space_key / db_name / branch, or 'all')",
                 value="all",
                 key="ing_scope",
             )
+            st.caption(
+                "Mode is **incremental** — only items changed since your last "
+                "successful run are re-embedded. For full rebuilds, use the "
+                "CLI from an admin account."
+            )
 
             if st.button("Run ingestion", use_container_width=True):
-                _trigger_ingestion(user["id"], ing_source, ing_mode, ing_scope)
+                _trigger_ingestion(
+                    user["id"], ing_source, "incremental", ing_scope
+                )
 
             _render_recent_logs(user["id"])
 

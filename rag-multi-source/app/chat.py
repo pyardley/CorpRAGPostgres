@@ -96,22 +96,18 @@ def render_chat(state: SelectionState) -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Header row: title on the left, Clear-chat button on the right (only
-    # when there is something to clear). We render this on every render so
-    # the button is reachable immediately after the model has answered.
-    title_col, button_col = st.columns([6, 1])
-    with title_col:
-        st.title("\U0001F50D CorporateRAG")
-    with button_col:
-        if st.session_state.messages:
-            st.write("")  # spacer to vertically align with the title
-            if st.button(
-                "\U0001F5D1 Clear chat",
-                key="clear_chat",
-                use_container_width=True,
-            ):
-                st.session_state.messages = []
-                st.rerun()
+    # Snapshot whether messages were empty *before* this run starts. The
+    # sidebar (which has already rendered above this in main.py's call order)
+    # used the same pre-run snapshot to decide whether to disable the
+    # Clear-chat button. If we're about to add the very first message in this
+    # run, we trigger an explicit st.rerun() at the end so the sidebar gets
+    # a chance to re-render with the now-populated list and enable the button.
+    _was_empty_at_start = len(st.session_state.messages) == 0
+
+    # Note: the Clear-chat button is rendered by app/sidebar.py at the top of
+    # the sidebar so it's always above the fold. Don't duplicate it here.
+
+    st.title("\U0001F50D CorporateRAG")
 
     badges = _badges(state)
     if badges:
@@ -162,3 +158,11 @@ def render_chat(state: SelectionState) -> None:
     st.session_state.messages.append(
         {"role": "assistant", "content": result.answer, "citations": result.citations}
     )
+
+    # First-turn rerun: the sidebar rendered before us with messages still
+    # empty, which left the Clear-chat button disabled. Force one extra
+    # render so the sidebar can pick up the now-populated list. Subsequent
+    # turns don't need this because the sidebar already saw a non-empty
+    # list on the previous render.
+    if _was_empty_at_start:
+        st.rerun()

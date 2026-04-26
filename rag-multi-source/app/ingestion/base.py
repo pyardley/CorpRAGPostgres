@@ -29,11 +29,18 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from loguru import logger
 from sqlalchemy.orm import Session
+
+
+# Type alias for the optional progress callback. Receives a snapshot dict like
+# {"source": "...", "items_processed": 12, "vectors_upserted": 87,
+#  "current_item": "PROJ-123 — fix login"}. The UI can render whatever it
+# wants from this; the CLI uses loguru and ignores the callback.
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 from app.config import settings
 from app.utils import grant_access
@@ -134,7 +141,14 @@ class BaseIngestor(ABC):
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
-    def run(self) -> IngestionResult:
+    def run(
+        self, on_progress: Optional[ProgressCallback] = None
+    ) -> IngestionResult:
+        """
+        Execute the ingestion. If ``on_progress`` is supplied it is called once
+        before fetching starts (so the UI can flip into "running" state) and
+        after every successfully-processed resource.
+        """
         log = IngestionLog(
             user_id=self.user_id,
             source=self.source,
@@ -146,6 +160,18 @@ class BaseIngestor(ABC):
         self.db.flush()
 
         result = IngestionResult()
+        if on_progress:
+            on_progress(
+                {
+                    "source": self.source,
+                    "scope": self.scope,
+                    "stage": "starting",
+                    "items_processed": 0,
+                    "vectors_upserted": 0,
+                    "current_item": "",
+                }
+            )
+
         try:
             if self.mode == "full":
                 logger.info(
@@ -166,6 +192,17 @@ class BaseIngestor(ABC):
 
             for resource in self.fetch_resources(since=since):
                 self._process_resource(resource, result)
+                if on_progress:
+                    on_progress(
+                        {
+                            "source": self.source,
+                            "scope": self.scope,
+                            "stage": "processing",
+                            "items_processed": result.items_processed,
+                            "vectors_upserted": result.vectors_upserted,
+                            "current_item": resource.title,
+                        }
+                    )
 
             log.status = "success"
         except Exception as exc:
@@ -179,6 +216,18 @@ class BaseIngestor(ABC):
             log.last_item_updated_at = result.last_item_updated_at
             log.completed_at = datetime.utcnow()
             self.db.flush()
+
+        if on_progress:
+            on_progress(
+                {
+                    "source": self.source,
+                    "scope": self.scope,
+                    "stage": "done",
+                    "items_processed": result.items_processed,
+                    "vectors_upserted": result.vectors_upserted,
+                    "current_item": "",
+                }
+            )
 
         return result
 

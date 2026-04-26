@@ -1,0 +1,25 @@
+# Streamlit config — keeps the dev console clean.
+#
+# folderWatchBlacklist tells the file watcher to skip these paths when it walks
+# for source-file changes. We ignore the venv (transformers' lazy loader spams
+# tracebacks when touched by Streamlit's introspection) and __pycache__.
+#
+# fileWatcherType "auto" picks watchdog if installed, falls back to polling.
+# Set this to "none" if you ever want to fully disable hot-reload.
+[server]
+fileWatcherType = "auto"
+folderWatchBlacklist = [
+    ".venv",
+    "**/__pycache__",
+    "**/site-packages/transformers/**",
+    "**/site-packages/torch/**",
+    "**/site-packages/sentence_transformers/**",
+]
+
+# Hide Streamlit's deprecation banner so it doesn't crowd the page.
+[client]
+showSidebarNavigation = true
+# "minimal" hides the Deploy button + the three-dot Streamlit hamburger menu
+# while keeping the rerun / settings options reachable. Use "viewer" to hide
+# the toolbar entirely.
+toolbarMode = "minimal"

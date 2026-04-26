@@ -277,3 +277,107 @@ python -m scripts.cleanup_legacy_vectors --strategy report
   by the dynamic filter built from `user_accessible_resources`. Treat that
   table as the security boundary — anyone able to write into it can grant
   themselves access to any resource that's been ingested.
+
+### Access model — current behaviour
+
+Access is **granted at ingestion time**, not **re-checked at query time
+against the source system**. Concretely:
+
+- A user gains access to a scope (`jira:PROJ`, `confluence:DOCS`,
+  `sql:mydb`, `git:owner/repo@main`) the moment they successfully run an
+  ingestion under their own account. The ingestor calls
+  `grant_access(user_id, source, resource_identifier)` for every resource
+  it processes.
+- That access **persists until they revoke it** via the sidebar's
+  *🛡 Manage my access* panel. If their permissions are later removed at
+  the source (e.g. their Jira project membership is revoked), CorporateRAG
+  will not notice — they will continue to retrieve any chunks already
+  ingested for that scope.
+- Conversely, a user who has full access at the source but has never run
+  an ingestion themselves cannot query the data — there is no
+  `user_accessible_resources` row to put into the Pinecone filter.
+
+---
+
+## Possible enhancements
+
+Things this codebase deliberately does not do today, listed in roughly
+ascending order of effort.
+
+### 1. Live source-system ACL re-validation at query time
+
+Today the access table is the only thing standing between users and
+resources. A natural hardening is to have the chat layer call back into
+each source on every query and intersect the live ACL with the granted
+scopes:
+
+- **Jira**: call `GET /rest/api/3/permissions/project` (or list
+  accessible projects) and keep only project keys present in both the
+  live response and `user_accessible_resources`.
+- **Confluence**: list spaces the user can view via
+  `GET /wiki/rest/api/space` (filter by `permissions[].operation = read`)
+  and intersect with the granted space keys.
+- **SQL Server**: probe `SELECT HAS_DBACCESS(...)` for each granted
+  database; drop any the connection can no longer reach.
+- **Git/GitHub**: hit `GET /repos/{owner}/{repo}/collaborators/{username}/permission`
+  and drop repos where the user lost access.
+
+Trade-offs to consider before implementing:
+
+- Adds a per-query API hit (and latency) to every chat message — caching
+  per session for a short TTL (e.g. 60 s) helps a lot.
+- Requires the user's own credentials to be present at query time, not
+  just at ingest time.
+- Closes the "permissions changed at the source" gap but adds a hard
+  dependency on the source system being reachable; Pinecone-only queries
+  would fail when Jira / Confluence are down.
+
+### 2. Per-chunk visibility (issue / page-level granularity)
+
+The current model is at *project / space / database / repo+branch*
+granularity. If you need chunk-level controls (e.g., a single Jira issue
+that's restricted to a security level inside an otherwise-public project),
+you'd need to:
+
+- Capture per-resource ACL during ingestion (e.g., Jira issue security
+  levels, Confluence page restrictions) and store it as additional vector
+  metadata.
+- Extend `build_query_filter` to AND together the scope filter with a
+  per-resource visibility clause derived from the user's group
+  memberships.
+
+### 3. Background / scheduled ingestion
+
+Today ingestion runs synchronously in the foreground via the sidebar, or
+manually from the CLI. A small scheduler (cron job, Celery beat, GitHub
+Actions, or Streamlit-internal `schedule` skill) running
+`python -m app.ingestion.cli --source all --mode incremental` on a regular
+cadence under an admin account would keep the index fresh without
+anybody clicking buttons.
+
+### 4. Audit log of queries
+
+For traceability ("who asked what, and which sources were returned?"),
+log every `(user_id, query, filter_dict, citations)` tuple to a
+`query_logs` table. Useful for compliance reviews and for debugging
+"why did the model say X?".
+
+### 5. Reranking + hybrid search
+
+Pure cosine similarity over OpenAI embeddings is fine for most queries,
+but accuracy on tricky retrievals improves measurably with:
+
+- A second-stage cross-encoder reranker (e.g. `bge-reranker-base`) over
+  the top-k results.
+- Sparse-dense hybrid retrieval (BM25 + dense), which Pinecone serverless
+  supports natively as of 2024.
+
+Both can slot in behind `core/retriever.py` without touching the rest of
+the stack.
+
+### 6. Streaming LLM responses
+
+`render_chat` currently calls `llm.invoke()` and renders the full answer
+once it returns. Switching to `llm.stream()` and `st.write_stream()`
+would give a typewriter-style response and noticeably improve perceived
+latency on long answers.

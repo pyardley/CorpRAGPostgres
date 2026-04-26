@@ -18,14 +18,18 @@ from core.retriever import RetrievedChunk, deduplicate_by_resource
 
 
 SYSTEM_PROMPT = """You are CorporateRAG, an enterprise assistant that answers
-questions strictly from the user's connected Jira tickets, Confluence pages
-and SQL Server objects.
+questions strictly from the user's connected Jira tickets, Confluence pages,
+SQL Server objects, and Git repositories.
 
 Rules:
 1. Use ONLY the information in the provided context. If the answer is not
    present, say so plainly — do not invent facts.
 2. Cite sources inline using bracketed numeric markers like [1], [2] that
-   match the numbered list provided in the context.
+   match the numbered list provided in the context. The number you cite MUST
+   be the number of the source that actually contains the fact you are
+   stating — never cite [N] unless block [N] in the context supports the
+   claim. If multiple sources support a claim, you may cite several, e.g.
+   "X is true [1][3]".
 3. Be concise and direct. Prefer bullet points for lists, fenced code blocks
    for SQL, JSON, or code snippets.
 4. If the question references something that is clearly out of scope for the
@@ -38,13 +42,39 @@ class RAGAnswer:
     citations: list[RetrievedChunk]
 
 
-def _format_context(hits: list[RetrievedChunk]) -> str:
+def _format_context(
+    hits: list[RetrievedChunk], citations: list[RetrievedChunk]
+) -> str:
+    """
+    Build the LLM context block, numbered identically to the user-visible
+    citations list.
+
+    The retrieved ``hits`` may contain several chunks per resource; the
+    ``citations`` list is the de-duplicated view shown to the user (one entry
+    per resource, ordered by score). To prevent a citation-number mismatch
+    where the LLM cites ``[4]`` meaning the 4th raw chunk while the user sees
+    a different ``[4]``, we:
+
+      1. Group all hit chunks by ``resource_id``.
+      2. Walk ``citations`` in order, emitting one numbered block per
+         resource with all of its chunks concatenated underneath the same
+         number.
+
+    Net effect: the LLM's ``[N]`` and the rendered Sources list's ``[N]``
+    always point to the same resource.
+    """
+    grouped: dict[str, list[RetrievedChunk]] = {}
+    for hit in hits:
+        grouped.setdefault(hit.resource_id, []).append(hit)
+
     parts: list[str] = []
-    for i, hit in enumerate(hits, start=1):
-        header = f"[{i}] ({hit.source}) {hit.citation_label}"
-        if hit.url:
-            header += f" — {hit.url}"
-        parts.append(f"{header}\n{hit.text.strip()}")
+    for i, citation in enumerate(citations, start=1):
+        chunks = grouped.get(citation.resource_id) or [citation]
+        header = f"[{i}] ({citation.source}) {citation.citation_label}"
+        if citation.url:
+            header += f" — {citation.url}"
+        body = "\n\n".join(chunk.text.strip() for chunk in chunks)
+        parts.append(f"{header}\n{body}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -71,10 +101,12 @@ def answer_question(
             citations=[],
         )
 
-    # Use de-duplicated, sorted citations for the visible "Sources" list, but
-    # keep all chunks in the LLM context so it has more to work with.
+    # Use de-duplicated, sorted citations for the visible "Sources" list, AND
+    # number the LLM context the same way (one block per resource, all chunks
+    # underneath the same number) so the LLM's [N] always lines up with what
+    # the user sees in the Sources list.
     citations = deduplicate_by_resource(hits)
-    context = _format_context(hits)
+    context = _format_context(hits, citations)
 
     messages = [SystemMessage(content=SYSTEM_PROMPT)]
     # Include up to last 6 turns of history (3 exchanges) — enough for

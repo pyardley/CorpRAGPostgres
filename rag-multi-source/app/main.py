@@ -1,5 +1,5 @@
 """
-CorporateRAG – Streamlit entry point.
+CorporateRAG - Streamlit entry point.
 
 Run with:
     streamlit run app/main.py
@@ -10,31 +10,47 @@ from __future__ import annotations
 import sys
 import os
 
+# Suppress noisy startup tracebacks
+# Streamlit's local-sources file watcher walks sys.modules and accesses
+# `__path__` on every loaded package. The `transformers` package (pulled in
+# transitively by langchain-huggingface / sentence-transformers) uses a lazy
+# loader that tries to import `torchvision` whenever its submodules are
+# touched - and torchvision isn't a dependency, so each touch logs a full
+# traceback.
+#
+# Two muzzles, applied as early as possible:
+#   1) `TRANSFORMERS_VERBOSITY=error` silences transformers' own warnings.
+#   2) Lower the Streamlit watcher's logger to CRITICAL so its
+#      "Examining the path of ..." tracebacks don't reach the console.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+import logging  # noqa: E402
+
+logging.getLogger("streamlit.watcher.local_sources_watcher").setLevel(
+    logging.CRITICAL
+)
+
 # Allow imports from project root regardless of CWD
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import streamlit as st
-from loguru import logger
+import streamlit as st  # noqa: E402
+from loguru import logger  # noqa: E402
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
-
+# Bootstrap
 from app.utils import init_db
 
 init_db()
 
-# ── Page config (must be first Streamlit call) ────────────────────────────────
-
+# Page config (must be first Streamlit call)
 st.set_page_config(
     page_title="CorporateRAG",
-    page_icon="🔍",
+    page_icon="\U0001F50D",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS – clean, modern look ──────────────────────────────────────────
-
+# Custom CSS - clean, modern look
 st.markdown(
     """
     <style>
@@ -60,18 +76,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Auth gate ─────────────────────────────────────────────────────────────────
-
-from app.auth import current_user, login_page
+# Auth gate
+from app.auth import current_user, login_page  # noqa: E402
 
 if current_user() is None:
     login_page()
     st.stop()
 
-# ── Authenticated app ─────────────────────────────────────────────────────────
-
-from app.sidebar import render_sidebar
-from app.chat import render_chat
+# Authenticated app
+from app.sidebar import render_sidebar  # noqa: E402
+from app.chat import render_chat  # noqa: E402
 
 selection = render_sidebar()
 render_chat(selection)
