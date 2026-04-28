@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Literal, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,14 +12,20 @@ class Settings(BaseSettings):
     APP_SECRET_KEY: str = "change-me-in-production"
     ENCRYPTION_KEY: str = ""  # Fernet key; auto-generated on first run
 
-    # ── SQLite ───────────────────────────────────────────────────────────────
-    DATABASE_URL: str = "sqlite:///./rag_system.db"
+    # ── Database ─────────────────────────────────────────────────────────────
+    # PostgreSQL with the pgvector extension. Examples:
+    #   postgresql+psycopg://user:pass@localhost:5432/rag
+    #   postgresql+psycopg://postgres.<ref>:<pwd>@aws-0-eu-west-1.pooler.supabase.com:6543/postgres
+    #   postgresql+psycopg://<user>:<pwd>@ep-cool-xxx.eu-central-1.aws.neon.tech/neondb
+    DATABASE_URL: str = (
+        "postgresql+psycopg://postgres:postgres@localhost:5432/corporaterag"
+    )
 
-    # ── Pinecone (serverless free tier) ──────────────────────────────────────
-    PINECONE_API_KEY: str = ""
-    PINECONE_INDEX_NAME: str = "rag-multi-source"
-    PINECONE_REGION: str = "us-east-1"
-    PINECONE_CLOUD: str = "aws"
+    # SQLAlchemy connection pool tuning. Defaults are fine for a single
+    # Streamlit instance; bump pool_size for multi-process deployments.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_PRE_PING: bool = True
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     EMBEDDINGS_PROVIDER: Literal["openai", "huggingface"] = "openai"
@@ -48,9 +53,9 @@ class Settings(BaseSettings):
     TOP_K: int = 8
     SCORE_THRESHOLD: float = 0.10
 
-    # ── Pinecone ops ─────────────────────────────────────────────────────────
-    # Pinecone serverless caps single-call upserts/deletes; 100 is a safe batch.
-    PINECONE_BATCH_SIZE: int = 100
+    # ── Vector store ops ─────────────────────────────────────────────────────
+    # Rows per upsert batch. We still chunk for memory + WAL pressure.
+    VECTOR_UPSERT_BATCH_SIZE: int = 250
 
     @property
     def embedding_dim(self) -> int:

@@ -1,40 +1,44 @@
 """
-Pinecone vector store — single shared org-wide index.
+Vector store — PostgreSQL + pgvector.
 
-KEY DESIGN POINTS
------------------
-1. **One index** per organisation (`settings.PINECONE_INDEX_NAME`). The
-   previous architecture stored a separate copy of every chunk per user.
-   This module is the only place that talks to Pinecone, which makes the
-   "store-once" promise enforceable.
+The vector index lives in the same Postgres database as ``users``,
+``user_credentials``, and ``user_accessible_resources``. Retrieval is a single
+SQL statement that combines cosine-similarity ranking with the user's
+accessible resources — no second hop to a managed vector DB, and no risk of
+drift between the access table and the index.
 
-2. **Stable, deterministic IDs.** Each ingested resource is identified by a
-   `resource_id` like `jira:PROJ-123`, `confluence:page-987654321`, or
-   `sql:server1.dbname.proc_GetCustomerData`. A resource that produces N
-   chunks gets vector IDs of the form ``f"{resource_id}::chunk-{i}"`` so that:
-     * upserting the same resource twice replaces the previous chunks,
-     * we can wipe a resource cleanly by deleting the IDs we generated.
+Public surface
+--------------
+* :class:`ResourceChunk` — what each ingestor produces (one chunk of one
+  resource, ready to embed + insert).
+* :func:`upsert_chunks(chunks)` — embed + ``INSERT … ON CONFLICT DO UPDATE``
+  by ``(resource_id, chunk_index)``. Re-running is a clean replace.
+* :func:`delete_resource(resource_id)` — wipe one resource cleanly.
+* :func:`delete_by_filter(filter_dict)` — bulk wipe (used by ``--mode full``).
+* :func:`build_query_filter(...)` — helper for the chat layer; returns a dict
+  consumed by :func:`core.retriever.retrieve`.
 
-3. **No `user_id` metadata.** Multi-tenancy is enforced at *query* time by
-   passing a Pinecone metadata filter built from the user's accessible
-   resources (see :func:`build_query_filter` and `core.retriever`).
-
-4. **Required metadata fields per chunk** (lower-cased keys, JSON-safe):
-     resource_id, source, project_key | space_key | db_name,
-     object_name, title, url, last_updated, chunk_index, text
+Multi-tenancy
+-------------
+Vectors are shared org-wide. Tenancy is enforced **at query time** by the
+``WHERE`` clause built from ``build_query_filter`` + the user's
+``user_accessible_resources`` rows. There is no ``user_id`` column on
+``vector_chunks`` and no per-user duplication.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Iterable, Optional
 
 from loguru import logger
+from sqlalchemy import delete, or_, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
+from app.utils import get_db
 from core.llm import get_embeddings
+from models.vector_chunk import VectorChunk
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -46,139 +50,109 @@ class ResourceChunk:
     """One chunk of one resource, ready to upsert."""
 
     resource_id: str          # e.g. "jira:PROJ-123"
-    source: str               # "jira" | "confluence" | "sql"
+    source: str               # "jira" | "confluence" | "sql" | "git"
     chunk_index: int
     text: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def vector_id(self) -> str:
-        # `::` is reserved (never appears in any of our resource_ids).
-        return f"{self.resource_id}::chunk-{self.chunk_index}"
-
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pinecone client
+# Internals
 # ──────────────────────────────────────────────────────────────────────────────
 
-@lru_cache(maxsize=1)
-def _pinecone_client():
-    """Lazy-import the Pinecone SDK and ensure the shared index exists."""
-    from pinecone import Pinecone, ServerlessSpec
+# Columns we promote out of `chunk.metadata` onto their own DB column for
+# fast indexed filtering. The ingestors put the right value into metadata
+# under the matching key.
+_PROMOTED_FIELDS = ("project_key", "space_key", "db_name", "git_scope")
 
-    if not settings.PINECONE_API_KEY:
-        raise RuntimeError("PINECONE_API_KEY is not set.")
-
-    pc = Pinecone(api_key=settings.PINECONE_API_KEY)
-    name = settings.PINECONE_INDEX_NAME
-
-    existing = {idx["name"] for idx in pc.list_indexes()}
-    if name not in existing:
-        logger.info("Creating Pinecone index {!r}", name)
-        pc.create_index(
-            name=name,
-            dimension=settings.embedding_dim,
-            metric="cosine",
-            spec=ServerlessSpec(
-                cloud=settings.PINECONE_CLOUD, region=settings.PINECONE_REGION
-            ),
-        )
-        # Wait until the index is ready before we try to use it.
-        while not pc.describe_index(name).status.get("ready", False):
-            time.sleep(1)
-
-    return pc
+# Per-source filter column. Used by both `build_query_filter` and the
+# retriever to know which column to constrain.
+_FILTER_COLUMNS_BY_SOURCE = {
+    "jira": "project_key",
+    "confluence": "space_key",
+    "sql": "db_name",
+    "git": "git_scope",
+}
 
 
-def ensure_index() -> str:
-    """Make sure the shared index exists and return its name."""
-    _pinecone_client()  # side-effect: create-if-missing
-    return settings.PINECONE_INDEX_NAME
+def _row_payload(chunk: ResourceChunk, embedding: list[float]) -> dict[str, Any]:
+    md = dict(chunk.metadata)
 
+    promoted = {key: md.pop(key, None) for key in _PROMOTED_FIELDS}
 
-def get_index():
-    """Return a handle to the shared Pinecone index."""
-    return _pinecone_client().Index(settings.PINECONE_INDEX_NAME)
+    return {
+        "resource_id": chunk.resource_id,
+        "source": chunk.source,
+        "chunk_index": chunk.chunk_index,
+        "text": chunk.text,
+        "embedding": embedding,
+        "title": md.pop("title", None),
+        "url": md.pop("url", None),
+        "object_name": md.pop("object_name", None),
+        "last_updated": md.pop("last_updated", None),
+        "extra": md,
+        **promoted,
+    }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Existence / lookup
-# ──────────────────────────────────────────────────────────────────────────────
-
-def list_chunk_ids_for_resource(resource_id: str) -> list[str]:
-    """
-    Return the existing vector IDs that belong to ``resource_id``.
-
-    Pinecone serverless does not offer a cheap "list IDs by metadata filter",
-    so we scope by ID prefix — every chunk we upsert is keyed
-    ``{resource_id}::chunk-{n}``, which makes the prefix exact.
-    """
-    index = get_index()
-    ids: list[str] = []
-    try:
-        for page in index.list(prefix=f"{resource_id}::"):
-            ids.extend(page)
-    except AttributeError:
-        page = index.list(prefix=f"{resource_id}::")
-        if page:
-            ids.extend(page)
-    except Exception as exc:  # pragma: no cover - SDK shape can vary
-        logger.warning("list() failed for prefix {}: {}", resource_id, exc)
-    return ids
-
-
-def resource_exists(resource_id: str) -> bool:
-    """True if at least one chunk for this resource is already in Pinecone."""
-    return bool(list_chunk_ids_for_resource(resource_id))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Upsert
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _batched(seq: list[Any], n: int) -> Iterable[list[Any]]:
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Existence / lookup
+# ──────────────────────────────────────────────────────────────────────────────
+
+def resource_exists(resource_id: str) -> bool:
+    """True if at least one chunk for this resource is already stored."""
+    with get_db() as db:
+        return db.execute(
+            select(VectorChunk.id)
+            .where(VectorChunk.resource_id == resource_id)
+            .limit(1)
+        ).first() is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Upsert
+# ──────────────────────────────────────────────────────────────────────────────
+
 def upsert_chunks(chunks: list[ResourceChunk]) -> int:
     """
-    Embed and upsert chunks. Returns the number of vectors written.
+    Embed and ``INSERT … ON CONFLICT DO UPDATE`` the chunks. Returns the
+    number of rows written.
 
-    For idempotency the caller is expected to either:
-      * always pass *every* chunk for a resource (so re-upserts overwrite), OR
-      * call :func:`delete_resource` first.
+    Idempotent — calling with the same chunks twice is a no-op (each row's
+    ``updated_at`` advances). The conflict target is
+    ``(resource_id, chunk_index)``, so re-ingesting a resource overwrites
+    its chunks in place.
     """
     if not chunks:
         return 0
 
     embeddings = get_embeddings()
-    index = get_index()
-
     total = 0
-    for batch in _batched(chunks, settings.PINECONE_BATCH_SIZE):
-        texts = [c.text for c in batch]
-        vectors = embeddings.embed_documents(texts)
-
-        payload = []
-        for chunk, vector in zip(batch, vectors):
-            md = dict(chunk.metadata)
-            # Always overwrite the canonical metadata fields so callers can't
-            # accidentally drop them.
-            md["resource_id"] = chunk.resource_id
-            md["source"] = chunk.source
-            md["chunk_index"] = chunk.chunk_index
-            # Keep chunk text in metadata so retrieval can hand it to the LLM
-            # without a second round-trip.
-            md.setdefault("text", chunk.text)
-            payload.append(
-                {"id": chunk.vector_id, "values": vector, "metadata": md}
+    with get_db() as db:
+        for batch in _batched(chunks, settings.VECTOR_UPSERT_BATCH_SIZE):
+            vectors = embeddings.embed_documents([c.text for c in batch])
+            rows = [
+                _row_payload(chunk, vec) for chunk, vec in zip(batch, vectors)
+            ]
+            stmt = pg_insert(VectorChunk).values(rows)
+            update_cols = {
+                col.name: stmt.excluded[col.name]
+                for col in VectorChunk.__table__.columns
+                if col.name not in {"id", "created_at"}
+            }
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_vector_chunks_resource_chunk",
+                set_=update_cols,
             )
+            db.execute(stmt)
+            total += len(rows)
 
-        index.upsert(vectors=payload)
-        total += len(payload)
-
-    logger.info("Upserted {} chunks to {}", total, settings.PINECONE_INDEX_NAME)
+    logger.info("Upserted {} chunks to vector_chunks.", total)
     return total
 
 
@@ -188,46 +162,66 @@ def upsert_chunks(chunks: list[ResourceChunk]) -> int:
 
 def delete_resource(resource_id: str) -> int:
     """Delete every chunk for a single resource. Returns count deleted."""
-    index = get_index()
-    ids = list_chunk_ids_for_resource(resource_id)
-    if not ids:
-        return 0
-    for batch in _batched(ids, settings.PINECONE_BATCH_SIZE):
-        index.delete(ids=batch)
-    logger.info("Deleted {} chunks for resource {}", len(ids), resource_id)
-    return len(ids)
+    with get_db() as db:
+        result = db.execute(
+            delete(VectorChunk).where(VectorChunk.resource_id == resource_id)
+        )
+        n = int(result.rowcount or 0)
+    if n:
+        logger.info("Deleted {} chunks for resource {}", n, resource_id)
+    return n
 
 
-def delete_by_filter(filter_dict: dict[str, Any]) -> None:
+def delete_by_filter(filter_dict: dict[str, Any]) -> int:
     """
-    Bulk delete using Pinecone's metadata-filter delete.
+    Bulk-delete chunks that match a simple filter dict.
 
-    Used for ``--mode full`` ingestion: e.g. wipe all vectors for
-    ``{"source": "jira", "project_key": {"$in": ["PROJ"]}}`` before the rebuild.
-    A 404 / "not found" is treated as a no-op (the scope was empty already).
+    Supported keys:
+
+      * ``source`` — string
+      * ``project_key`` / ``space_key`` / ``db_name`` / ``git_scope`` —
+        a string, a list, or ``{"$in": [...]}``
+
+    Used by ``--mode full`` to wipe a scope before re-ingesting it.
     """
-    index = get_index()
-    logger.info("Deleting vectors by filter: {}", filter_dict)
-    try:
-        index.delete(filter=filter_dict)
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "404" in msg or "not found" in msg:
-            logger.info("Nothing to delete for filter {} (empty scope).", filter_dict)
+    stmt = delete(VectorChunk)
+    clauses = []
+    for key, value in filter_dict.items():
+        column = getattr(VectorChunk, key, None)
+        if column is None:
+            continue
+        if isinstance(value, dict) and "$in" in value:
+            clauses.append(column.in_(list(value["$in"])))
+        elif isinstance(value, (list, tuple, set)):
+            clauses.append(column.in_(list(value)))
         else:
-            raise
+            clauses.append(column == value)
+    if clauses:
+        stmt = stmt.where(*clauses)
+
+    with get_db() as db:
+        result = db.execute(stmt)
+        n = int(result.rowcount or 0)
+    logger.info("Deleted {} chunks matching {}", n, filter_dict)
+    return n
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Stats (used by the sidebar)
+# Stats
 # ──────────────────────────────────────────────────────────────────────────────
 
 def index_stats() -> dict[str, Any]:
-    try:
-        return get_index().describe_index_stats()
-    except Exception as exc:
-        logger.warning("Could not fetch Pinecone stats: {}", exc)
-        return {}
+    """Return per-source row counts. Cheap — `GROUP BY source`."""
+    with get_db() as db:
+        rows = db.execute(
+            text(
+                "SELECT source, COUNT(*) AS n "
+                "FROM vector_chunks GROUP BY source ORDER BY source"
+            )
+        ).all()
+    counts: dict[str, Any] = {r[0]: int(r[1]) for r in rows}
+    counts["__total__"] = sum(int(v) for v in counts.values())
+    return counts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -242,58 +236,56 @@ def build_query_filter(
     accessible_git_scopes: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """
-    Translate (selected sources × accessible-resources rows) into a Pinecone
-    metadata filter.
+    Translate (selected sources × accessible-resources rows) into a structured
+    filter dict consumed by :func:`core.retriever.retrieve`.
 
-    Rules
-    -----
-    * ``source`` must be in ``selected_sources``.
-    * Within each source, the per-source key
-      (``project_key`` / ``space_key`` / ``db_name`` / ``git_scope``) must be in
-      the matching accessible-list — UNLESS that list is empty, in which case
-      that source is excluded.
-    * The per-source clauses are OR'd together so one query can span
-      Jira + Confluence + SQL + Git.
+    Per-source clauses are OR'd together so one query can span Jira +
+    Confluence + SQL + Git.
+
+    Example output::
+
+        {
+            "by_source": {
+                "jira":       ["PROJ", "OPS"],
+                "confluence": ["DOCS"],
+                "git":        ["acme/widgets@main"],
+            }
+        }
     """
-    selected_sources = [s for s in selected_sources if s]
-    if not selected_sources:
-        # Pinecone rejects empty filters; this clause never matches anything,
-        # which is the correct behaviour when the user has selected no sources.
-        return {"source": {"$in": ["__none__"]}}
-
-    or_clauses: list[dict[str, Any]] = []
+    by_source: dict[str, list[str]] = {}
 
     if "jira" in selected_sources and accessible_jira_projects:
-        or_clauses.append(
-            {
-                "source": "jira",
-                "project_key": {"$in": list(accessible_jira_projects)},
-            }
-        )
+        by_source["jira"] = list(accessible_jira_projects)
     if "confluence" in selected_sources and accessible_confluence_spaces:
-        or_clauses.append(
-            {
-                "source": "confluence",
-                "space_key": {"$in": list(accessible_confluence_spaces)},
-            }
-        )
+        by_source["confluence"] = list(accessible_confluence_spaces)
     if "sql" in selected_sources and accessible_databases:
-        or_clauses.append(
-            {
-                "source": "sql",
-                "db_name": {"$in": list(accessible_databases)},
-            }
-        )
+        by_source["sql"] = list(accessible_databases)
     if "git" in selected_sources and accessible_git_scopes:
-        or_clauses.append(
-            {
-                "source": "git",
-                "git_scope": {"$in": list(accessible_git_scopes)},
-            }
+        by_source["git"] = list(accessible_git_scopes)
+
+    return {"by_source": by_source}
+
+
+def filter_to_where(filter_dict: dict[str, Any]):
+    """
+    Turn a :func:`build_query_filter` result into a SQLAlchemy WHERE
+    expression. Returns ``None`` when the filter would match nothing
+    (caller should short-circuit with an empty result).
+    """
+    by_source: dict[str, list[str]] = (filter_dict or {}).get("by_source") or {}
+    if not by_source:
+        return None
+
+    clauses = []
+    for source, scope_values in by_source.items():
+        col_name = _FILTER_COLUMNS_BY_SOURCE.get(source)
+        if not col_name or not scope_values:
+            continue
+        column = getattr(VectorChunk, col_name)
+        clauses.append(
+            (VectorChunk.source == source) & column.in_(scope_values)
         )
 
-    if not or_clauses:
-        return {"source": {"$in": ["__none__"]}}
-    if len(or_clauses) == 1:
-        return or_clauses[0]
-    return {"$or": or_clauses}
+    if not clauses:
+        return None
+    return or_(*clauses) if len(clauses) > 1 else clauses[0]

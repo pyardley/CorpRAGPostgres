@@ -1,5 +1,5 @@
 # Python 3.11 or 3.12 required.
-# The LangChain / Pinecone ecosystem does not yet support Python 3.13+.
+# (Some downstream LangChain packages don't support 3.13+ yet.)
 
 # ── Core framework ─────────────────────────────────────────────────────────
 streamlit>=1.40.0,<2.0
@@ -14,11 +14,12 @@ langchain>=0.3.7,<0.4
 langchain-community>=0.3.7,<0.4
 langchain-openai>=0.2.12,<0.3
 langchain-anthropic>=0.2.4,<0.3
-langchain-pinecone>=0.2.0,<0.3
 langchain-huggingface>=0.1.2,<0.2
 
-# ── Vector DB ──────────────────────────────────────────────────────────────
-pinecone>=5.0.0,<6.0
+# ── Vector store: PostgreSQL + pgvector ────────────────────────────────────
+# Install pgvector at the database level (CREATE EXTENSION vector). Supabase
+# and Neon ship it pre-installed; for local Postgres see README.
+pgvector>=0.3.6,<0.4
 
 # ── Embeddings ─────────────────────────────────────────────────────────────
 openai>=1.57.0,<2.0
@@ -34,11 +35,14 @@ atlassian-python-api>=3.41.0
 # ── GitHub (Git source) ────────────────────────────────────────────────────
 PyGithub>=2.3.0
 
-# ── Database ───────────────────────────────────────────────────────────────
+# ── Database (app + vector store, both Postgres) ───────────────────────────
 sqlalchemy>=2.0.36,<3.0
+# psycopg v3 — the modern Postgres driver. `[binary]` ships pre-built
+# wheels so no compiler is needed.
+psycopg[binary]>=3.2.3,<4.0
 alembic>=1.14.0,<2.0
 
-# ── SQL Server driver ──────────────────────────────────────────────────────
+# ── SQL Server driver (only needed for the SQL Server ingestor) ────────────
 pyodbc>=5.1.0
 
 # ── Security ───────────────────────────────────────────────────────────────

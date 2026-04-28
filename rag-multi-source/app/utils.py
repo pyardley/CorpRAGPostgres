@@ -15,18 +15,28 @@ from app.config import settings
 from models.base import Base
 
 # ── Database engine ───────────────────────────────────────────────────────────
+#
+# Single PostgreSQL connection — the app DB and the vector store live in the
+# same database. `pool_pre_ping` survives idle-connection drops on managed
+# Postgres providers (Supabase, Neon, RDS) which aggressively close
+# connections held open across sleeps.
 
-_connect_args = {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
-
-engine = create_engine(settings.DATABASE_URL, connect_args=_connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_pre_ping=settings.DB_POOL_PRE_PING,
+    future=True,
+)
+SessionLocal = sessionmaker(
+    autocommit=False, autoflush=False, bind=engine, future=True
+)
 
 
 def init_db() -> None:
-    """Create / migrate all tables (idempotent – safe on every startup)."""
-    # Delegated to models.migrations so additive schema changes
-    # (e.g. the new user_accessible_resources table) are applied automatically
-    # for users coming from the previous version.
+    """Create / migrate all tables (idempotent — safe on every startup)."""
+    # Delegated to models.migrations: enables the pgvector extension, creates
+    # missing tables, and ensures the HNSW ANN index exists.
     from models.migrations import run_migrations
 
     run_migrations(engine)

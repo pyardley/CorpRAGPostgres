@@ -1,10 +1,12 @@
 """
-UserAccessibleResource — replaces the old `user_id` filter on every Pinecone vector.
+UserAccessibleResource — the multi-tenancy access table.
 
-Each row says: "user X is allowed to query vectors whose `<source>` metadata field
-equals `<resource_identifier>`". The vector store itself is shared across the whole
-organisation; multi-tenancy is enforced *only* at query time by translating the
-rows in this table into a Pinecone metadata filter.
+Each row says: "user X is allowed to query vector_chunks whose ``source``
+column equals ``<source>`` AND whose per-source identifier column
+(``project_key`` / ``space_key`` / ``db_name`` / ``git_scope``) equals
+``<resource_identifier>``". The vector store itself is shared across the
+whole organisation; tenancy is enforced *only* at query time by translating
+the rows in this table into a SQL ``WHERE`` clause.
 
 The (user_id, source, resource_identifier) tuple is unique.
 """

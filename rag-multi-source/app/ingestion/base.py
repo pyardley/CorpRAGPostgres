@@ -1,27 +1,29 @@
 """
 Base ingestor — the contract every source-specific ingestor must satisfy.
 
-In the new architecture there is **one** Pinecone index for the whole
-organisation. The base class is the only place that talks to the vector store
-during ingestion, which makes the "store-once + dedup" guarantee enforceable.
+There is one shared ``vector_chunks`` table in Postgres for the whole
+organisation. The base class is the only place that talks to the vector
+store during ingestion, which makes the "store-once + dedup" guarantee
+enforceable.
 
 Subclass responsibilities
 -------------------------
 1. Set the ``source`` class attribute (e.g. ``"jira"``).
 2. Implement :meth:`fetch_resources` — yield :class:`SourceResource` objects.
-3. Implement :meth:`scope_filter` — Pinecone filter used to wipe the user's
-   selected scope when ``mode == "full"``.
+3. Implement :meth:`scope_filter` — filter dict consumed by
+   ``core.vector_store.delete_by_filter`` to wipe the user's selected scope
+   when ``mode == "full"``.
 4. Implement :meth:`resource_identifier_for` — the value to store in
    ``user_accessible_resources.resource_identifier`` (the project_key /
-   space_key / db_name).
+   space_key / db_name / git_scope).
 
 The base class handles:
   * chunking with the shared text splitter,
-  * deterministic vector IDs,
-  * dedup against Pinecone (incremental skips re-fetching if you don't),
-  * full-mode wipe-then-rebuild via metadata filter (no `user_id` involved),
-  * `IngestionLog` rows for full / incremental baselines,
-  * `grant_access()` into ``user_accessible_resources``.
+  * deterministic chunk identity via ``(resource_id, chunk_index)`` ON
+    CONFLICT DO UPDATE so re-ingest is a clean overwrite,
+  * full-mode wipe-then-rebuild via metadata filter (no per-user data),
+  * ``IngestionLog`` rows for full / incremental baselines,
+  * ``grant_access()`` into ``user_accessible_resources``.
 """
 
 from __future__ import annotations
@@ -133,7 +135,7 @@ class BaseIngestor(ABC):
 
     @abstractmethod
     def scope_filter(self) -> dict[str, Any]:
-        """Pinecone metadata filter used to wipe the scope in ``--mode full``."""
+        """Filter dict used to wipe the scope in ``--mode full``."""
 
     @abstractmethod
     def resource_identifier_for(self, resource: SourceResource) -> str:

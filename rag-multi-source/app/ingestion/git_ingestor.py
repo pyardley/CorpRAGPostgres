@@ -9,8 +9,7 @@ resource_id format
 
 resource_identifier (for the access table) is ``{repo_full_name}@{branch}``,
 e.g. ``acme/widgets@main``. This is also written to each chunk's
-``git_scope`` metadata field, which the dynamic Pinecone filter targets at
-query time.
+``git_scope`` column, which the retriever filter targets at query time.
 
 Scope semantics
 ---------------

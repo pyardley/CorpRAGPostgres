@@ -1,5 +1,5 @@
 """
-Chat UI - turns each user message into a Pinecone metadata-filtered retrieval
+Chat UI - turns each user message into a metadata-filtered pgvector retrieval
 plus an LLM call, and renders the result with citations.
 
 Multi-tenancy is enforced *here* at query time. The retriever does NOT inject
@@ -22,7 +22,7 @@ from core.vector_store import build_query_filter
 
 
 def _build_filter(state: SelectionState) -> dict[str, Any]:
-    """Translate the SelectionState into a Pinecone metadata filter."""
+    """Translate the SelectionState into a vector_chunks metadata filter."""
     return build_query_filter(
         selected_sources=state.sources,
         accessible_jira_projects=state.jira_projects,

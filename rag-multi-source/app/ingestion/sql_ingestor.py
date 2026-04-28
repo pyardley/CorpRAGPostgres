@@ -76,11 +76,28 @@ class SQLIngestor(BaseIngestor):
     # ── Engine ───────────────────────────────────────────────────────────────
 
     def _make_engine(self, db_name: Optional[str] = None):
-        from sqlalchemy import create_engine
+        """
+        Build a SQLAlchemy engine for the given database.
+
+        Why this is more involved than just ``DATABASE=...`` in the conn
+        string: with some SQL Server setups (especially Windows
+        authentication where the login has a server-level *default
+        database* assignment), the ``DATABASE=`` clause in the ODBC
+        connection string is silently ignored — the login lands in its
+        default DB regardless. The reliable way to guarantee we're inside
+        the target catalog is to run ``USE [db_name]`` immediately after
+        every connect.
+
+        We do that via a SQLAlchemy ``connect`` event listener so it
+        fires for every pooled connection automatically.
+        """
+        from sqlalchemy import create_engine, event
         from sqlalchemy.engine import URL
 
         conn_str = self._base_conn_str
         if db_name and db_name != "all":
+            # Still adjust the DATABASE= clause as a hint to the driver —
+            # cheap, and helps when the server *does* respect it.
             if "DATABASE=" in conn_str.upper():
                 conn_str = re.sub(
                     r"DATABASE=[^;]+",
@@ -92,7 +109,23 @@ class SQLIngestor(BaseIngestor):
                 conn_str += f";DATABASE={db_name}"
 
         url = URL.create("mssql+pyodbc", query={"odbc_connect": conn_str})
-        return create_engine(url, fast_executemany=True)
+        engine = create_engine(url, fast_executemany=True)
+
+        if db_name and db_name != "all":
+            target = db_name  # capture before the listener closure
+
+            @event.listens_for(engine, "connect")
+            def _force_db(dbapi_conn, _conn_record):
+                # Use the raw DB-API cursor; SQLAlchemy isn't ready yet at
+                # connect-time. The bracket-quoted name handles dbs with
+                # spaces / hyphens.
+                cursor = dbapi_conn.cursor()
+                try:
+                    cursor.execute(f"USE [{target}]")
+                finally:
+                    cursor.close()
+
+        return engine
 
     # ── Abstract API ─────────────────────────────────────────────────────────
 

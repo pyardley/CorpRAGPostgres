@@ -1,17 +1,19 @@
 """
 Streamlit sidebar - source selection, credentials, and ingestion controls.
 
-What's different from the old version
--------------------------------------
-* The Pinecone index is shared across the whole org. The sidebar no longer
-  decides "what data exists"; it decides "what the *current user* is allowed
-  to query right now". The source of truth for that is the
+Design notes
+------------
+* The ``vector_chunks`` table is shared across the whole org. The sidebar
+  doesn't decide "what data exists" — it decides "what the *current user*
+  is allowed to query right now". The source of truth for that is the
   ``user_accessible_resources`` table.
-* Scope dropdowns are populated from that table, NOT from a live API call to
-  Jira/Confluence/SQL/Git. The accessible_resources rows are inserted by the
-  ingestion pipeline whenever the user has successfully ingested a scope.
-* The chat layer uses :class:`SelectionState` to build a Pinecone metadata
-  filter (see ``core.vector_store.build_query_filter``).
+* Scope dropdowns are populated from that table, NOT from a live API call
+  to Jira/Confluence/SQL/Git. ``user_accessible_resources`` rows are
+  inserted by the ingestion pipeline whenever the user has successfully
+  ingested a scope.
+* The chat layer uses :class:`SelectionState` to build a metadata filter
+  (see ``core.vector_store.build_query_filter``) which the retriever
+  turns into a SQL ``WHERE`` clause.
 """
 
 from __future__ import annotations
@@ -53,32 +55,112 @@ def _credential_form(
     fields: list[tuple[str, str, bool]],
     form_key: Optional[str] = None,
 ) -> None:
+    """
+    Render a form that saves encrypted credentials.
+
+    `fields` is a list of (key, label, is_secret) tuples. For non-secret
+    fields the existing value is shown editable. For secret fields:
+      * an empty input is shown by default (we never decrypt + display
+        on the page);
+      * the field's *length* is shown in the caption so the user can
+        confirm a value is saved;
+      * leaving the field empty on save keeps the existing value
+        (i.e. you only need to type something when you want to overwrite).
+
+    The connection-string field for SQL uses a multi-line text_area so
+    long ODBC strings (~150 chars) are easier to read and edit.
+    """
     user = current_user()
     if not user:
         return
 
     key = form_key or f"creds_{source}"
+
+    # Show any status carried across from the previous run so the user
+    # actually sees the success/info banner — st.rerun() at submit time
+    # otherwise wipes one-shot messages immediately.
+    status_key = f"_creds_status_{key}"
+    pending = st.session_state.pop(status_key, None)
+    if pending:
+        level, msg = pending
+        if level == "success":
+            st.success(msg)
+        elif level == "info":
+            st.info(msg)
+        elif level == "error":
+            st.error(msg)
+
     with st.form(key):
         values: dict[str, str] = {}
         with get_db() as db:
             existing = load_all_credentials(db, user["id"], source)
+
         for field_key, label, is_secret in fields:
             existing_val = existing.get(field_key, "")
-            placeholder = "●●●●●●●●" if (is_secret and existing_val) else ""
-            values[field_key] = st.text_input(
-                label,
-                value="" if is_secret else existing_val,
-                type="password" if is_secret else "default",
-                placeholder=placeholder,
-                key=f"{key}_{field_key}",
-            )
+            widget_key = f"{key}_{field_key}"
+            is_long = field_key == "conn_str"
+
+            if is_secret:
+                # Caption tells the user whether something is saved without
+                # exposing the value.
+                if existing_val:
+                    st.caption(
+                        f"**{label}** — currently saved "
+                        f"({len(existing_val)} characters). "
+                        f"Type a new value below to overwrite; leave blank "
+                        f"to keep the saved value."
+                    )
+                else:
+                    st.caption(f"**{label}** — no value saved yet.")
+
+                if is_long:
+                    values[field_key] = st.text_area(
+                        label,
+                        value="",
+                        placeholder="DRIVER={ODBC Driver 18 for SQL Server};"
+                                    "SERVER=…;DATABASE=…;UID=…;PWD=…;"
+                                    "TrustServerCertificate=yes",
+                        key=widget_key,
+                        height=120,
+                        label_visibility="collapsed",
+                    )
+                else:
+                    values[field_key] = st.text_input(
+                        label,
+                        value="",
+                        type="password",
+                        placeholder=("●●●●●●●●" if existing_val else ""),
+                        key=widget_key,
+                        label_visibility="collapsed",
+                    )
+            else:
+                values[field_key] = st.text_input(
+                    label,
+                    value=existing_val,
+                    type="default",
+                    key=widget_key,
+                )
+
         if st.form_submit_button("Save credentials", use_container_width=True):
+            saved: list[str] = []
             with get_db() as db:
-                for field_key, _, _ in fields:
+                for field_key, _label, _is_secret in fields:
                     val = values[field_key].strip()
                     if val:
                         save_credential(db, user["id"], source, field_key, val)
-            st.success(f"{source.title()} credentials saved.")
+                        saved.append(field_key)
+            if saved:
+                st.session_state[status_key] = (
+                    "success",
+                    f"{source.title()}: saved {', '.join(saved)} "
+                    f"({len(saved)} field{'s' if len(saved) != 1 else ''}).",
+                )
+            else:
+                st.session_state[status_key] = (
+                    "info",
+                    f"{source.title()}: nothing to save — all fields were "
+                    f"left blank. (Existing values preserved.)",
+                )
             st.rerun()
 
 
@@ -368,7 +450,7 @@ def render_sidebar() -> SelectionState:
         with st.expander("🛡 Manage my access"):
             st.caption(
                 "Each row is a scope you can currently query. Removing a row "
-                "doesn't delete vectors from Pinecone - it only revokes "
+                "doesn't delete vectors from the database - it only revokes "
                 "*your* visibility into that scope."
             )
             for src in ("jira", "confluence", "sql", "git"):
