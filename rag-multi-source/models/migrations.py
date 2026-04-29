@@ -29,7 +29,22 @@ from models.base import Base
 
 # (table_name, column_name, column_ddl). Example:
 #   ("users", "is_admin", "BOOLEAN NOT NULL DEFAULT FALSE")
-_ADDITIVE_COLUMNS: Iterable[tuple[str, str, str]] = ()
+_ADDITIVE_COLUMNS: Iterable[tuple[str, str, str]] = (
+    # Email source — added after the original 4-source schema was deployed.
+    # Nullable so existing rows (jira/confluence/sql/git) stay valid.
+    ("vector_chunks", "email_provider", "VARCHAR(32) NULL"),
+)
+
+# (index_name, table_name, ddl). Idempotent — checked via _index_exists.
+_ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
+    (
+        "ix_vector_chunks_email_provider",
+        "vector_chunks",
+        "CREATE INDEX IF NOT EXISTS ix_vector_chunks_email_provider "
+        "ON vector_chunks (email_provider) "
+        "WHERE email_provider IS NOT NULL",
+    ),
+)
 
 
 def _existing_columns(engine: Engine, table: str) -> set[str]:
@@ -89,5 +104,14 @@ def run_migrations(engine: Engine) -> None:
             conn.execute(
                 text(f'ALTER TABLE "{table}" ADD COLUMN {column} {ddl}')
             )
+
+    # 5. Additive indexes (CREATE INDEX IF NOT EXISTS already idempotent,
+    #    but we double-check the inspector first to avoid noisy logs).
+    with engine.begin() as conn:
+        for index_name, table, ddl in _ADDITIVE_INDEXES:
+            if _index_exists(engine, table, index_name):
+                continue
+            logger.info("Creating index {} on {}", index_name, table)
+            conn.execute(text(ddl))
 
     logger.info("Schema migrations complete.")

@@ -35,6 +35,14 @@ atlassian-python-api>=3.41.0
 # ── GitHub (Git source) ────────────────────────────────────────────────────
 PyGithub>=2.3.0
 
+# ── Email (Outlook / Microsoft Graph + Gmail) ──────────────────────────────
+# Outlook is reached via the public Graph REST API using `requests` + a
+# refresh-token grant — no Microsoft SDK required. Gmail uses the official
+# Google API client with google-auth for OAuth2 token handling.
+google-api-python-client>=2.149.0,<3.0
+google-auth>=2.35.0,<3.0
+google-auth-oauthlib>=1.2.1,<2.0
+
 # ── Database (app + vector store, both Postgres) ───────────────────────────
 sqlalchemy>=2.0.36,<3.0
 # psycopg v3 — the modern Postgres driver. `[binary]` ships pre-built

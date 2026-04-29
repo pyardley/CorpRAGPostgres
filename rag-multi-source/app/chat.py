@@ -29,6 +29,7 @@ def _build_filter(state: SelectionState) -> dict[str, Any]:
         accessible_confluence_spaces=state.confluence_spaces,
         accessible_databases=state.sql_databases,
         accessible_git_scopes=state.git_scopes,
+        accessible_email_providers=state.email_providers,
     )
 
 
@@ -66,6 +67,18 @@ def _render_citations(citations: list[RetrievedChunk]) -> None:
             else:
                 file_path = c.metadata.get("file_path", "")
                 label = f"{repo}@{branch} \u00b7 `{file_path}`"
+        elif c.source == "email":
+            provider = c.metadata.get("email_provider", "email")
+            sender = c.metadata.get("from", "")
+            badge = (
+                "\U0001F4E8 Outlook"
+                if provider == "outlook"
+                else "\U0001F4EC Gmail"
+                if provider == "gmail"
+                else "\u2709 Email"
+            )
+            subject = c.title or c.resource_id
+            label = f"{subject} \u2014 _{sender}_" if sender else subject
         else:
             badge = "\u2022"
             label = c.title or c.resource_id
@@ -91,6 +104,8 @@ def _badges(state: SelectionState) -> str:
         parts.append(f"\U0001F7E0 SQL ({len(state.sql_databases)}){suffix}")
     if "git" in state.sources and state.git_scopes:
         parts.append(f"\U0001F7E3 Git ({len(state.git_scopes)})")
+    if "email" in state.sources and state.email_providers:
+        parts.append(f"\u2709 Email ({len(state.email_providers)})")
     return " \u00b7 ".join(parts) if parts else ""
 
 
@@ -131,7 +146,7 @@ def render_chat(state: SelectionState) -> None:
                 _render_citations(msg["citations"])
 
     prompt = st.chat_input(
-        "Ask anything about your Jira, Confluence, SQL, or Git data\u2026"
+        "Ask anything about your Jira, Confluence, SQL, Git, or Email data\u2026"
     )
     if not prompt:
         return

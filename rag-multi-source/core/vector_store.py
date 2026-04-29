@@ -63,7 +63,13 @@ class ResourceChunk:
 # Columns we promote out of `chunk.metadata` onto their own DB column for
 # fast indexed filtering. The ingestors put the right value into metadata
 # under the matching key.
-_PROMOTED_FIELDS = ("project_key", "space_key", "db_name", "git_scope")
+_PROMOTED_FIELDS = (
+    "project_key",
+    "space_key",
+    "db_name",
+    "git_scope",
+    "email_provider",
+)
 
 # Per-source filter column. Used by both `build_query_filter` and the
 # retriever to know which column to constrain.
@@ -72,6 +78,7 @@ _FILTER_COLUMNS_BY_SOURCE = {
     "confluence": "space_key",
     "sql": "db_name",
     "git": "git_scope",
+    "email": "email_provider",
 }
 
 
@@ -179,8 +186,8 @@ def delete_by_filter(filter_dict: dict[str, Any]) -> int:
     Supported keys:
 
       * ``source`` — string
-      * ``project_key`` / ``space_key`` / ``db_name`` / ``git_scope`` —
-        a string, a list, or ``{"$in": [...]}``
+      * ``project_key`` / ``space_key`` / ``db_name`` / ``git_scope`` /
+        ``email_provider`` — a string, a list, or ``{"$in": [...]}``
 
     Used by ``--mode full`` to wipe a scope before re-ingesting it.
     """
@@ -234,13 +241,14 @@ def build_query_filter(
     accessible_confluence_spaces: Optional[list[str]] = None,
     accessible_databases: Optional[list[str]] = None,
     accessible_git_scopes: Optional[list[str]] = None,
+    accessible_email_providers: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """
     Translate (selected sources × accessible-resources rows) into a structured
     filter dict consumed by :func:`core.retriever.retrieve`.
 
     Per-source clauses are OR'd together so one query can span Jira +
-    Confluence + SQL + Git.
+    Confluence + SQL + Git + Email.
 
     Example output::
 
@@ -249,6 +257,7 @@ def build_query_filter(
                 "jira":       ["PROJ", "OPS"],
                 "confluence": ["DOCS"],
                 "git":        ["acme/widgets@main"],
+                "email":      ["outlook", "gmail"],
             }
         }
     """
@@ -262,6 +271,8 @@ def build_query_filter(
         by_source["sql"] = list(accessible_databases)
     if "git" in selected_sources and accessible_git_scopes:
         by_source["git"] = list(accessible_git_scopes)
+    if "email" in selected_sources and accessible_email_providers:
+        by_source["email"] = list(accessible_email_providers)
 
     return {"by_source": by_source}
 

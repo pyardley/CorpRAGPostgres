@@ -47,6 +47,9 @@ class SelectionState:
     # For git, each entry is "{repo_full_name}@{branch}", matching the
     # `git_scope` field written to chunk metadata.
     git_scopes: list[str] = field(default_factory=list)
+    # For email, each entry is a provider name: "outlook" and/or "gmail",
+    # matching the `email_provider` column on vector_chunks.
+    email_providers: list[str] = field(default_factory=list)
     # When True, the chat layer will route through core.mcp_chain so the
     # LLM can call live SQL Server tools (read-only) on top of the RAG
     # context. Off by default — pure-RAG is the safe baseline.
@@ -347,12 +350,19 @@ def render_sidebar() -> SelectionState:
                     "Repos+branches", "git", user["id"]
                 )
 
+        if st.checkbox("Email", value=True, key="src_email"):
+            state.sources.append("email")
+            with st.expander("📧 Email mailboxes (outlook / gmail)", expanded=True):
+                state.email_providers = _scope_picker(
+                    "Mailboxes", "email", user["id"]
+                )
+
         st.divider()
 
         # Credentials
         with st.expander("🔑 Credentials"):
-            tab_j, tab_c, tab_s, tab_g = st.tabs(
-                ["Jira", "Confluence", "SQL", "Git"]
+            tab_j, tab_c, tab_s, tab_g, tab_e = st.tabs(
+                ["Jira", "Confluence", "SQL", "Git", "Email"]
             )
 
             with tab_j:
@@ -432,6 +442,50 @@ def render_sidebar() -> SelectionState:
                         form_key="creds_git_2",
                     )
 
+            with tab_e:
+                st.caption(
+                    "Connect Outlook / Microsoft 365 and / or Gmail. "
+                    "Each provider's credentials are independent — fill in "
+                    "only the section(s) you want to ingest."
+                )
+                with st.expander("📨 Outlook / Microsoft 365", expanded=True):
+                    st.caption(
+                        "Register an app in Azure AD with delegated `Mail.Read` "
+                        "permission. For personal outlook.com / yahoo accounts "
+                        "use tenant `common` and supply a refresh token."
+                    )
+                    _credential_form(
+                        "email",
+                        [
+                            ("outlook_tenant_id", "Tenant ID (or 'common')", False),
+                            ("outlook_client_id", "Client (Application) ID", False),
+                            ("outlook_client_secret", "Client Secret (optional)", True),
+                            ("outlook_refresh_token", "Refresh Token", True),
+                            ("outlook_user", "Mailbox UPN (optional, blank = /me)", False),
+                            ("outlook_folder", "Folder filter (optional, e.g. inbox)", False),
+                        ],
+                        form_key="creds_email_outlook",
+                    )
+                with st.expander("📬 Gmail", expanded=True):
+                    st.caption(
+                        "Create OAuth client credentials at console.cloud.google.com, "
+                        "grant the `gmail.readonly` scope, and obtain a refresh token "
+                        "with a one-time installed-app flow. Alternatively paste a "
+                        "full token.json blob in the field below."
+                    )
+                    _credential_form(
+                        "email",
+                        [
+                            ("gmail_client_id", "OAuth Client ID", False),
+                            ("gmail_client_secret", "OAuth Client Secret", True),
+                            ("gmail_refresh_token", "Refresh Token", True),
+                            ("gmail_token_json", "Full token.json (optional)", True),
+                            ("gmail_user", "Mailbox address (optional, default 'me')", False),
+                            ("gmail_label", "Label filter (optional, e.g. INBOX)", False),
+                        ],
+                        form_key="creds_email_gmail",
+                    )
+
         # Ingestion controls — incremental only.
         # Full-mode ingestion is intentionally NOT exposed in the UI: a full
         # ingest wipes by metadata filter (not by user_id), so a user with a
@@ -442,11 +496,12 @@ def render_sidebar() -> SelectionState:
         with st.expander("⚙️ Ingest data"):
             ing_source = st.selectbox(
                 "Source",
-                ["all", "jira", "confluence", "sql", "git"],
+                ["all", "jira", "confluence", "sql", "git", "email"],
                 key="ing_source",
             )
             ing_scope = st.text_input(
-                "Scope (project_key / space_key / db_name / branch, or 'all')",
+                "Scope (project_key / space_key / db_name / branch / "
+                "'outlook' | 'gmail' / folder, or 'all')",
                 value="all",
                 key="ing_scope",
             )
@@ -470,7 +525,7 @@ def render_sidebar() -> SelectionState:
                 "doesn't delete vectors from the database - it only revokes "
                 "*your* visibility into that scope."
             )
-            for src in ("jira", "confluence", "sql", "git"):
+            for src in ("jira", "confluence", "sql", "git", "email"):
                 with get_db() as db:
                     items = sorted(list_accessible(db, user["id"], src))
                 if not items:

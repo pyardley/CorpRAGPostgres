@@ -103,6 +103,7 @@ def retrieve(
             VectorChunk.space_key,
             VectorChunk.db_name,
             VectorChunk.git_scope,
+            VectorChunk.email_provider,
             VectorChunk.object_name,
             VectorChunk.last_updated,
             VectorChunk.extra,
@@ -131,6 +132,7 @@ def retrieve(
             "space_key",
             "db_name",
             "git_scope",
+            "email_provider",
             "object_name",
             "last_updated",
         ):

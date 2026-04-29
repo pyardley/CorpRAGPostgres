@@ -244,6 +244,18 @@ python -m app.ingestion.cli --source confluence --mode full --scope DOCS \
 python -m app.ingestion.cli --source git --mode incremental --scope main \
     --email me@org.com
 
+# Email — defaults to the previous calendar month if there's no prior log
+python -m app.ingestion.cli --source email --mode incremental \
+    --email me@org.com
+
+# Email — pin to a specific calendar month
+python -m app.ingestion.cli --source email --mode month --month 2025-03 \
+    --email me@org.com
+
+# Email — only one provider (outlook | gmail)
+python -m app.ingestion.cli --source email --mode incremental --scope outlook \
+    --email me@org.com
+
 # Everything for everything
 python -m app.ingestion.cli --source all --mode incremental --scope all \
     --email me@org.com
@@ -251,10 +263,11 @@ python -m app.ingestion.cli --source all --mode incremental --scope all \
 
 ### Mode semantics
 
-| Mode          | What happens                                                                                                                     |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `full`        | `DELETE FROM vector_chunks WHERE source = ... AND <scope-key> IN (...)`, then re-fetch + re-embed.                               |
-| `incremental` | Fetches resources updated since this user's last successful run; overwrites their chunks via `INSERT ... ON CONFLICT DO UPDATE`. |
+| Mode          | What happens                                                                                                                                                                                                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `full`        | `DELETE FROM vector_chunks WHERE source = ... AND <scope-key> IN (...)`, then re-fetch + re-embed.                                                                                                                                                |
+| `incremental` | Fetches resources updated since this user's last successful run; overwrites their chunks via `INSERT ... ON CONFLICT DO UPDATE`. For the **email** source the very first run defaults to the **previous calendar month** instead of full history. |
+| `month`       | **Email source only.** Combine with `--month YYYY-MM` to ingest exactly that calendar month — useful for backfills.                                                                                                                               |
 
 In both modes, on success the user is granted access to every
 `(source, resource_identifier)` they ingested.
@@ -263,6 +276,123 @@ In both modes, on success the user is granted access to every
 user with a narrower view than the previous ingestor would silently delete
 chunks of resources only the previous ingestor could see. Run full ingests
 from the CLI on an admin account that owns the union of all scopes.
+
+---
+
+### Email source — obtaining credentials
+
+The email ingestor supports two providers in a single run: **Outlook /
+Microsoft 365** (incl. personal `outlook.com`, `live.com`, `hotmail.com`,
+and federated yahoo accounts that route through Outlook) and **Gmail**.
+Each provider is independent — fill in only the section(s) you actually
+want to ingest. All values are stored encrypted in `user_credentials`
+under `source = "email"`.
+
+UI: **Sidebar → 🔑 Credentials → Email → Outlook / Gmail sub-form**.
+
+#### Outlook / Microsoft 365 (e.g. `paul_r_yardley@yahoo.co.uk` linked to
+
+outlook.com)
+
+We use the **delegated public-client flow** with a long-lived refresh
+token. This works for both organisational tenants and personal
+Microsoft accounts.
+
+1. **Register a public-client app in Microsoft Entra ID**
+   ([entra.microsoft.com](https://entra.microsoft.com) → Identity → App
+   registrations → New registration).
+   - **Supported account types**: pick _"Accounts in any organizational
+     directory and personal Microsoft accounts"_.
+   - **Redirect URI**: select **Public client / native** and use
+     `http://localhost`.
+   - After creation, on the **Authentication** blade enable
+     _"Allow public client flows"_.
+2. **Grant delegated permissions** under _API permissions_:
+   - `Microsoft Graph → Delegated → Mail.Read`
+   - `Microsoft Graph → Delegated → offline_access` (required to receive
+     a `refresh_token`).
+   - Click _Grant admin consent_ if you have admin rights — otherwise
+     consent will happen interactively on first sign-in.
+3. **Capture a refresh token once** with a short helper script (run it
+   on your laptop, paste the output into the UI). Drop the snippet
+   below into `scripts/get_outlook_refresh_token.py`:
+
+   ```python
+   import msal, webbrowser
+   CLIENT_ID = "<application-id-from-step-1>"
+   AUTHORITY = "https://login.microsoftonline.com/common"
+   SCOPES    = ["Mail.Read", "offline_access"]
+   app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+   flow = app.initiate_device_flow(scopes=SCOPES)
+   print(flow["message"])              # → open URL, enter code
+   webbrowser.open(flow["verification_uri"])
+   result = app.acquire_token_by_device_flow(flow)
+   print("REFRESH TOKEN:\n", result["refresh_token"])
+   ```
+
+   `pip install msal && python scripts/get_outlook_refresh_token.py`,
+   sign in as `paul_r_yardley@yahoo.co.uk`, approve the prompt, and copy
+   the printed refresh token.
+
+4. **Paste into the UI** under _Outlook / Microsoft 365_:
+   - **Tenant ID** → `common` (use your tenant GUID for org accounts only)
+   - **Client (Application) ID** → from step 1
+   - **Client Secret** → leave blank (public-client flow doesn't need one)
+   - **Refresh Token** → from step 3
+   - **Mailbox UPN** → leave blank (the `/me` endpoint resolves itself)
+   - **Folder filter** → e.g. `inbox` to limit to Inbox; blank = all mail
+
+#### Gmail (e.g. `pr.yardley@gmail.com`)
+
+We use the standard **installed-app OAuth 2.0 flow** to obtain a
+refresh token, then store either the discrete keys or the full
+`token.json` blob.
+
+1. **Create OAuth credentials** in the
+   [Google Cloud Console](https://console.cloud.google.com/):
+   - Enable the **Gmail API** for your project.
+   - _APIs & Services → OAuth consent screen_ → External, add yourself
+     as a test user, scope `.../auth/gmail.readonly`.
+   - _APIs & Services → Credentials → Create credentials → OAuth client
+     ID → Application type: Desktop app_. Download the resulting JSON
+     as `client_secret.json`.
+2. **Run a one-time installed-app flow** to mint a refresh token. Save
+   the snippet below as `scripts/get_gmail_token.py`:
+
+   ```python
+   from google_auth_oauthlib.flow import InstalledAppFlow
+   SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+   flow  = InstalledAppFlow.from_client_secrets_file(
+       "client_secret.json", SCOPES
+   )
+   creds = flow.run_local_server(port=0)
+   with open("token.json", "w") as f:
+       f.write(creds.to_json())
+   print("Saved token.json — paste its contents into gmail_token_json.")
+   ```
+
+   `pip install google-auth-oauthlib && python scripts/get_gmail_token.py`,
+   sign in as `pr.yardley@gmail.com`, click _Allow_. The browser tab
+   closes automatically and a `token.json` file appears next to the
+   script.
+
+3. **Paste into the UI** under _Gmail_. You have two equally-supported
+   options:
+   - **Recommended (one-field)**: paste the full contents of
+     `token.json` into the **Full token.json** field — leave the other
+     three credential fields blank.
+   - **Discrete fields**: instead of the blob, paste **Client ID**,
+     **Client Secret** (from `client_secret.json`) and **Refresh
+     Token** (the `refresh_token` value inside `token.json`).
+   - **Mailbox address** → blank or `me` (resolves to the authenticated
+     account)
+   - **Label filter** → e.g. `INBOX` to limit to Inbox; blank = all mail
+
+> 🔐 Both refresh tokens are encrypted at rest with the same
+> Fernet key (`ENCRYPTION_KEY`) used for every other connector
+> credential. Treat them like passwords — anyone holding a refresh
+> token can read the mailbox until the token is revoked from the
+> provider's account-security page.
 
 ---
 
@@ -287,6 +417,7 @@ rag-multi-source/
 │       ├── confluence_ingestor.py
 │       ├── sql_ingestor.py
 │       ├── git_ingestor.py
+│       ├── email_ingestor.py                 # Outlook (Graph) + Gmail
 │       └── cli.py
 ├── core/
 │   ├── llm.py                            # embeddings + LLM factory

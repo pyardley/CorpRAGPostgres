@@ -61,6 +61,9 @@ class VectorChunk(Base):
     space_key = Column(String(255), nullable=True)
     db_name = Column(String(255), nullable=True)
     git_scope = Column(String(512), nullable=True)
+    # Email source: "outlook" | "gmail". Tracked separately so the access
+    # table and the query-time filter can target each mailbox individually.
+    email_provider = Column(String(32), nullable=True)
 
     # Common displayable metadata (cheaper to read than a JSONB extract).
     title = Column(Text, nullable=True)
@@ -111,6 +114,11 @@ class VectorChunk(Base):
             "ix_vector_chunks_git_scope",
             "git_scope",
             postgresql_where=Column("git_scope").isnot(None),
+        ),
+        Index(
+            "ix_vector_chunks_email_provider",
+            "email_provider",
+            postgresql_where=Column("email_provider").isnot(None),
         ),
     )
 
