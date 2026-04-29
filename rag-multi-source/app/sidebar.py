@@ -47,6 +47,10 @@ class SelectionState:
     # For git, each entry is "{repo_full_name}@{branch}", matching the
     # `git_scope` field written to chunk metadata.
     git_scopes: list[str] = field(default_factory=list)
+    # When True, the chat layer will route through core.mcp_chain so the
+    # LLM can call live SQL Server tools (read-only) on top of the RAG
+    # context. Off by default — pure-RAG is the safe baseline.
+    use_mcp_sql: bool = False
 
 
 # Credential form
@@ -322,6 +326,19 @@ def render_sidebar() -> SelectionState:
             state.sources.append("sql")
             with st.expander("🟠 SQL databases", expanded=True):
                 state.sql_databases = _scope_picker("Databases", "sql", user["id"])
+                state.use_mcp_sql = st.toggle(
+                    "⚡ Use Live SQL Table Data (MCP)",
+                    value=st.session_state.get("use_mcp_sql", False),
+                    key="use_mcp_sql",
+                    help=(
+                        "When ON, the chat agent can call read-only SQL "
+                        "tools to fetch live row data from your SQL Server "
+                        "in addition to the indexed schema/proc-code RAG. "
+                        "Hard-capped at 100 rows per query, no DDL/DML."
+                    ),
+                )
+                if state.use_mcp_sql:
+                    _render_mcp_status()
 
         if st.checkbox("Git", value=True, key="src_git"):
             state.sources.append("git")
@@ -468,6 +485,26 @@ def render_sidebar() -> SelectionState:
                         st.rerun()
 
     return state
+
+
+# MCP status badge
+def _render_mcp_status() -> None:
+    """Tiny status line under the MCP toggle so the user knows it's wired up."""
+    try:
+        from app.mcp_manager import mcp_status
+    except Exception:  # noqa: BLE001 - never block the sidebar on this
+        st.caption("⚪ MCP: status unavailable")
+        return
+    info = mcp_status()
+    if info["healthy"] and info["token_set"]:
+        st.caption(f"🟢 MCP: connected ({info['base_url']})")
+    elif info["healthy"]:
+        st.caption(f"🟡 MCP: reachable but no token ({info['base_url']})")
+    else:
+        st.caption(
+            f"🔴 MCP: not reachable at {info['base_url']} — "
+            f"check the server / restart the app"
+        )
 
 
 # Recent ingestion logs

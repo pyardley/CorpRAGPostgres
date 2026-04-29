@@ -45,11 +45,16 @@ def _render_citations(citations: list[RetrievedChunk]) -> None:
             badge = "\U0001F7E2 Confluence"
             label = c.title or c.resource_id
         elif c.source == "sql":
-            badge = "\U0001F7E0 SQL"
             obj = c.metadata.get("object_name", "")
             db = c.metadata.get("db_name", "")
             obj_type = c.metadata.get("object_type", "object").upper()
-            label = f"{db} \u203a {obj} ({obj_type})"
+            if c.metadata.get("via") == "mcp":
+                badge = "\u26A1 SQL (live, MCP)"
+                rows = c.metadata.get("row_count", "?")
+                label = f"Live data from `{db}` \u2014 {rows} row(s)"
+            else:
+                badge = "\U0001F7E0 SQL"
+                label = f"{db} \u203a {obj} ({obj_type})"
         elif c.source == "git":
             badge = "\U0001F7E3 Git"
             repo = c.metadata.get("repo_name", "")
@@ -82,7 +87,8 @@ def _badges(state: SelectionState) -> str:
     if "confluence" in state.sources and state.confluence_spaces:
         parts.append(f"\U0001F7E2 Confluence ({len(state.confluence_spaces)})")
     if "sql" in state.sources and state.sql_databases:
-        parts.append(f"\U0001F7E0 SQL ({len(state.sql_databases)})")
+        suffix = " + \u26A1MCP" if state.use_mcp_sql else ""
+        parts.append(f"\U0001F7E0 SQL ({len(state.sql_databases)}){suffix}")
     if "git" in state.sources and state.git_scopes:
         parts.append(f"\U0001F7E3 Git ({len(state.git_scopes)})")
     return " \u00b7 ".join(parts) if parts else ""
@@ -145,7 +151,18 @@ def render_chat(state: SelectionState) -> None:
                     for m in st.session_state.messages
                     if m["role"] in {"user", "assistant"}
                 ][:-1]
-                result: RAGAnswer = answer_question(prompt, hits, history)
+                if state.use_mcp_sql and "sql" in state.sources:
+                    # Hybrid path: RAG context + bound SQL MCP tools.
+                    from core.mcp_chain import answer_question_with_mcp
+
+                    result = answer_question_with_mcp(
+                        user_id=user["id"],
+                        question=prompt,
+                        hits=hits,
+                        history=history,
+                    )
+                else:
+                    result: RAGAnswer = answer_question(prompt, hits, history)
             except Exception as exc:
                 logger.exception("Chat error")
                 result = RAGAnswer(

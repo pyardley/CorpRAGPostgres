@@ -86,6 +86,22 @@ if current_user() is None:
 # Authenticated app
 from app.sidebar import render_sidebar  # noqa: E402
 from app.chat import render_chat  # noqa: E402
+from app.mcp_manager import ensure_mcp_running  # noqa: E402
+
+# Boot the MCP server on first authenticated load. We only do this once per
+# Streamlit process (cached in session_state) so reruns don't keep re-probing.
+if not st.session_state.get("_mcp_bootstrapped"):
+    try:
+        ok = ensure_mcp_running()
+        st.session_state["_mcp_bootstrapped"] = True
+        if not ok:
+            logger.warning(
+                "MCP server failed to start — Live SQL Table Data toggle "
+                "will be unavailable."
+            )
+    except Exception:
+        logger.exception("MCP bootstrap raised; continuing without it.")
+        st.session_state["_mcp_bootstrapped"] = True
 
 selection = render_sidebar()
 render_chat(selection)
