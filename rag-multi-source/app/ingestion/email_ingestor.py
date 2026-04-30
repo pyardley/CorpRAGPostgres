@@ -684,13 +684,18 @@ def _build_yahoo_search_url(
     — enough to nearly-uniquely identify a single message from the
     metadata we already capture at ingest time.
 
-    Composed query (URL-encoded once into the path):
+    Composed query (URL-encoded twice into the path; see encoding note
+    below):
 
-        <subject> from:<sender_email> after:<YYYY-MM-DD>
+        <subject> from:<sender_email> after:<rcvd-1d> before:<rcvd+1d>
 
-    where ``after`` is the day **before** ``received_dt`` so the target
-    message falls inside the half-open window. Yahoo's date operators
-    are inclusive of the day, so widening by 1 keeps the match in.
+    The 3-day after/before window combined with subject + from:
+    typically narrows the result set to a single hit, making the
+    citation effectively a permalink. We widen by one day on each side
+    so the target message always falls inside even when Yahoo searches
+    in the account's local timezone vs. our stored UTC ``last_updated``
+    (the gap can push a 23:30 UTC message into the previous calendar
+    day from Yahoo's perspective, or vice versa).
 
     Why not ``Message-ID``: empirically Yahoo's search ignores the
     RFC 5322 ``Message-ID:`` header — it indexes user-visible content
@@ -716,12 +721,18 @@ def _build_yahoo_search_url(
     if len(subj) > 80:
         subj = subj[:80].rsplit(" ", 1)[0]  # break on a word boundary
 
-    # ``after:`` is inclusive; widen by a day so the target message
-    # always falls inside the window even with timezone wobble.
+    # ``after:`` and ``before:`` are inclusive on the day boundary;
+    # widen the window by one day on each side so the target message
+    # always falls inside even with timezone wobble (Yahoo searches in
+    # the user's account timezone, not UTC). The resulting 3-day window
+    # combined with subject + from: typically narrows to a single hit,
+    # which makes the citation effectively a permalink.
     if received_dt is not None:
         after_date = (received_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        before_date = (received_dt + timedelta(days=1)).strftime("%Y-%m-%d")
     else:
         after_date = ""
+        before_date = ""
 
     parts: list[str] = []
     if subj:
@@ -730,6 +741,8 @@ def _build_yahoo_search_url(
         parts.append(f"from:{addr}")
     if after_date:
         parts.append(f"after:{after_date}")
+    if before_date:
+        parts.append(f"before:{before_date}")
 
     query = " ".join(parts).strip()
     if not query:
