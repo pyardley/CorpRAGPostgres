@@ -714,10 +714,11 @@ def _build_yahoo_search_url(
 
     # Subjects can contain colons, hashes, plus, slashes — all of which
     # Yahoo's query parser interprets specially. Replace ``:`` with a
-    # space (the most damaging one — turns into a fake operator) and
+    # space (the most damaging one — turns into a fake operator), strip
+    # embedded ``"`` (would break the quoted-phrase wrapping below), and
     # cap the length so we don't blow URL-length budgets on the rare
     # 500-character marketing-email subject.
-    subj = (subject or "").replace(":", " ").strip()
+    subj = (subject or "").replace(":", " ").replace('"', "").strip()
     if len(subj) > 80:
         subj = subj[:80].rsplit(" ", 1)[0]  # break on a word boundary
 
@@ -736,7 +737,15 @@ def _build_yahoo_search_url(
 
     parts: list[str] = []
     if subj:
-        parts.append(subj)
+        # Wrap the subject in double quotes so Yahoo treats it as an
+        # exact-phrase match instead of a bag of words. Without quotes
+        # an email titled "Spring drops" matches every message
+        # containing both ``Spring`` and ``drops`` anywhere — Yahoo's
+        # default tokeniser is permissive. With quotes the subject has
+        # to appear as a contiguous phrase, which combined with
+        # ``from:`` + the 3-day date window almost always narrows to
+        # the single target message.
+        parts.append(f'"{subj}"')
     if addr:
         parts.append(f"from:{addr}")
     if after_date:

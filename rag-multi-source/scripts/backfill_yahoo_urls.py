@@ -145,6 +145,20 @@ def main() -> int:
                   url LIKE 'https://mail.yahoo.com/n/search/keyword=%'
                   AND url NOT LIKE '%before%253A%'
               )
+              -- The current builder wraps the subject in double quotes
+              -- so Yahoo does an exact-phrase match. Older /n/ URLs
+              -- (had before: but unquoted subject) are detected by the
+              -- absence of the double-encoded ``"`` (``%2522``) when a
+              -- subject is present in the row. Idempotent: once a
+              -- titled row has %2522 it's skipped on subsequent runs;
+              -- untitled rows never trip this branch (they correctly
+              -- produce no quotes).
+              OR (
+                  url LIKE 'https://mail.yahoo.com/n/search/keyword=%'
+                  AND title IS NOT NULL
+                  AND length(title) > 0
+                  AND url NOT LIKE '%2522%'
+              )
           )
         ORDER BY last_updated DESC NULLS LAST, id ASC
         """
@@ -227,6 +241,12 @@ def main() -> int:
                       OR (
                           url LIKE 'https://mail.yahoo.com/n/search/keyword=%'
                           AND url NOT LIKE '%before%253A%'
+                      )
+                      OR (
+                          url LIKE 'https://mail.yahoo.com/n/search/keyword=%'
+                          AND title IS NOT NULL
+                          AND length(title) > 0
+                          AND url NOT LIKE '%2522%'
                       )
                   )
                 """
