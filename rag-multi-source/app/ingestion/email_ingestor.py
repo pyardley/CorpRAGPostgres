@@ -664,6 +664,82 @@ def _b64url_decode(s: str) -> str:
 _YAHOO_IMAP_HOST = "imap.mail.yahoo.com"
 _YAHOO_IMAP_PORT = 993
 
+# When we can't build a search URL (e.g. blank subject + blank sender),
+# fall back to the inbox root. We use the ``/n/`` (new) UI route Yahoo's
+# web client redirects to as of 2026; the older ``/d/`` route still
+# resolves but doesn't honour search-keyword paths consistently.
+_YAHOO_INBOX_FALLBACK = "https://mail.yahoo.com/n/folders/1"
+
+
+def _build_yahoo_search_url(
+    subject: str, sender: str, received_dt: datetime
+) -> str:
+    """
+    Compose a clickable Yahoo Mail URL that lands on a single message.
+
+    Yahoo's web UI doesn't expose stable per-message permalinks. It
+    *does* honour Gmail-style search operators inside the
+    ``…/n/search/keyword=<query>`` route, and Yahoo's search index
+    covers ``subject`` / ``from:`` / ``to:`` / ``after:`` / ``before:``
+    — enough to nearly-uniquely identify a single message from the
+    metadata we already capture at ingest time.
+
+    Composed query (URL-encoded once into the path):
+
+        <subject> from:<sender_email> after:<YYYY-MM-DD>
+
+    where ``after`` is the day **before** ``received_dt`` so the target
+    message falls inside the half-open window. Yahoo's date operators
+    are inclusive of the day, so widening by 1 keeps the match in.
+
+    Why not ``Message-ID``: empirically Yahoo's search ignores the
+    RFC 5322 ``Message-ID:`` header — it indexes user-visible content
+    only — so a search keyed on the MID returns 0 hits even though the
+    URL pattern works. Subject + from + date narrowing returns the
+    message reliably.
+    """
+    from email.utils import parseaddr
+    from urllib.parse import quote
+
+    # Pull just the bare address out of "Name <addr@host>" forms; if
+    # the metadata only had a raw email string parseaddr returns
+    # ("", "<that string>") so the fallback handles both shapes.
+    _name, addr = parseaddr(sender or "")
+    addr = (addr or sender or "").strip()
+
+    # Subjects can contain colons, hashes, plus, slashes — all of which
+    # Yahoo's query parser interprets specially. Replace ``:`` with a
+    # space (the most damaging one — turns into a fake operator) and
+    # cap the length so we don't blow URL-length budgets on the rare
+    # 500-character marketing-email subject.
+    subj = (subject or "").replace(":", " ").strip()
+    if len(subj) > 80:
+        subj = subj[:80].rsplit(" ", 1)[0]  # break on a word boundary
+
+    # ``after:`` is inclusive; widen by a day so the target message
+    # always falls inside the window even with timezone wobble.
+    if received_dt is not None:
+        after_date = (received_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        after_date = ""
+
+    parts: list[str] = []
+    if subj:
+        parts.append(subj)
+    if addr:
+        parts.append(f"from:{addr}")
+    if after_date:
+        parts.append(f"after:{after_date}")
+
+    query = " ".join(parts).strip()
+    if not query:
+        return _YAHOO_INBOX_FALLBACK
+
+    # ``safe=''`` percent-encodes everything that isn't unreserved per
+    # RFC 3986 — including ``@`` and ``:`` — which is exactly what
+    # Yahoo's path parser expects on this route.
+    return f"https://mail.yahoo.com/n/search/keyword={quote(query, safe='')}"
+
 
 class _YahooProvider:
     """
@@ -971,24 +1047,9 @@ class _YahooProvider:
             seed = f"{folder}|{uid.decode(errors='replace')}|{received_iso}"
             stable_id = hashlib.sha1(seed.encode()).hexdigest()
 
-        # Yahoo's web UI doesn't expose stable per-message permalinks
-        # (no equivalent of Gmail's threadId-rooted ``#all/{tid}`` deep
-        # link), but its search URL accepts arbitrary keywords. The
-        # Internet Message-ID is globally unique by RFC 5322 §3.6.4, so
-        # building a ``…/d/search/keyword=<Message-ID>`` URL gives the
-        # user a one-click landing page with this exact message at the
-        # top of the results — close enough to a permalink that the
-        # citation block in the chat UI is actually navigable.
-        # If the message had no Message-ID header (very rare; some
-        # Yahoo-internal system messages, draft saves) we fall back to
-        # the folder root rather than an empty / broken URL.
-        from urllib.parse import quote
-
-        if message_id:
-            encoded_mid = quote(message_id.strip("<>"), safe="")
-            url = f"https://mail.yahoo.com/d/search/keyword={encoded_mid}"
-        else:
-            url = "https://mail.yahoo.com/d/folders/1"
+        url = _build_yahoo_search_url(
+            subject=subject, sender=sender, received_dt=received_dt
+        )
 
         return SourceResource(
             resource_id=f"email:yahoo:message:{stable_id}",
