@@ -34,6 +34,7 @@ from typing import Any, Iterable, Optional
 from loguru import logger
 from sqlalchemy import delete, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.utils import get_db
@@ -157,41 +158,99 @@ def resource_exists(resource_id: str) -> bool:
 # Upsert
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _upsert_stmt(rows: list[dict[str, Any]]):
+    """Build the ``INSERT … ON CONFLICT DO UPDATE`` statement once."""
+    stmt = pg_insert(VectorChunk).values(rows)
+    update_cols = {
+        col.name: stmt.excluded[col.name]
+        for col in VectorChunk.__table__.columns
+        if col.name not in {"id", "created_at"}
+    }
+    return stmt.on_conflict_do_update(
+        constraint="uq_vector_chunks_resource_chunk",
+        set_=update_cols,
+    )
+
+
 def upsert_chunks(chunks: list[ResourceChunk]) -> int:
     """
     Embed and ``INSERT … ON CONFLICT DO UPDATE`` the chunks. Returns the
-    number of rows written.
+    number of rows actually written.
 
     Idempotent — calling with the same chunks twice is a no-op (each row's
     ``updated_at`` advances). The conflict target is
     ``(resource_id, chunk_index)``, so re-ingesting a resource overwrites
     its chunks in place.
+
+    Robustness: each batch is wrapped in a SAVEPOINT (``begin_nested``)
+    so a single bad row (e.g. a previously-undetected control-character
+    or Postgres-incompatible payload) doesn't poison the whole outer
+    transaction. On batch failure we rollback the savepoint, log the
+    error, and retry the rows **one at a time** with their own
+    savepoints — successful rows still land, failures are logged with
+    their ``resource_id`` + ``chunk_index`` so the next "weird payload"
+    is one ``grep`` away from being identifiable.
     """
     if not chunks:
         return 0
 
     embeddings = get_embeddings()
     total = 0
+    skipped = 0
     with get_db() as db:
         for batch in _batched(chunks, settings.VECTOR_UPSERT_BATCH_SIZE):
             vectors = embeddings.embed_documents([c.text for c in batch])
             rows = [
                 _row_payload(chunk, vec) for chunk, vec in zip(batch, vectors)
             ]
-            stmt = pg_insert(VectorChunk).values(rows)
-            update_cols = {
-                col.name: stmt.excluded[col.name]
-                for col in VectorChunk.__table__.columns
-                if col.name not in {"id", "created_at"}
-            }
-            stmt = stmt.on_conflict_do_update(
-                constraint="uq_vector_chunks_resource_chunk",
-                set_=update_cols,
-            )
-            db.execute(stmt)
-            total += len(rows)
 
-    logger.info("Upserted {} chunks to vector_chunks.", total)
+            # Fast path: single bulk INSERT inside a savepoint.
+            try:
+                with db.begin_nested():
+                    db.execute(_upsert_stmt(rows))
+                total += len(rows)
+                continue
+            except SQLAlchemyError as exc:
+                logger.warning(
+                    "Bulk upsert of {} rows failed ({}); falling back "
+                    "to per-row inserts to isolate the bad payload.",
+                    len(rows),
+                    exc.__class__.__name__,
+                )
+
+            # Slow path: one row per savepoint so one rotten payload
+            # only kills itself.
+            for row in rows:
+                try:
+                    with db.begin_nested():
+                        db.execute(_upsert_stmt([row]))
+                    total += 1
+                except SQLAlchemyError as exc:
+                    skipped += 1
+                    text_preview = (row.get("text") or "")[:160].replace(
+                        "\n", " "
+                    )
+                    logger.error(
+                        "[upsert_chunks] DROP row resource_id={} "
+                        "chunk_index={} source={} reason={}: {} | "
+                        "text[0:160]={!r}",
+                        row.get("resource_id"),
+                        row.get("chunk_index"),
+                        row.get("source"),
+                        exc.__class__.__name__,
+                        str(exc.orig)[:300] if hasattr(exc, "orig") else str(exc)[:300],
+                        text_preview,
+                    )
+
+    if skipped:
+        logger.warning(
+            "Upserted {} chunks to vector_chunks ({} dropped due to "
+            "DB-level rejection — see ERROR lines above).",
+            total,
+            skipped,
+        )
+    else:
+        logger.info("Upserted {} chunks to vector_chunks.", total)
     return total
 
 

@@ -35,3 +35,13 @@ logs/
 
 # Docker volumes / data
 data/
+
+# OAuth client secrets (downloaded from Google / Microsoft / Yahoo dev consoles)
+client_secret.json
+client_secret*.json
+*_token.json
+token.json
+
+# MCP server runtime state — pid + auth token are regenerated on every boot
+.streamlit/mcp/
+
