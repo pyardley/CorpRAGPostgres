@@ -971,9 +971,24 @@ class _YahooProvider:
             seed = f"{folder}|{uid.decode(errors='replace')}|{received_iso}"
             stable_id = hashlib.sha1(seed.encode()).hexdigest()
 
-        # Yahoo doesn't expose a deep-link URL the way Outlook/Graph
-        # does; the folder-rooted webmail URL is the closest analogue.
-        url = "https://mail.yahoo.com/d/folders/1"
+        # Yahoo's web UI doesn't expose stable per-message permalinks
+        # (no equivalent of Gmail's threadId-rooted ``#all/{tid}`` deep
+        # link), but its search URL accepts arbitrary keywords. The
+        # Internet Message-ID is globally unique by RFC 5322 §3.6.4, so
+        # building a ``…/d/search/keyword=<Message-ID>`` URL gives the
+        # user a one-click landing page with this exact message at the
+        # top of the results — close enough to a permalink that the
+        # citation block in the chat UI is actually navigable.
+        # If the message had no Message-ID header (very rare; some
+        # Yahoo-internal system messages, draft saves) we fall back to
+        # the folder root rather than an empty / broken URL.
+        from urllib.parse import quote
+
+        if message_id:
+            encoded_mid = quote(message_id.strip("<>"), safe="")
+            url = f"https://mail.yahoo.com/d/search/keyword={encoded_mid}"
+        else:
+            url = "https://mail.yahoo.com/d/folders/1"
 
         return SourceResource(
             resource_id=f"email:yahoo:message:{stable_id}",
