@@ -158,8 +158,9 @@ def main() -> None:
         default="all",
         help=(
             "Scope within the source: Jira project key, Confluence space key, "
-            "SQL database name, Git branch, email provider (outlook | gmail) "
-            "or folder/label, or 'all'."
+            "SQL database name, Git branch, email provider "
+            "(outlook | gmail | yahoo) or folder/label/IMAP-folder name, "
+            "or 'all'."
         ),
     )
     parser.add_argument(

@@ -1,26 +1,29 @@
 """
-Email ingestor — supports Outlook / Microsoft 365 (Graph API) and Gmail
-(Google API), in any combination, from a single ingestion run.
+Email ingestor — supports Outlook / Microsoft 365 (Graph API), Gmail
+(Google API), and Yahoo Mail (IMAP + App Password), in any combination,
+from a single ingestion run.
 
 resource_id format
 ------------------
     email:outlook:message:{graph_message_id}
     email:gmail:message:{gmail_message_id}
+    email:yahoo:message:{rfc822_message_id_or_uid_hash}
 
 resource_identifier (for the access table) is the **provider name**
-(``outlook`` or ``gmail``), so users see and can revoke each mailbox
-independently. The same value is also written to the new ``email_provider``
-column on ``vector_chunks`` for query-time filtering.
+(``outlook`` / ``gmail`` / ``yahoo``), so users see and can revoke each
+mailbox independently. The same value is also written to the
+``email_provider`` column on ``vector_chunks`` for query-time filtering.
 
 Scope semantics
 ---------------
-* ``--scope all`` (default) → both providers, whichever have credentials.
+* ``--scope all`` (default) → every configured provider.
 * ``--scope outlook``       → Outlook / M365 mailbox only.
 * ``--scope gmail``         → Gmail mailbox only.
+* ``--scope yahoo``         → Yahoo Mail mailbox only.
 * Any other value           → treated as a folder/label name applied to
   every configured provider (Outlook well-known folder name, e.g.
-  ``inbox``, ``sentitems``; or Gmail label name, e.g. ``INBOX``,
-  ``IMPORTANT``).
+  ``inbox``, ``sentitems``; Gmail label name, e.g. ``INBOX``,
+  ``IMPORTANT``; or Yahoo IMAP folder, e.g. ``INBOX``, ``Sent``).
 
 Modes
 -----
@@ -64,6 +67,25 @@ Gmail:
   gmail_label                 (optional) label filter (default: no label
                               filter — all mail; use "INBOX" to limit).
 
+Yahoo Mail (IMAP + App Password):
+  yahoo_email_address         Mailbox to authenticate as, e.g.
+                              ``you@yahoo.com``. Used as the IMAP
+                              ``LOGIN`` username.
+  yahoo_app_password          16-character mailbox-scoped app password
+                              generated at
+                              login.yahoo.com → Account → Security →
+                              "Generate app password". Yahoo deprecated
+                              public OAuth2 access to Mail content for
+                              new third-party apps; app passwords are
+                              the supported integration today (see
+                              uk.help.yahoo.com/kb/sln4075). Treat like
+                              a real password — anyone holding it has
+                              full read access to the mailbox until it
+                              is revoked from the same screen.
+  yahoo_folder                (optional) IMAP folder name, default
+                              ``INBOX``. Common values: ``INBOX``,
+                              ``Sent``, ``Bulk Mail``, ``Archive``.
+
 Rate-limiting and reliability
 -----------------------------
 * Tenacity exponential backoff on every transient HTTP failure.
@@ -76,12 +98,15 @@ Rate-limiting and reliability
 from __future__ import annotations
 
 import base64
+import email as email_lib
+import hashlib
+import imaplib
 import json
 import os
 import time
 from calendar import monthrange
 from datetime import datetime, timedelta, timezone
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Iterable, Optional
 
 import requests
@@ -633,6 +658,411 @@ def _b64url_decode(s: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Yahoo Mail provider (IMAP + App Password)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_YAHOO_IMAP_HOST = "imap.mail.yahoo.com"
+_YAHOO_IMAP_PORT = 993
+
+
+class _YahooProvider:
+    """
+    Yahoo Mail wrapper using IMAP4 + a mailbox-scoped app password.
+
+    Why an app password and not OAuth
+    ---------------------------------
+    Yahoo discontinued public OAuth2 access to Mail content for new
+    third-party apps. The Yahoo Developer Console no longer exposes
+    the ``mail-r`` scope under *API Permissions*, and Yahoo's official
+    IMAP help (uk.help.yahoo.com/kb/sln4075) instructs users to
+    authenticate with a 16-character app password generated under
+    *Account → Security → Generate app password*. We follow that
+    documented path:
+
+    1. Open ``imap.mail.yahoo.com:993`` over SSL.
+    2. Plain ``LOGIN <email> <app_password>`` (RFC 3501 §6.2.3). The
+       app password is mailbox-scoped, revocable independently of the
+       user's account password, and only valid for IMAP/SMTP/POP — it
+       cannot be used to sign in to the web UI, so the blast radius is
+       contained even if it leaks.
+    3. ``SELECT`` the requested folder read-only.
+    4. ``UID SEARCH`` with ``SINCE``/``BEFORE`` to honour the date
+       window from :class:`EmailIngestor._compute_window`.
+    5. ``UID FETCH (RFC822)`` and parse with the stdlib :mod:`email`
+       module — same body / attachment extraction story as Gmail.
+
+    Note on legacy OAuth2 (XOAUTH2)
+    -------------------------------
+    A previous revision of this module supported XOAUTH2 against
+    Yahoo's ``oauth2/get_token`` endpoint. That code was removed
+    because it could not authenticate any newly-registered Yahoo
+    Developer app — Yahoo silently rejects bearer tokens whose client
+    doesn't have the legacy ``mail-r`` permission. If you have a
+    legacy app that still works that way, the integration option is to
+    expose IMAP via an account-level alias rather than re-introducing
+    XOAUTH2 here.
+    """
+
+    name = "yahoo"
+    BATCH_SIZE = 50
+    RATE_LIMIT_SLEEP = 0.05
+
+    def __init__(self, credentials: dict[str, str]) -> None:
+        self.email_address = (
+            credentials.get("yahoo_email_address") or ""
+        ).strip()
+        # Yahoo's UI displays app passwords with whitespace in groups
+        # of four (``xxxx xxxx xxxx xxxx``). The IMAP server doesn't
+        # care about the spaces, but normalising here removes a
+        # paste-error footgun.
+        self.app_password = (
+            (credentials.get("yahoo_app_password") or "")
+            .replace(" ", "")
+            .strip()
+        )
+        self.folder = (credentials.get("yahoo_folder") or "INBOX").strip() or "INBOX"
+
+        if not self.email_address or "@" not in self.email_address:
+            raise ValueError(
+                "yahoo_email_address must be the full mailbox address, "
+                "e.g. 'you@yahoo.com'."
+            )
+        if not self.app_password:
+            raise ValueError(
+                "yahoo_app_password is required. Generate one at "
+                "login.yahoo.com → Account → Security → 'Generate app "
+                "password'. (Yahoo deprecated OAuth2 for Mail; app "
+                "passwords are the supported credential.)"
+            )
+
+        self._mail: Optional[imaplib.IMAP4_SSL] = None
+
+    # ── IMAP connection ─────────────────────────────────────────────────────
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+    )
+    def _connect_and_auth(self) -> imaplib.IMAP4_SSL:
+        """
+        Open a fresh IMAP SSL connection and authenticate via plain
+        ``LOGIN``. Yahoo's gateway accepts the SASL ``LOGIN``/``PLAIN``
+        mechanisms with the email address as the username and the
+        16-character app password as the password.
+
+        The retry decorator handles transient TLS or DNS hiccups; auth
+        errors (bad credentials) are NOT retried — re-issuing the same
+        wrong password just locks the account out faster.
+        """
+        try:
+            mail = imaplib.IMAP4_SSL(
+                _YAHOO_IMAP_HOST, _YAHOO_IMAP_PORT, timeout=30
+            )
+        except (OSError, imaplib.IMAP4.error) as exc:
+            logger.warning(
+                "[email/yahoo] could not connect to {}:{}: {}",
+                _YAHOO_IMAP_HOST,
+                _YAHOO_IMAP_PORT,
+                exc,
+            )
+            raise
+
+        try:
+            mail.login(self.email_address, self.app_password)
+        except imaplib.IMAP4.error as exc:
+            # Auth failures are terminal — surface them clearly so the
+            # user sees "AUTHENTICATE failed" / "Invalid credentials"
+            # in the ingestion log instead of a generic IMAP error.
+            try:
+                mail.logout()
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"Yahoo IMAP login failed for {self.email_address}: "
+                f"{exc}. Check that the app password is correct and "
+                f"hasn't been revoked, and that the mailbox address "
+                f"matches the one that issued it."
+            ) from exc
+
+        self._mail = mail
+        return mail
+
+    def _close(self) -> None:
+        if not self._mail:
+            return
+        try:
+            self._mail.close()
+        except Exception:  # noqa: BLE001 - already in teardown
+            pass
+        try:
+            self._mail.logout()
+        except Exception:  # noqa: BLE001
+            pass
+        self._mail = None
+
+    # ── Iteration ───────────────────────────────────────────────────────────
+
+    def fetch(
+        self,
+        start: Optional[datetime],
+        end: Optional[datetime],
+        folder_override: Optional[str] = None,
+    ) -> Iterable[SourceResource]:
+        folder = (folder_override or self.folder).strip() or "INBOX"
+        mail = self._connect_and_auth()
+        try:
+            # SELECT in read-only mode — we never want to mutate the
+            # remote mailbox state (no \Seen flag updates, etc.).
+            typ, data = mail.select(self._encode_folder(folder), readonly=True)
+            if typ != "OK":
+                raise RuntimeError(
+                    f"IMAP SELECT {folder!r} failed: {data}"
+                )
+            logger.info(
+                "[email/yahoo] selected folder {} ({} messages total)",
+                folder,
+                (data[0].decode() if data and data[0] else "?"),
+            )
+
+            criteria = self._build_search_criteria(start, end)
+            typ, search_data = mail.uid("SEARCH", None, *criteria)
+            if typ != "OK":
+                raise RuntimeError(
+                    f"IMAP SEARCH {criteria} failed: {search_data}"
+                )
+
+            uids: list[bytes] = (
+                search_data[0].split() if search_data and search_data[0] else []
+            )
+            logger.info(
+                "[email/yahoo] {} messages match window {}",
+                len(uids),
+                criteria,
+            )
+
+            # Stream UIDs in modest batches so a mid-run failure leaves
+            # most of the work durably committed by the upstream
+            # vector-store batcher.
+            for i in range(0, len(uids), self.BATCH_SIZE):
+                batch = uids[i : i + self.BATCH_SIZE]
+                for uid in batch:
+                    try:
+                        resource = self._fetch_one(mail, uid, folder)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[email/yahoo] uid={} fetch failed: {}",
+                            uid.decode(errors="replace"),
+                            exc,
+                        )
+                        continue
+                    if resource:
+                        yield resource
+                    time.sleep(self.RATE_LIMIT_SLEEP)
+        finally:
+            self._close()
+
+    @staticmethod
+    def _build_search_criteria(
+        start: Optional[datetime], end: Optional[datetime]
+    ) -> list[str]:
+        """
+        Translate a ``[start, end)`` window into IMAP SEARCH tokens.
+
+        IMAP date format is ``DD-Mon-YYYY`` (RFC 3501 §6.4.4). The
+        ``SINCE`` keyword is *inclusive of the day*, so for a half-open
+        window we widen the BEFORE bound by one day to keep the same
+        semantics the Graph and Gmail providers use.
+        """
+        criteria: list[str] = []
+        if start is not None:
+            criteria += ["SINCE", start.strftime("%d-%b-%Y")]
+        if end is not None:
+            # +1 day so [start, end) maps to SINCE/BEFORE inclusively.
+            end_inclusive = end + timedelta(days=1)
+            criteria += ["BEFORE", end_inclusive.strftime("%d-%b-%Y")]
+        if not criteria:
+            criteria = ["ALL"]
+        return criteria
+
+    @staticmethod
+    def _encode_folder(folder: str) -> str:
+        """
+        IMAP folder names with spaces or non-ASCII characters need
+        quoting. Yahoo's well-known names like ``Bulk Mail`` are the
+        common case worth handling here.
+        """
+        if " " in folder or '"' in folder:
+            escaped = folder.replace('\\', '\\\\').replace('"', '\\"')
+            return f'"{escaped}"'
+        return folder
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+    )
+    def _fetch_one(
+        self, mail: imaplib.IMAP4_SSL, uid: bytes, folder: str
+    ) -> Optional[SourceResource]:
+        typ, data = mail.uid("FETCH", uid, "(RFC822)")
+        if typ != "OK" or not data or not data[0]:
+            logger.debug("[email/yahoo] uid={} returned {}", uid, typ)
+            return None
+        # data is e.g. [(b'1 (RFC822 {N}', <bytes>), b')']
+        for entry in data:
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                raw = entry[1]
+                if isinstance(raw, bytes) and raw:
+                    return self._parse_message(raw, uid, folder)
+        return None
+
+    # ── Message conversion ──────────────────────────────────────────────────
+
+    def _parse_message(
+        self, raw: bytes, uid: bytes, folder: str
+    ) -> Optional[SourceResource]:
+        msg = email_lib.message_from_bytes(raw)
+
+        subject = self._decoded_header(msg, "Subject") or "(no subject)"
+        sender = self._decoded_header(msg, "From") or "(unknown)"
+        to_list = self._decoded_header(msg, "To") or ""
+        cc_list = self._decoded_header(msg, "Cc") or ""
+        message_id = (self._decoded_header(msg, "Message-ID") or "").strip()
+        date_hdr = self._decoded_header(msg, "Date") or ""
+
+        try:
+            received_dt = parsedate_to_datetime(date_hdr) if date_hdr else None
+        except (TypeError, ValueError):
+            received_dt = None
+        if received_dt is None:
+            received_dt = datetime.now(timezone.utc)
+        if received_dt.tzinfo is None:
+            received_dt = received_dt.replace(tzinfo=timezone.utc)
+        received_iso = received_dt.isoformat()
+
+        plain, html, attachments = self._extract_body_and_attachments(msg)
+        body_text = (plain or _html_to_text(html) or "").strip()
+
+        attachments_summary = (
+            f"[{len(attachments)} attachment(s): "
+            f"{', '.join(a[:60] for a in attachments[:5])}"
+            f"{'…' if len(attachments) > 5 else ''}]"
+            if attachments
+            else ""
+        )
+
+        text = (
+            f"Email (Yahoo): {subject}\n"
+            f"From: {sender}\n"
+            f"To: {to_list}\n"
+            + (f"Cc: {cc_list}\n" if cc_list else "")
+            + f"Date: {received_iso}\n"
+            + (f"{attachments_summary}\n" if attachments_summary else "")
+            + "\n"
+            + body_text
+        )
+
+        # Prefer the globally-unique RFC822 Message-ID; fall back to a
+        # deterministic hash of (folder, uid, date) so that re-running
+        # against the same mailbox produces the same resource_id and
+        # the upstream INSERT … ON CONFLICT dedupe path still works.
+        if message_id:
+            stable_id = message_id.strip("<>")
+        else:
+            seed = f"{folder}|{uid.decode(errors='replace')}|{received_iso}"
+            stable_id = hashlib.sha1(seed.encode()).hexdigest()
+
+        # Yahoo doesn't expose a deep-link URL the way Outlook/Graph
+        # does; the folder-rooted webmail URL is the closest analogue.
+        url = "https://mail.yahoo.com/d/folders/1"
+
+        return SourceResource(
+            resource_id=f"email:yahoo:message:{stable_id}",
+            title=subject,
+            text=text,
+            url=url,
+            last_updated=received_iso,
+            metadata={
+                "email_provider": "yahoo",
+                "object_name": subject,
+                "from": sender,
+                "to": to_list,
+                "cc": cc_list,
+                "message_id": stable_id,
+                "internet_message_id": message_id,
+                "imap_uid": uid.decode(errors="replace"),
+                "folder": folder,
+                "has_attachments": bool(attachments),
+            },
+        )
+
+    @staticmethod
+    def _decoded_header(msg: "email_lib.message.Message", name: str) -> str:
+        """
+        RFC 2047-decode a header (``=?utf-8?B?…?=`` etc.) into a single
+        Python string. Returns "" if absent.
+        """
+        from email.header import decode_header, make_header
+
+        raw = msg.get(name)
+        if raw is None:
+            return ""
+        try:
+            return str(make_header(decode_header(raw)))
+        except Exception:  # noqa: BLE001
+            return raw if isinstance(raw, str) else raw.decode(errors="replace")
+
+    @staticmethod
+    def _extract_body_and_attachments(
+        msg: "email_lib.message.Message",
+    ) -> tuple[str, str, list[str]]:
+        """
+        Walk the MIME tree the same way the Gmail provider does.
+        Returns ``(plain_text, html_text, attachment_filenames)``.
+        Attachment bytes are intentionally NOT downloaded — too costly
+        and risky to embed unsanitised binary content into RAG.
+        """
+        plain_parts: list[str] = []
+        html_parts: list[str] = []
+        attachments: list[str] = []
+
+        def _decode(part: "email_lib.message.Message") -> str:
+            payload = part.get_payload(decode=True)
+            if not payload:
+                return ""
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                return payload.decode(charset, errors="replace")
+            except (LookupError, TypeError):
+                return payload.decode("utf-8", errors="replace")
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disposition = (str(part.get("Content-Disposition") or "")).lower()
+                filename = part.get_filename()
+                if filename or "attachment" in disposition:
+                    attachments.append(filename or "(unnamed)")
+                    continue
+                if ctype == "text/plain":
+                    txt = _decode(part)
+                    if txt:
+                        plain_parts.append(txt)
+                elif ctype == "text/html":
+                    txt = _decode(part)
+                    if txt:
+                        html_parts.append(txt)
+        else:
+            ctype = msg.get_content_type()
+            txt = _decode(msg)
+            if ctype == "text/html":
+                html_parts.append(txt)
+            else:
+                plain_parts.append(txt)
+
+        return "\n".join(plain_parts), "\n".join(html_parts), attachments
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Ingestor
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -665,10 +1095,12 @@ class EmailIngestor(BaseIngestor):
         self._email_mode = mode
         self._month = month
 
-        # `scope` may be one of: "all", "outlook", "gmail", or a folder/label.
+        # `scope` may be one of: "all", "outlook", "gmail", "yahoo",
+        # or a folder/label/IMAP-folder name applied to every configured
+        # provider.
         self._scope_provider: Optional[str] = None
         self._folder_override: Optional[str] = None
-        if scope in {"outlook", "gmail"}:
+        if scope in {"outlook", "gmail", "yahoo"}:
             self._scope_provider = scope
         elif scope and scope != "all":
             # Treat anything else as a folder/label name.
@@ -683,7 +1115,7 @@ class EmailIngestor(BaseIngestor):
         wanted = (
             {self._scope_provider}
             if self._scope_provider
-            else {"outlook", "gmail"}
+            else {"outlook", "gmail", "yahoo"}
         )
 
         if "outlook" in wanted and self._has_outlook_creds():
@@ -704,10 +1136,20 @@ class EmailIngestor(BaseIngestor):
                     "[email] Gmail credentials present but invalid: {}", exc
                 )
 
+        if "yahoo" in wanted and self._has_yahoo_creds():
+            try:
+                provs.append(_YahooProvider(self.credentials))
+                logger.info("[email] Yahoo provider registered.")
+            except Exception as exc:
+                logger.warning(
+                    "[email] Yahoo credentials present but invalid: {}", exc
+                )
+
         if not provs:
             raise ValueError(
-                "No usable email providers — supply outlook_* and/or "
-                "gmail_* credentials in Settings → Credentials → Email."
+                "No usable email providers — supply outlook_*, gmail_* "
+                "and/or yahoo_* credentials in Settings → Credentials → "
+                "Email. Configured providers: outlook, gmail, yahoo."
             )
         return provs
 
@@ -723,6 +1165,14 @@ class EmailIngestor(BaseIngestor):
         return all(
             self.credentials.get(k)
             for k in ("gmail_client_id", "gmail_client_secret", "gmail_refresh_token")
+        )
+
+    def _has_yahoo_creds(self) -> bool:
+        # Yahoo dropped public OAuth2 for Mail; the supported integration
+        # is mailbox-scoped app passwords (see _YahooProvider docstring).
+        return bool(
+            self.credentials.get("yahoo_email_address")
+            and self.credentials.get("yahoo_app_password")
         )
 
     # ── BaseIngestor abstract API ───────────────────────────────────────────

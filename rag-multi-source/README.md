@@ -281,14 +281,16 @@ from the CLI on an admin account that owns the union of all scopes.
 
 ### Email source — obtaining credentials
 
-The email ingestor supports two providers in a single run: **Outlook /
+The email ingestor supports three providers in a single run: **Outlook /
 Microsoft 365** (incl. personal `outlook.com`, `live.com`, `hotmail.com`,
-and federated yahoo accounts that route through Outlook) and **Gmail**.
-Each provider is independent — fill in only the section(s) you actually
-want to ingest. All values are stored encrypted in `user_credentials`
-under `source = "email"`.
+and federated yahoo accounts that route through Outlook), **Gmail**, and
+**Yahoo Mail** (native, via IMAP + App Password). Each provider is
+independent — fill in only the section(s) you actually want to ingest.
+All values are stored encrypted in `user_credentials` under
+`source = "email"`.
 
-UI: **Sidebar → 🔑 Credentials → Email → Outlook / Gmail sub-form**.
+UI: **Sidebar → 🔑 Credentials → Email → Outlook / Gmail / Yahoo
+sub-form**.
 
 #### Outlook / Microsoft 365 (e.g. `paul_r_yardley@yahoo.co.uk` linked to
 
@@ -348,51 +350,227 @@ We use the standard **installed-app OAuth 2.0 flow** to obtain a
 refresh token, then store either the discrete keys or the full
 `token.json` blob.
 
-1. **Create OAuth credentials** in the
-   [Google Cloud Console](https://console.cloud.google.com/):
-   - Enable the **Gmail API** for your project.
-   - _APIs & Services → OAuth consent screen_ → External, add yourself
-     as a test user, scope `.../auth/gmail.readonly`.
-   - _APIs & Services → Credentials → Create credentials → OAuth client
-     ID → Application type: Desktop app_. Download the resulting JSON
-     as `client_secret.json`.
-2. **Run a one-time installed-app flow** to mint a refresh token. Save
-   the snippet below as `scripts/get_gmail_token.py`:
+> **Note on Google's UI (current as of April 2026).** The OAuth
+> configuration moved out of the legacy "APIs & Services → OAuth
+> consent screen" page into a dedicated **Google Auth Platform**
+> console with sub-tabs **Overview / Branding / Audience / Clients /
+> Data access / Verification centre / Settings**. The instructions
+> below match this layout. The legacy single-page UI is still served
+> for some older projects and works the same way conceptually — just
+> with everything on one screen.
 
-   ```python
-   from google_auth_oauthlib.flow import InstalledAppFlow
-   SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-   flow  = InstalledAppFlow.from_client_secrets_file(
-       "client_secret.json", SCOPES
-   )
-   creds = flow.run_local_server(port=0)
-   with open("token.json", "w") as f:
-       f.write(creds.to_json())
-   print("Saved token.json — paste its contents into gmail_token_json.")
+1. **Enable the Gmail API.**
+   In the Cloud Console for your project go to
+   _APIs & Services → Library_ → search "Gmail API" → **Enable**.
+
+2. **Configure the OAuth consent screen.**
+   Open _Google Auth Platform_ (the shield icon in APIs & Services, or
+   directly from the App selector — once configured for the project
+   it sits at the top-level left nav).
+   - **Branding** — set an app name (e.g. `CorporateRAG-Gmail`),
+     a user-support email, and a developer contact email.
+   - **Audience** — keep **User type: External** unless your project
+     belongs to a Google Workspace org and you only need internal users
+     (in which case "Make internal" gives long-lived refresh tokens).
+   - **Test users** (only matters for External, Testing-mode apps).
+     - You **do not need to add yourself if you own the Cloud project**
+       — project Owners/Editors are implicitly allow-listed. Adding
+       them here is rejected with a misleading "Ineligible accounts"
+       error; that's expected, just skip the step.
+     - Add only _other_ Gmail addresses you want to ingest from while
+       in Testing mode (max 100). The address must be a real Google
+       Account in lowercase canonical form (Gmail's dot-insensitivity
+       does **not** apply here).
+   - **Data access** — you don't need to pre-list scopes while in
+     Testing; the helper script declares `gmail.readonly` dynamically
+     and the consent screen surfaces it on first sign-in. (You only
+     need to add it explicitly if you ever submit for verification.)
+
+3. **Create the OAuth client.**
+   _Google Auth Platform → Clients → + Create client_:
+   - **Application type: Desktop app**
+   - Give it a name (e.g. `CorporateRAG Desktop`).
+   - On creation, the dialog shows the **Client ID** and a
+     one-time **Client secret**. Click **Download JSON** and save it
+     to the repo root as `client_secret.json` (gitignored).
+
+   > 🔁 **Rotating the secret later.** Google no longer offers a
+   > "Reset secret" button or a re-downloadable JSON. To rotate:
+   > _Clients → \[your client] → Client secrets → **+ Add secret**_.
+   > A row appears with the **plaintext shown exactly once** —
+   > copy it immediately ("Viewing and downloading client secrets is
+   > no longer available"). You can hold at most **two** active
+   > secrets, so to rotate again you must **Disable** then **Delete**
+   > the old one. Update `client_secret.json` by hand: open the file
+   > and replace the `installed.client_secret` value with the new
+   > `GOCSPX-…` string; everything else (`client_id`, `project_id`,
+   > `auth_uri`, `token_uri`, `redirect_uris`) stays the same.
+
+4. **Run the one-time installed-app flow** to mint a refresh token.
+   A ready-made helper is included at
+   [`scripts/gmail_get_refresh_token.py`](scripts/gmail_get_refresh_token.py):
+
+   ```bash
+   # google-auth-oauthlib is already in requirements.txt
+   python scripts/gmail_get_refresh_token.py
    ```
 
-   `pip install google-auth-oauthlib && python scripts/get_gmail_token.py`,
-   sign in as `pr.yardley@gmail.com`, click _Allow_. The browser tab
-   closes automatically and a `token.json` file appears next to the
-   script.
+   Useful flags:
+   - `--client-secret <path>` if your JSON isn't at `./client_secret.json`
+   - `--out token.json` to also write the resulting blob to disk
+   - `--port <n>` to pin the loopback redirect to a specific port
 
-3. **Paste into the UI** under _Gmail_. You have two equally-supported
-   options:
-   - **Recommended (one-field)**: paste the full contents of
-     `token.json` into the **Full token.json** field — leave the other
-     three credential fields blank.
-   - **Discrete fields**: instead of the blob, paste **Client ID**,
-     **Client Secret** (from `client_secret.json`) and **Refresh
-     Token** (the `refresh_token` value inside `token.json`).
+   The browser opens automatically — sign in as the mailbox owner
+   (e.g. `pr.yardley@gmail.com`), approve **Read your email**, and the
+   tab closes itself. The terminal then prints two blocks:
+
+   ```
+   ============================================================
+   REFRESH TOKEN (paste into 'Refresh Token' field in the sidebar):
+   ============================================================
+   1//09…
+   ============================================================
+   FULL token.json (paste into 'Full token.json (optional)' instead,
+   if you'd rather use a single field):
+   ============================================================
+   {
+     "token": "ya29.…",
+     "refresh_token": "1//09…",
+     …
+   }
+   ```
+
+   The script forces `prompt=consent` + `access_type=offline`, so a
+   refresh token is guaranteed even on re-runs.
+
+5. **Paste into the UI** under _Sidebar → 🔑 Credentials → Email →
+   📬 Gmail_. Pick **one** of the two routes — don't fill both:
+
+   | Route                         | Fields to populate                                                              |
+   | ----------------------------- | ------------------------------------------------------------------------------- |
+   | **Single blob (recommended)** | only **Full token.json (optional)** — embeds client id/secret/scope/`token_uri` |
+   | **Discrete keys**             | **OAuth Client ID**, **OAuth Client Secret**, **Refresh Token**                 |
+
+   Optional in either case:
    - **Mailbox address** → blank or `me` (resolves to the authenticated
      account)
    - **Label filter** → e.g. `INBOX` to limit to Inbox; blank = all mail
 
-> 🔐 Both refresh tokens are encrypted at rest with the same
-> Fernet key (`ENCRYPTION_KEY`) used for every other connector
-> credential. Treat them like passwords — anyone holding a refresh
-> token can read the mailbox until the token is revoked from the
-> provider's account-security page.
+   > 🧹 **Clearing a saved secret.** Each saved secret field renders a
+   > "Clear saved …" checkbox above the input. Tick it, leave the
+   > input blank, click **Save credentials** to delete the value.
+   > Typing a new value always wins over the Clear tick.
+
+6. **Token longevity.** While the consent screen is in **Testing**
+   mode and the user is `@gmail.com` (not Workspace-internal),
+   refresh tokens expire after **7 days of inactivity**. If a future
+   ingestion fails with `invalid_grant`, just re-run the helper script
+   and update the credential. To get long-lived tokens click
+   **Publish app** under _Audience_ — for `gmail.readonly` on a
+   personal account with no other users, Google won't actually require
+   verification.
+
+#### Yahoo Mail (e.g. `pr.yardley@yahoo.com`)
+
+Yahoo deprecated public OAuth2 access to Mail content for new
+third-party apps — the Yahoo Developer Console no longer offers a
+**Mail (read)** permission, and `mail-r`-scoped tokens are silently
+rejected at the IMAP gateway. Yahoo's
+[official IMAP documentation](https://uk.help.yahoo.com/kb/new-yahoo-mail/imap-server-settings-yahoo-mail-sln4075.html)
+now instructs users to authenticate with a **mailbox-scoped 16-character
+app password** instead. We follow that path: plain
+[`imaplib.IMAP4_SSL.login()`](https://docs.python.org/3/library/imaplib.html#imaplib.IMAP4.login)
+against `imap.mail.yahoo.com:993`, no helper script, no refresh-token
+dance, no Yahoo Developer Console.
+
+1. **Enable 2-step verification** (one-time, prerequisite for app
+   passwords). Sign in to Yahoo, click your avatar →
+   **Account info → Account Security**, scroll to _2-step
+   verification_ → **Turn on** → verify with SMS or an authenticator
+   app of your choice.
+
+2. **Generate the app password.** On the same Account Security page
+   (Yahoo's current UI as of 2026):
+   1. Sign in to your [Yahoo Account Security page](https://login.yahoo.com/myaccount/security).
+   2. Under **External connections**, click **Create app password**.
+      (On older accounts the section may be labelled _Other ways to
+      sign in → Generate app password_ — it's the same feature.)
+   3. Enter your app's name in the text field — anything goes, e.g.
+      `CorporateRAG`. The string is cosmetic; Yahoo doesn't validate
+      it against any registry.
+   4. Click **Generate password**.
+   5. Yahoo displays a 16-character one-time password in groups of
+      four (e.g. `xxxx xxxx xxxx xxxx`). **Copy it now.** It's shown
+      exactly once; you cannot re-fetch it later, only revoke and
+      regenerate.
+   6. Click **Done**.
+
+   You can manage / delete app passwords from the same screen later;
+   each is independent of every other and of your account password.
+
+3. **Smoke-test before saving** (optional but recommended). One-liner
+   from the project venv:
+
+   ```powershell
+   python -c "import imaplib; m=imaplib.IMAP4_SSL('imap.mail.yahoo.com',993,timeout=30); m.login('you@yahoo.com','xxxxxxxxxxxxxxxx'); print(m.select('INBOX',readonly=True)); m.logout()"
+   ```
+
+   Expected: `('OK', [b'<message-count>'])`. If you get
+   `imaplib.IMAP4.error: AUTHENTICATE failed.`, the password is wrong
+   or 2-step verification was disabled (which auto-revokes app
+   passwords). Spaces in the displayed password are cosmetic — IMAP
+   accepts it with or without them, and the sidebar form strips them
+   on save anyway.
+
+4. **Paste into the UI.** _Sidebar → 🔑 Credentials → Email →
+   📭 Yahoo Mail (IMAP + App Password)_:
+
+   | Field                                  | Value                                                                |
+   | -------------------------------------- | -------------------------------------------------------------------- |
+   | **Mailbox address**                    | the Yahoo email you generated the password for, e.g. `you@yahoo.com` |
+   | **Yahoo App Password (16 characters)** | the password Yahoo showed you (with or without spaces)               |
+   | **IMAP folder**                        | leave blank for `INBOX`, or e.g. `Sent`, `Bulk Mail`, `Archive`      |
+
+   Click **Save credentials**.
+
+5. **Run ingestion.** Sidebar → ⚙️ Ingest data → Source: `email`,
+   Scope: `yahoo` → **Run ingestion**. Or via CLI:
+
+   ```bash
+   python -m app.ingestion.cli \
+       --source email --mode incremental --scope yahoo \
+       --email <your CorporateRAG account email>
+   ```
+
+   Healthy log signature:
+
+   ```
+   [email] Yahoo provider registered.
+   [email/yahoo] selected folder INBOX (1234 messages total)
+   [email/yahoo] 47 messages match window ['SINCE', '1-Mar-2026', 'BEFORE', '2-Apr-2026']
+   ```
+
+   After completion, `yahoo` appears under **Email mailboxes** and
+   under **🛡 Manage my access → email**, so it can be selected as a
+   query scope or revoked independently of Outlook / Gmail.
+
+> 🔁 **No helper script for Yahoo.** Earlier revisions of this repo
+> shipped `scripts/yahoo_get_refresh_token.py` to drive an OAuth2
+> consent flow against Yahoo. That script has been **removed** because
+> Yahoo no longer issues `mail-r` tokens to new apps. If you have a
+> legacy Yahoo Developer app that still has the permission and want
+> XOAUTH2 instead of an app password, restore the previous revision
+> of [`app/ingestion/email_ingestor.py`](app/ingestion/email_ingestor.py)
+> from git history — but for any new account, the app-password flow
+> above is the supported path.
+
+> 🔐 **Credential storage.** Outlook / Gmail refresh tokens and the
+> Yahoo app password are all encrypted at rest with the same Fernet
+> key (`ENCRYPTION_KEY`) used for every other connector credential.
+> Treat them like passwords — anyone holding a refresh token can read
+> the mailbox until it's revoked from the provider's account-security
+> page; the same applies to the Yahoo app password (revoke at
+> _Account Security → External connections → Delete app password_).
 
 ---
 

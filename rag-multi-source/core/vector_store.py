@@ -82,21 +82,53 @@ _FILTER_COLUMNS_BY_SOURCE = {
 }
 
 
+def _strip_nul(value: Any) -> Any:
+    """
+    Recursively remove NUL (``\\x00``) bytes from string values.
+
+    PostgreSQL's TEXT/VARCHAR types reject NUL bytes outright
+    (``psycopg.DataError: PostgreSQL text fields cannot contain NUL
+    (0x00) bytes``) — they have no semantic meaning in a text column
+    and can't be escaped. Marketing emails, Outlook-generated MSO
+    conditional comments, and any payload that's been transcoded
+    UTF-16 → UTF-8 with errors='replace' frequently contain stray NULs
+    inside otherwise-valid text/HTML/CSS, which then bombs the entire
+    INSERT batch (32 chunks at a time) on the first offending row.
+
+    Strip rather than reject: the user's intent is "store this email",
+    not "fail because of an invisible artefact in a tracking-pixel
+    style block". JSONB columns *do* allow ``\\u0000`` so we still
+    sanitise the metadata recursively to keep behaviour consistent and
+    avoid future schema-level surprises.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    return value
+
+
 def _row_payload(chunk: ResourceChunk, embedding: list[float]) -> dict[str, Any]:
-    md = dict(chunk.metadata)
+    md = _strip_nul(dict(chunk.metadata))
 
     promoted = {key: md.pop(key, None) for key in _PROMOTED_FIELDS}
 
     return {
-        "resource_id": chunk.resource_id,
+        "resource_id": _strip_nul(chunk.resource_id),
         "source": chunk.source,
         "chunk_index": chunk.chunk_index,
-        "text": chunk.text,
+        "text": _strip_nul(chunk.text),
         "embedding": embedding,
-        "title": md.pop("title", None),
-        "url": md.pop("url", None),
-        "object_name": md.pop("object_name", None),
-        "last_updated": md.pop("last_updated", None),
+        "title": _strip_nul(md.pop("title", None)),
+        "url": _strip_nul(md.pop("url", None)),
+        "object_name": _strip_nul(md.pop("object_name", None)),
+        "last_updated": _strip_nul(md.pop("last_updated", None)),
         "extra": md,
         **promoted,
     }

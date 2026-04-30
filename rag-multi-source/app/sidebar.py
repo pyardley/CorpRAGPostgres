@@ -26,6 +26,7 @@ from loguru import logger
 
 from app.auth import current_user, logout_session
 from app.utils import (
+    delete_credential,
     get_db,
     list_accessible,
     load_all_credentials,
@@ -99,6 +100,7 @@ def _credential_form(
 
     with st.form(key):
         values: dict[str, str] = {}
+        clears: dict[str, bool] = {}
         with get_db() as db:
             existing = load_all_credentials(db, user["id"], source)
 
@@ -115,7 +117,16 @@ def _credential_form(
                         f"**{label}** — currently saved "
                         f"({len(existing_val)} characters). "
                         f"Type a new value below to overwrite; leave blank "
-                        f"to keep the saved value."
+                        f"to keep the saved value; tick **Clear** to remove it."
+                    )
+                    clears[field_key] = st.checkbox(
+                        f"Clear saved {label}",
+                        value=False,
+                        key=f"{widget_key}_clear",
+                        help=(
+                            "Remove this saved secret on save. If you also "
+                            "type a new value above, the new value wins."
+                        ),
                     )
                 else:
                     st.caption(f"**{label}** — no value saved yet.")
@@ -150,17 +161,29 @@ def _credential_form(
 
         if st.form_submit_button("Save credentials", use_container_width=True):
             saved: list[str] = []
+            cleared: list[str] = []
             with get_db() as db:
                 for field_key, _label, _is_secret in fields:
                     val = values[field_key].strip()
                     if val:
+                        # New value typed — overrides any "clear" tick.
                         save_credential(db, user["id"], source, field_key, val)
                         saved.append(field_key)
+                    elif clears.get(field_key):
+                        if delete_credential(db, user["id"], source, field_key):
+                            cleared.append(field_key)
+            parts: list[str] = []
             if saved:
+                parts.append(
+                    f"saved {', '.join(saved)} "
+                    f"({len(saved)} field{'s' if len(saved) != 1 else ''})"
+                )
+            if cleared:
+                parts.append(f"cleared {', '.join(cleared)}")
+            if parts:
                 st.session_state[status_key] = (
                     "success",
-                    f"{source.title()}: saved {', '.join(saved)} "
-                    f"({len(saved)} field{'s' if len(saved) != 1 else ''}).",
+                    f"{source.title()}: " + "; ".join(parts) + ".",
                 )
             else:
                 st.session_state[status_key] = (
@@ -484,6 +507,38 @@ def render_sidebar() -> SelectionState:
                             ("gmail_label", "Label filter (optional, e.g. INBOX)", False),
                         ],
                         form_key="creds_email_gmail",
+                    )
+                with st.expander("📭 Yahoo Mail (IMAP + App Password)", expanded=False):
+                    st.caption(
+                        "Yahoo dropped public OAuth2 for Mail. Generate "
+                        "a 16-character app password at "
+                        "[login.yahoo.com → Account → Security → "
+                        "*Generate app password*]"
+                        "(https://login.yahoo.com/myaccount/security)"
+                        " (requires 2-step verification on the account). "
+                        "Spaces in the displayed password are cosmetic — "
+                        "you can paste with or without them."
+                    )
+                    _credential_form(
+                        "email",
+                        [
+                            (
+                                "yahoo_email_address",
+                                "Mailbox address (e.g. you@yahoo.com)",
+                                False,
+                            ),
+                            (
+                                "yahoo_app_password",
+                                "Yahoo App Password (16 characters)",
+                                True,
+                            ),
+                            (
+                                "yahoo_folder",
+                                "IMAP folder (optional, default INBOX)",
+                                False,
+                            ),
+                        ],
+                        form_key="creds_email_yahoo",
                     )
 
         # Ingestion controls — incremental only.

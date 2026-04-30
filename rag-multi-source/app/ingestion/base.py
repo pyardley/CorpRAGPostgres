@@ -159,7 +159,13 @@ class BaseIngestor(ABC):
             status="running",
         )
         self.db.add(log)
-        self.db.flush()
+        # Commit the "running" row immediately so it survives a hard
+        # interruption (browser close, Streamlit watcher rerun, Ctrl+C).
+        # Without this, the outer get_db() context manager would
+        # roll back this row along with every grant_access() insert
+        # and the user would see vectors in the DB but no scope in the
+        # picker — exactly the orphaned-state bug we're hardening against.
+        self.db.commit()
 
         result = IngestionResult()
         if on_progress:
@@ -194,6 +200,18 @@ class BaseIngestor(ABC):
 
             for resource in self.fetch_resources(since=since):
                 self._process_resource(resource, result)
+                # Update the running log row with cumulative counters so
+                # the "Recent runs" sidebar panel shows real progress and
+                # so a hard kill leaves a sane partial-status row instead
+                # of one that's frozen at items=0/vectors=0.
+                # _process_resource() already committed after
+                # grant_access(); this flush makes the updated counters
+                # part of the *next* commit (whether that's the next
+                # resource's commit or the final one in the finally block).
+                log.items_processed = result.items_processed
+                log.vectors_upserted = result.vectors_upserted
+                log.last_item_updated_at = result.last_item_updated_at
+                self.db.flush()
                 if on_progress:
                     on_progress(
                         {
@@ -217,7 +235,18 @@ class BaseIngestor(ABC):
             log.vectors_upserted = result.vectors_upserted
             log.last_item_updated_at = result.last_item_updated_at
             log.completed_at = datetime.utcnow()
-            self.db.flush()
+            # Commit the terminal status (success/error) so it survives
+            # the wrapping get_db() block being torn down by an
+            # exception. ``except Exception`` in get_db() rolls back any
+            # *uncommitted* work, but a committed row is durable.
+            try:
+                self.db.commit()
+            except Exception:  # noqa: BLE001 - best-effort bookkeeping
+                logger.exception(
+                    "[{}] Could not commit final ingestion log row.",
+                    self.source,
+                )
+                self.db.rollback()
 
         if on_progress:
             on_progress(
@@ -284,6 +313,13 @@ class BaseIngestor(ABC):
             self.source,
             self.resource_identifier_for(resource),
         )
+        # Persist the grant + any pending log-row updates immediately.
+        # Vector upserts in core.vector_store.upsert_chunks() commit on
+        # their own engine session per batch, so without this commit the
+        # bookkeeping would lag behind real data and a mid-run interrupt
+        # would leave orphaned vectors with no user_accessible_resources
+        # row to surface them in the sidebar picker.
+        self.db.commit()
 
     def _chunk(self, resource: SourceResource) -> list[ResourceChunk]:
         splitter = _get_splitter()

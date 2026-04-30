@@ -54,8 +54,22 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Tighten sidebar padding */
-    section[data-testid="stSidebar"] { padding-top: 1rem; }
+    /* Tighten sidebar padding + widen so long credential captions
+       (e.g. "Full token.json") don't get clipped. Streamlit's default
+       sidebar is ~21rem; bump it to 26rem and let it stretch a bit
+       more on wide displays. */
+    section[data-testid="stSidebar"] {
+        padding-top: 1rem;
+        width: 26rem !important;
+        min-width: 26rem !important;
+        max-width: 32rem !important;
+    }
+    /* The collapsed-state container also has a fixed width — keep them
+       aligned so the resize handle works as expected. */
+    section[data-testid="stSidebar"] > div:first-child {
+        width: 26rem !important;
+        min-width: 26rem !important;
+    }
 
     /* Citation block subtle background */
     .citation-block {

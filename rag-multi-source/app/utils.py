@@ -97,6 +97,19 @@ def save_credential(db: Session, user_id: str, source: str, key: str, value: str
     db.flush()
 
 
+def delete_credential(db: Session, user_id: str, source: str, key: str) -> bool:
+    """Remove a single saved credential field. Returns True if a row was deleted."""
+    from models.user import UserCredential
+
+    deleted = (
+        db.query(UserCredential)
+        .filter_by(user_id=user_id, source=source, credential_key=key)
+        .delete()
+    )
+    db.flush()
+    return bool(deleted)
+
+
 def load_credential(db: Session, user_id: str, source: str, key: str) -> Optional[str]:
     from models.user import UserCredential
 
