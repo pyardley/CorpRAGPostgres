@@ -735,10 +735,20 @@ def _build_yahoo_search_url(
     if not query:
         return _YAHOO_INBOX_FALLBACK
 
-    # ``safe=''`` percent-encodes everything that isn't unreserved per
-    # RFC 3986 — including ``@`` and ``:`` — which is exactly what
-    # Yahoo's path parser expects on this route.
-    return f"https://mail.yahoo.com/n/search/keyword={quote(query, safe='')}"
+    # Yahoo's ``/n/search/keyword=…`` route requires the query to be
+    # **double URL-encoded**. The keyword sits in the *path*, not the
+    # query string, and Yahoo's router decodes the path once before
+    # treating the result as the literal search query — so the first
+    # quote() pass produces ``Fresh%20spring…%3A…`` and the second
+    # quote() pass turns those ``%`` bytes into ``%25``, giving the
+    # double-encoded form (``Fresh%2520spring…%253A…``) Yahoo's UI
+    # itself generates when you type the same query into the search
+    # box. A single-encoded URL silently fails to load the message
+    # for queries containing ``:`` or ``@`` — which is every email
+    # address — so don't be tempted to "simplify" this.
+    encoded_once = quote(query, safe="")
+    encoded_twice = quote(encoded_once, safe="")
+    return f"https://mail.yahoo.com/n/search/keyword={encoded_twice}"
 
 
 class _YahooProvider:
