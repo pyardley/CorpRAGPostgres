@@ -48,8 +48,9 @@ class SelectionState:
     # For git, each entry is "{repo_full_name}@{branch}", matching the
     # `git_scope` field written to chunk metadata.
     git_scopes: list[str] = field(default_factory=list)
-    # For email, each entry is a provider name: "outlook" and/or "gmail",
-    # matching the `email_provider` column on vector_chunks.
+    # For email, each entry is a provider name: "outlook", "gmail",
+    # and/or "yahoo", matching the `email_provider` column on
+    # vector_chunks.
     email_providers: list[str] = field(default_factory=list)
     # When True, the chat layer will route through core.mcp_chain so the
     # LLM can call live SQL Server tools (read-only) on top of the RAG
@@ -375,7 +376,9 @@ def render_sidebar() -> SelectionState:
 
         if st.checkbox("Email", value=True, key="src_email"):
             state.sources.append("email")
-            with st.expander("📧 Email mailboxes (outlook / gmail)", expanded=True):
+            with st.expander(
+                "📧 Email mailboxes (outlook / gmail / yahoo)", expanded=True
+            ):
                 state.email_providers = _scope_picker(
                     "Mailboxes", "email", user["id"]
                 )
@@ -556,7 +559,7 @@ def render_sidebar() -> SelectionState:
             )
             ing_scope = st.text_input(
                 "Scope (project_key / space_key / db_name / branch / "
-                "'outlook' | 'gmail' / folder, or 'all')",
+                "'outlook' | 'gmail' | 'yahoo' / folder, or 'all')",
                 value="all",
                 key="ing_scope",
             )
