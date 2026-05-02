@@ -14,12 +14,31 @@ When MCP is actually used we synthesise an extra
 :class:`core.retriever.RetrievedChunk` so the citation list shows
 "Live data via MCP from <db>.<table>" alongside the RAG sources, with
 ``score = 1.0`` so it sorts to the top.
+
+Because the hybrid path may invoke the LLM more than once per user
+prompt, we **aggregate** token usage / cost / duration across every hop
+into a single audit record (``RAGAnswer.usage``) so the chat status bar
+sees one coherent number per user prompt rather than one-per-tool-call.
+
+Step timings (``RAGAnswer.steps``) emitted by this chain:
+
+* ``"build_context"``                    — RAG context formatting.
+* ``"llm_invocation"`` (one per hop, ``metadata.hop = N``)
+* ``"mcp_tool_call:sql_table_query"``    — one round-trip per call,
+  with ``metadata.row_count`` / ``metadata.duration_ms`` from the
+  MCP server response.
+* ``"mcp_tool_call:sql_list_databases"`` — same shape.
+* ``"post_processing"``                  — final text extraction.
+
+The chat layer hands ``steps`` to ``app.utils.log_query_audit`` which
+persists every entry as a ``query_step_timings`` row.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Iterable
 
 from langchain_core.messages import (
@@ -30,7 +49,15 @@ from langchain_core.messages import (
 )
 from loguru import logger
 
-from app.utils import get_db, list_accessible
+from app.config import settings
+from app.utils import (
+    StepTimer,
+    estimate_cost,
+    extract_usage,
+    get_db,
+    list_accessible,
+    record_step_timing,
+)
 from core.llm import get_llm
 from core.mcp_client import build_mcp_tools, get_mcp_client
 from core.rag_chain import RAGAnswer, _format_context  # type: ignore[attr-defined]
@@ -103,16 +130,7 @@ _FROM_TARGET_RE = re.compile(
 def _resolve_direct_db(
     user_id: str, query: str
 ) -> tuple[str | None, str]:
-    """
-    Decide which (db_name, query_to_send) to use for a user-pasted SELECT.
-
-    * If the query references ``db.schema.table``, peel ``db`` off and
-      send the rest unchanged (SQL Server doesn't allow cross-db
-      ``USE`` inside a session-pinned connection, so we strip the
-      database prefix and route the connection to ``db`` instead).
-    * Otherwise, fall back to the user's only accessible db (or the
-      first one, if multiple — the LLM path will handle ambiguity).
-    """
+    """Decide which (db_name, query_to_send) to use for a user-pasted SELECT."""
     match = _FROM_TARGET_RE.search(query)
     if match:
         parts = [p for p in match.groups() if p]
@@ -189,6 +207,52 @@ def _execute_tool_call(
     return header + result.markdown, result.metadata
 
 
+def _current_model_name() -> str:
+    p = settings.LLM_PROVIDER
+    if p == "openai":
+        return settings.OPENAI_CHAT_MODEL
+    if p == "anthropic":
+        return settings.ANTHROPIC_MODEL
+    if p == "grok":
+        return settings.GROK_MODEL
+    return ""
+
+
+def _accumulate_usage(audit: dict[str, Any], response: Any, duration: float) -> None:
+    """
+    Add one LLM call's usage onto the running ``audit`` dict in-place.
+
+    The hybrid path may call the LLM up to ``MAX_TOOL_HOPS + 1`` times for
+    a single user prompt; we sum tokens / cost / duration across all of
+    them so the status bar shows ONE figure per user prompt instead of
+    the sum being split across hops.
+    """
+    usage = extract_usage(response)
+    cost = estimate_cost(
+        audit["provider"],
+        audit["model"],
+        usage["prompt_tokens"],
+        usage["completion_tokens"],
+    )
+    audit["prompt_tokens"] += usage["prompt_tokens"]
+    audit["completion_tokens"] += usage["completion_tokens"]
+    audit["total_tokens"] += usage["total_tokens"]
+    audit["cost_usd"] += cost
+    audit["duration_seconds"] += duration
+
+
+def _new_audit_record() -> dict[str, Any]:
+    return {
+        "provider": settings.LLM_PROVIDER,
+        "model": _current_model_name(),
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "duration_seconds": 0.0,
+    }
+
+
 def answer_question_with_mcp(
     user_id: str,
     question: str,
@@ -200,26 +264,59 @@ def answer_question_with_mcp(
 
     Always falls back to the pure-RAG path on any LangChain/LLM error so a
     flaky MCP server can't take the chat down.
-    """
-    citations = deduplicate_by_resource(hits) if hits else []
-    context_block = _format_context(hits, citations) if citations else "(no RAG context)"
 
+    Returns a :class:`RAGAnswer` whose ``usage`` field is the **summed**
+    audit record across every LLM invocation in the loop, and whose
+    ``steps`` list carries one entry per measured phase (context build,
+    each LLM hop, each MCP tool call, post-processing). The chat layer
+    persists those into ``query_step_timings``.
+    """
+    steps: list[dict[str, Any]] = []
     extra_citations: list[RetrievedChunk] = []
+    audit = _new_audit_record()
+
+    with StepTimer(
+        steps, "build_context", retrieved_count=len(hits)
+    ) as t_ctx:
+        citations = deduplicate_by_resource(hits) if hits else []
+        context_block = (
+            _format_context(hits, citations) if citations else "(no RAG context)"
+        )
+        t_ctx.extra["citations_count"] = len(citations)
+        t_ctx.extra["context_chars"] = len(context_block)
 
     # ── Direct-SELECT fast path ─────────────────────────────────────────────
     # When the user's prompt IS a SQL SELECT (or WITH), we don't trust the
     # LLM to "decide" whether to call the tool — we just run it. This is
     # the most common failure mode of tool-calling models: they refuse to
-    # call a clearly-needed tool and invent prose instead.
+    # call a clearly-needed tool and invent prose instead. No LLM call is
+    # made on this path so the audit record stays at zeros — but the MCP
+    # tool call IS measured, so the audit log still has a step row for it.
     if _DIRECT_SELECT_RE.match(question):
         logger.info("[mcp.chain] direct-SELECT fast path engaged")
         db_name, normalised_query = _resolve_direct_db(user_id, question)
         if db_name:
-            content, meta = _execute_tool_call(
-                user_id,
-                "sql_table_query",
-                {"db_name": db_name, "query": normalised_query},
-            )
+            with StepTimer(
+                steps,
+                "mcp_tool_call:sql_table_query",
+                tool="sql_table_query",
+                fast_path=True,
+                db_name=db_name,
+            ) as t_tool:
+                content, meta = _execute_tool_call(
+                    user_id,
+                    "sql_table_query",
+                    {"db_name": db_name, "query": normalised_query},
+                )
+                if meta:
+                    # Echo MCP-server-reported metadata onto the step row
+                    # so the audit table can show row counts without a
+                    # JOIN against the chat history.
+                    t_tool.extra["row_count"] = meta.get("row_count")
+                    t_tool.extra["server_duration_ms"] = meta.get("duration_ms")
+                t_tool.extra["error"] = (
+                    None if not content.startswith("ERROR") else content
+                )
             if meta and meta.get("row_count") is not None:
                 extra_citations.append(
                     _live_chunk(
@@ -231,7 +328,12 @@ def answer_question_with_mcp(
                 if not content.startswith("ERROR")
                 else content
             )
-            return RAGAnswer(answer=answer, citations=citations + extra_citations)
+            return RAGAnswer(
+                answer=answer,
+                citations=citations + extra_citations,
+                usage=audit,
+                steps=steps,
+            )
         # No accessible DB — fall through to LLM path so it can explain.
 
     tools = build_mcp_tools(user_id)
@@ -242,7 +344,11 @@ def answer_question_with_mcp(
         logger.warning("bind_tools failed, falling back to pure RAG: {}", exc)
         from core.rag_chain import answer_question
 
-        return answer_question(question, hits, history)
+        # Forward the steps we've already measured so the eventual audit
+        # row still records the context-build phase.
+        fallback = answer_question(question, hits, history)
+        fallback.steps = steps + (fallback.steps or [])
+        return fallback
 
     # Tell the LLM exactly which DBs it can target so it doesn't have to
     # guess (and to make refusal-to-call obviously wrong in its own logs).
@@ -276,20 +382,53 @@ def answer_question_with_mcp(
     )
 
     for hop in range(MAX_TOOL_HOPS):
-        response = llm_with_tools.invoke(messages)
+        with StepTimer(
+            steps,
+            "llm_invocation",
+            hop=hop,
+            provider=settings.LLM_PROVIDER,
+            model=_current_model_name(),
+        ) as t_llm:
+            started = time.perf_counter()
+            response = llm_with_tools.invoke(messages)
+            duration = time.perf_counter() - started
+            _accumulate_usage(audit, response, duration)
+            usage_this_hop = extract_usage(response)
+            t_llm.extra["prompt_tokens"] = usage_this_hop["prompt_tokens"]
+            t_llm.extra["completion_tokens"] = usage_this_hop["completion_tokens"]
+            t_llm.extra["total_tokens"] = usage_this_hop["total_tokens"]
+
         messages.append(response)
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             # Done.
-            text = getattr(response, "content", "") or ""
-            if isinstance(text, list):  # Anthropic-style content blocks
-                text = "".join(
-                    b.get("text", "") if isinstance(b, dict) else str(b)
-                    for b in text
+            with StepTimer(steps, "post_processing") as t_post:
+                text = getattr(response, "content", "") or ""
+                if isinstance(text, list):  # Anthropic-style content blocks
+                    text = "".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in text
+                    )
+                t_post.extra["hops"] = hop + 1
+                t_post.extra["tool_calls_made"] = sum(
+                    1 for s in steps if s["step_name"].startswith("mcp_tool_call:")
                 )
             final_citations = citations + extra_citations
-            return RAGAnswer(answer=text, citations=final_citations)
+            logger.info(
+                "[mcp.chain] done after {} hop(s). tokens={} cost=${:.5f} "
+                "llm_time={:.2f}s",
+                hop + 1,
+                audit["total_tokens"],
+                audit["cost_usd"],
+                audit["duration_seconds"],
+            )
+            return RAGAnswer(
+                answer=text,
+                citations=final_citations,
+                usage=audit,
+                steps=steps,
+            )
 
         for call in tool_calls:
             name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
@@ -306,7 +445,18 @@ def answer_question_with_mcp(
             logger.info(
                 "[mcp.chain] hop={} tool={} args={}", hop, name, args
             )
-            content, meta = _execute_tool_call(user_id, name, args or {})
+            with StepTimer(
+                steps,
+                f"mcp_tool_call:{name}",
+                tool=name,
+                hop=hop,
+                db_name=(args or {}).get("db_name"),
+            ) as t_tool:
+                content, meta = _execute_tool_call(user_id, name, args or {})
+                if meta:
+                    t_tool.extra["row_count"] = meta.get("row_count")
+                    t_tool.extra["server_duration_ms"] = meta.get("duration_ms")
+                t_tool.extra["ok"] = not content.startswith("ERROR")
             messages.append(
                 ToolMessage(content=content, tool_call_id=call_id or name)
             )
@@ -315,20 +465,50 @@ def answer_question_with_mcp(
 
     # Hop limit hit — make one final no-tool call to summarise.
     logger.warning("MCP tool loop hit MAX_TOOL_HOPS={}", MAX_TOOL_HOPS)
-    final = llm.invoke(
-        messages
-        + [
-            HumanMessage(
-                content=(
-                    "Tool-call budget exhausted. Summarise what you have so far "
-                    "and answer the user's question. Do not request more tool calls."
+    with StepTimer(
+        steps,
+        "llm_invocation",
+        hop=MAX_TOOL_HOPS,
+        final_summary=True,
+        provider=settings.LLM_PROVIDER,
+        model=_current_model_name(),
+    ):
+        started = time.perf_counter()
+        final = llm.invoke(
+            messages
+            + [
+                HumanMessage(
+                    content=(
+                        "Tool-call budget exhausted. Summarise what you have so far "
+                        "and answer the user's question. Do not request more tool calls."
+                    )
                 )
-            )
-        ]
-    )
-    text = getattr(final, "content", "") or ""
-    if isinstance(text, list):
-        text = "".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in text
+            ]
         )
-    return RAGAnswer(answer=text, citations=citations + extra_citations)
+        _accumulate_usage(audit, final, time.perf_counter() - started)
+
+    with StepTimer(steps, "post_processing") as t_post:
+        text = getattr(final, "content", "") or ""
+        if isinstance(text, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in text
+            )
+        t_post.extra["hops"] = MAX_TOOL_HOPS + 1
+        t_post.extra["budget_exhausted"] = True
+
+    # The hop loop is the most likely place we'd want to know which step
+    # was running when something went wrong; record_step_timing makes
+    # the "hop limit reached" event itself queryable as its own row.
+    record_step_timing(
+        steps,
+        "tool_loop_budget_exhausted",
+        duration_ms=0,
+        max_tool_hops=MAX_TOOL_HOPS,
+    )
+
+    return RAGAnswer(
+        answer=text,
+        citations=citations + extra_citations,
+        usage=audit,
+        steps=steps,
+    )

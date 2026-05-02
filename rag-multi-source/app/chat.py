@@ -5,10 +5,25 @@ plus an LLM call, and renders the result with citations.
 Multi-tenancy is enforced *here* at query time. The retriever does NOT inject
 ``user_id`` into the filter; instead we build a filter from
 :class:`SelectionState` (sidebar) + the user's accessible-resources rows.
+
+The chat layer also owns the **status-bar update** AND the **audit row**
+for each turn:
+
+* It wraps the whole answer-generation block (retrieve → reason → reply)
+  with a wall-clock timer so the user-perceived latency is what shows up
+  in the bar (rather than the LLM-only duration the chains report).
+* Two early steps — ``"build_filter"`` and ``"vector_retrieval"`` — are
+  measured here because the chains never see them. They get prepended
+  to whatever steps the chain produced before persistence.
+* On both success AND error the chat layer calls
+  ``app.utils.log_query_audit`` with a fully-populated audit row + the
+  list of step timings. The helper is wrapped so audit failures never
+  surface to the user.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import streamlit as st
@@ -16,6 +31,14 @@ from loguru import logger
 
 from app.auth import current_user
 from app.sidebar import SelectionState
+from app.utils import (
+    StepTimer,
+    init_session_totals,
+    log_query_audit,
+    record_step_timing,
+    render_status_bar,
+    update_session_totals,
+)
 from core.rag_chain import RAGAnswer, answer_question
 from core.retriever import RetrievedChunk, retrieve
 from core.vector_store import build_query_filter
@@ -31,6 +54,19 @@ def _build_filter(state: SelectionState) -> dict[str, Any]:
         accessible_git_scopes=state.git_scopes,
         accessible_email_providers=state.email_providers,
     )
+
+
+def _resolve_source_type(state: SelectionState, used_mcp: bool) -> str:
+    """
+    Decide the ``source_type`` value for the audit row.
+
+    ``"mcp_only"`` is reserved for the direct-SELECT fast path the user
+    triggers by pasting raw SQL; "hybrid" is anything that bound the MCP
+    tools to the LLM; "rag" is everything else.
+    """
+    if not used_mcp:
+        return "rag"
+    return "hybrid"
 
 
 def _render_citations(citations: list[RetrievedChunk]) -> None:
@@ -50,12 +86,12 @@ def _render_citations(citations: list[RetrievedChunk]) -> None:
             db = c.metadata.get("db_name", "")
             obj_type = c.metadata.get("object_type", "object").upper()
             if c.metadata.get("via") == "mcp":
-                badge = "\u26A1 SQL (live, MCP)"
+                badge = "⚡ SQL (live, MCP)"
                 rows = c.metadata.get("row_count", "?")
-                label = f"Live data from `{db}` \u2014 {rows} row(s)"
+                label = f"Live data from `{db}` — {rows} row(s)"
             else:
                 badge = "\U0001F7E0 SQL"
-                label = f"{db} \u203a {obj} ({obj_type})"
+                label = f"{db} › {obj} ({obj_type})"
         elif c.source == "git":
             badge = "\U0001F7E3 Git"
             repo = c.metadata.get("repo_name", "")
@@ -63,10 +99,10 @@ def _render_citations(citations: list[RetrievedChunk]) -> None:
             git_type = c.metadata.get("git_type", "")
             if git_type == "commit":
                 sha = c.metadata.get("sha", "")
-                label = f"{repo}@{branch} \u00b7 `{sha}` {c.title}"
+                label = f"{repo}@{branch} · `{sha}` {c.title}"
             else:
                 file_path = c.metadata.get("file_path", "")
-                label = f"{repo}@{branch} \u00b7 `{file_path}`"
+                label = f"{repo}@{branch} · `{file_path}`"
         elif c.source == "email":
             provider = c.metadata.get("email_provider", "email")
             sender = c.metadata.get("from", "")
@@ -75,21 +111,21 @@ def _render_citations(citations: list[RetrievedChunk]) -> None:
                 if provider == "outlook"
                 else "\U0001F4EC Gmail"
                 if provider == "gmail"
-                else "\u2709 Email"
+                else "✉ Email"
             )
             subject = c.title or c.resource_id
-            label = f"{subject} \u2014 _{sender}_" if sender else subject
+            label = f"{subject} — _{sender}_" if sender else subject
         else:
-            badge = "\u2022"
+            badge = "•"
             label = c.title or c.resource_id
 
         if c.url:
             st.markdown(
-                f"**[{i}]** {badge} \u2014 [{label}]({c.url})  *(score {c.score:.2f})*"
+                f"**[{i}]** {badge} — [{label}]({c.url})  *(score {c.score:.2f})*"
             )
         else:
             st.markdown(
-                f"**[{i}]** {badge} \u2014 {label}  *(score {c.score:.2f})*"
+                f"**[{i}]** {badge} — {label}  *(score {c.score:.2f})*"
             )
 
 
@@ -100,19 +136,24 @@ def _badges(state: SelectionState) -> str:
     if "confluence" in state.sources and state.confluence_spaces:
         parts.append(f"\U0001F7E2 Confluence ({len(state.confluence_spaces)})")
     if "sql" in state.sources and state.sql_databases:
-        suffix = " + \u26A1MCP" if state.use_mcp_sql else ""
+        suffix = " + ⚡MCP" if state.use_mcp_sql else ""
         parts.append(f"\U0001F7E0 SQL ({len(state.sql_databases)}){suffix}")
     if "git" in state.sources and state.git_scopes:
         parts.append(f"\U0001F7E3 Git ({len(state.git_scopes)})")
     if "email" in state.sources and state.email_providers:
-        parts.append(f"\u2709 Email ({len(state.email_providers)})")
-    return " \u00b7 ".join(parts) if parts else ""
+        parts.append(f"✉ Email ({len(state.email_providers)})")
+    return " · ".join(parts) if parts else ""
 
 
 def render_chat(state: SelectionState) -> None:
     user = current_user()
     if not user:
         return
+
+    # Defensive — main.py initialises this on login, but if someone
+    # imports render_chat from another page or a test harness we still
+    # want the bar to show zeros instead of crashing on a KeyError.
+    init_session_totals()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -146,27 +187,59 @@ def render_chat(state: SelectionState) -> None:
                 _render_citations(msg["citations"])
 
     prompt = st.chat_input(
-        "Ask anything about your Jira, Confluence, SQL, Git, or Email data\u2026"
+        "Ask anything about your Jira, Confluence, SQL, Git, or Email data…"
     )
     if not prompt:
+        # Render the bar before returning so it persists across reruns
+        # where no new prompt was entered.
+        render_status_bar()
         return
 
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # ── Audit + step-timing setup ───────────────────────────────────────────
+    # The chat layer owns the build_filter / vector_retrieval / total
+    # steps; the chains contribute everything else. Both lists end up
+    # in the same ``query_step_timings`` audit child rows.
+    chat_steps: list[dict[str, Any]] = []
+    audit_record: dict[str, Any] | None = None
+    success = True
+    error_message: str | None = None
+    used_mcp_path = bool(state.use_mcp_sql and "sql" in state.sources)
+
+    # Wall-clock the entire answer-generation cycle (retrieval + reasoning
+    # + tool calls). This is the user-perceived latency and is what we
+    # want the bar's "time" column AND the audit row's
+    # ``total_duration_ms`` to reflect — not the LLM-only timing the
+    # chains report separately in their log lines.
+    turn_started = time.perf_counter()
+    result: RAGAnswer
     with st.chat_message("assistant"):
-        with st.spinner("Searching & reasoning\u2026"):
+        with st.spinner("Searching & reasoning…"):
             try:
-                filter_dict = _build_filter(state)
+                with StepTimer(
+                    chat_steps,
+                    "build_filter",
+                    sources=list(state.sources),
+                    use_mcp=used_mcp_path,
+                ) as t_filter:
+                    filter_dict = _build_filter(state)
+                    t_filter.extra["filter_keys"] = sorted(filter_dict.keys())
                 logger.debug("Chat filter: {}", filter_dict)
-                hits = retrieve(prompt, filter_dict)
+
+                with StepTimer(chat_steps, "vector_retrieval") as t_retr:
+                    hits = retrieve(prompt, filter_dict)
+                    t_retr.extra["retrieved_count"] = len(hits)
+
                 history = [
                     (m["role"], m["content"])
                     for m in st.session_state.messages
                     if m["role"] in {"user", "assistant"}
                 ][:-1]
-                if state.use_mcp_sql and "sql" in state.sources:
+
+                if used_mcp_path:
                     # Hybrid path: RAG context + bound SQL MCP tools.
                     from core.mcp_chain import answer_question_with_mcp
 
@@ -177,15 +250,58 @@ def render_chat(state: SelectionState) -> None:
                         history=history,
                     )
                 else:
-                    result: RAGAnswer = answer_question(prompt, hits, history)
+                    result = answer_question(prompt, hits, history)
+
+                audit_record = dict(result.usage or {})
             except Exception as exc:
                 logger.exception("Chat error")
+                success = False
+                error_message = f"{type(exc).__name__}: {exc}"
                 result = RAGAnswer(
-                    answer=f"Sorry \u2014 an error occurred: {exc}", citations=[]
+                    answer=f"Sorry — an error occurred: {exc}",
+                    citations=[],
+                    usage={},
+                    steps=[],
                 )
 
         st.markdown(result.answer)
         _render_citations(result.citations)
+
+    # Wall-clock for the whole turn — what the user actually waited for.
+    total_seconds = time.perf_counter() - turn_started
+
+    # Merge the chain's steps in after the chat-owned ones, then append
+    # a final "total" step that mirrors the audit row's total duration
+    # so a single SELECT against query_step_timings already shows
+    # end-to-end timing without a JOIN.
+    all_steps: list[dict[str, Any]] = list(chat_steps)
+    all_steps.extend(result.steps or [])
+    record_step_timing(
+        all_steps,
+        "total",
+        duration_ms=int(total_seconds * 1000),
+        success=success,
+    )
+
+    # Merge the user-perceived duration into the chain's audit record and
+    # bump the running session totals. The chain reports its own LLM-only
+    # ``duration_seconds`` for the audit log; the bar wants wall-clock.
+    bar_audit = dict(audit_record or {})
+    bar_audit["duration_seconds"] = total_seconds
+    update_session_totals(bar_audit)
+
+    # Persist the audit row + every step timing. Helper is best-effort
+    # and never raises — a broken DB must not break the chat.
+    log_query_audit(
+        user_id=user["id"],
+        prompt_text=prompt,
+        audit=audit_record,
+        total_duration_seconds=total_seconds,
+        source_type=_resolve_source_type(state, used_mcp_path),
+        success=success,
+        error_message=error_message,
+        steps=all_steps,
+    )
 
     st.session_state.messages.append(
         {"role": "assistant", "content": result.answer, "citations": result.citations}
@@ -198,3 +314,9 @@ def render_chat(state: SelectionState) -> None:
     # list on the previous render.
     if _was_empty_at_start:
         st.rerun()
+
+    # Render the persistent status bar at the very bottom of the chat
+    # surface. This is the only place it appears — keeping it inside
+    # render_chat means it's automatically scoped to the authenticated
+    # chat view (anonymous users hit the login page and never get here).
+    render_status_bar()

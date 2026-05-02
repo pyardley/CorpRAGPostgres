@@ -101,6 +101,12 @@ if current_user() is None:
 from app.sidebar import render_sidebar  # noqa: E402
 from app.chat import render_chat  # noqa: E402
 from app.mcp_manager import ensure_mcp_running  # noqa: E402
+from app.utils import init_session_totals  # noqa: E402
+
+# Initialise the chat status-bar totals (tokens, cost, time, prompt count)
+# on first authenticated load. Idempotent — safe on every rerun. Logout
+# clears the whole session_state, so totals naturally reset on sign-out.
+init_session_totals()
 
 # Boot the MCP server on first authenticated load. We only do this once per
 # Streamlit process (cached in session_state) so reruns don't keep re-probing.

@@ -14,13 +14,19 @@ Design notes
 * The chat layer uses :class:`SelectionState` to build a metadata filter
   (see ``core.vector_store.build_query_filter``) which the retriever
   turns into a SQL ``WHERE`` clause.
+* The "Audit Log" expander at the bottom of the sidebar reads
+  ``query_audit_logs`` + ``query_step_timings`` so an operator can see
+  the last 100 prompts (filterable by user / date) plus the full
+  step-by-step timing breakdown for any selected row.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, time as dt_time, timedelta
+from typing import Any, Optional
 
+import pandas as pd
 import streamlit as st
 from loguru import logger
 
@@ -30,6 +36,7 @@ from app.utils import (
     get_db,
     list_accessible,
     load_all_credentials,
+    reset_session_totals,
     revoke_access,
     save_credential,
 )
@@ -330,7 +337,23 @@ def render_sidebar() -> SelectionState:
             help=None if has_messages else "No messages to clear yet.",
         ):
             st.session_state["messages"] = []
+            # Reset the running totals shown in the chat status bar so
+            # "tokens / cost / time" reflect only the new conversation.
+            reset_session_totals()
             st.rerun()
+
+        # Status-bar visibility toggle. Persists across reruns via the
+        # widget key (``show_status_bar``); the bar reads the same key
+        # in app.utils.render_status_bar.
+        st.checkbox(
+            "Show status bar",
+            value=st.session_state.get("show_status_bar", True),
+            key="show_status_bar",
+            help=(
+                "Show the running session totals (tokens, cost, time, "
+                "prompts answered) at the bottom of the chat."
+            ),
+        )
 
         st.divider()
 
@@ -597,6 +620,12 @@ def render_sidebar() -> SelectionState:
                             revoke_access(db, user["id"], src, item)
                         st.rerun()
 
+        # Audit log — read-only inspector for query_audit_logs +
+        # query_step_timings. Filter by user / date range and drill into
+        # any row to see its step-by-step timing breakdown.
+        with st.expander("📋 Audit Log"):
+            _render_audit_log(user["id"])
+
     return state
 
 
@@ -654,3 +683,372 @@ def _render_recent_logs(user_id: str) -> None:
             f"{icon} {log['source']}/{log['scope']} ({log['mode']}) "
             f"items={log['items_processed']} vecs={log['vectors_upserted']}"
         )
+
+
+# ── Audit Log UI ─────────────────────────────────────────────────────────────
+#
+# Reads ``query_audit_logs`` + ``query_step_timings``. Two-pane layout:
+#   1. A sortable, filterable summary table of recent prompts.
+#   2. A detail block for the row the operator picks from a dropdown
+#      (shows the prompt, the audit row's metadata, and every measured
+#      step with duration + JSONB extras).
+#
+# Filters:
+#   * Scope — "Just me" (default) | "All users" — non-admin users only
+#     see their own rows in the underlying query (the "All users" toggle
+#     is purely a UX nicety; access is enforced at query-build time by
+#     defaulting the user filter to the caller's ID).
+#   * Date range — last 24h / 7d / 30d / all.
+#   * Limit — 50 / 100 / 250 (default 100).
+
+
+_DATE_RANGE_OPTIONS = {
+    "Last 24 hours": timedelta(days=1),
+    "Last 7 days": timedelta(days=7),
+    "Last 30 days": timedelta(days=30),
+    "All time": None,
+}
+
+_LIMIT_OPTIONS = (50, 100, 250)
+
+
+def _format_duration_ms(ms: int | None) -> str:
+    if not ms:
+        return "—"
+    if ms < 1000:
+        return f"{ms} ms"
+    return f"{ms / 1000:.2f} s"
+
+
+def _format_cost_usd(value: float | None) -> str:
+    v = float(value or 0.0)
+    if v == 0:
+        return "$0"
+    if v < 0.01:
+        return f"${v:.4f}"
+    if v < 1:
+        return f"${v:.3f}"
+    return f"${v:,.2f}"
+
+
+def _audit_status_icon(success: bool, source_type: str) -> str:
+    if not success:
+        return "❌"
+    if source_type == "hybrid":
+        return "⚡"
+    if source_type == "mcp_only":
+        return "🟠"
+    return "✅"
+
+
+def _load_audit_rows(
+    *,
+    self_user_id: str,
+    only_self: bool,
+    since: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """
+    Read the most recent audit rows matching the active filter.
+
+    Joined to ``users`` for the display email so the table doesn't have
+    to do per-row lookups.
+    """
+    from models.query_audit_log import QueryAuditLog
+    from models.user import User
+
+    rows: list[dict[str, Any]] = []
+    try:
+        with get_db() as db:
+            q = (
+                db.query(QueryAuditLog, User.email)
+                .outerjoin(User, User.id == QueryAuditLog.user_id)
+            )
+            if only_self:
+                q = q.filter(QueryAuditLog.user_id == self_user_id)
+            if since is not None:
+                q = q.filter(QueryAuditLog.timestamp >= since)
+            q = q.order_by(QueryAuditLog.timestamp.desc()).limit(limit)
+            for audit, email in q.all():
+                rows.append(
+                    {
+                        "id": audit.id,
+                        "timestamp": audit.timestamp,
+                        "user_email": email or "(unknown)",
+                        "prompt_text": audit.prompt_text or "",
+                        "source_type": audit.source_type or "rag",
+                        "success": bool(audit.success),
+                        "duration_ms": int(audit.total_duration_ms or 0),
+                        "tokens_prompt": int(audit.tokens_prompt or 0),
+                        "tokens_completion": int(audit.tokens_completion or 0),
+                        "tokens_total": int(
+                            (audit.tokens_prompt or 0)
+                            + (audit.tokens_completion or 0)
+                        ),
+                        "cost_usd": float(audit.estimated_cost_usd or 0.0),
+                        "provider": audit.llm_provider or "",
+                        "model": audit.llm_model or "",
+                        "error_message": audit.error_message or "",
+                    }
+                )
+    except Exception:  # noqa: BLE001
+        # Audit table may not exist yet on a brand-new DB the first time
+        # the sidebar is rendered before init_db() has finished — fall
+        # back to an empty result rather than crashing the whole sidebar.
+        logger.exception("Failed to load audit rows")
+    return rows
+
+
+def _load_step_timings(audit_id: str) -> list[dict[str, Any]]:
+    from models.query_step_timing import QueryStepTiming
+
+    out: list[dict[str, Any]] = []
+    try:
+        with get_db() as db:
+            steps = (
+                db.query(QueryStepTiming)
+                .filter_by(audit_id=audit_id)
+                .order_by(QueryStepTiming.id.asc())
+                .all()
+            )
+            for s in steps:
+                out.append(
+                    {
+                        "step_name": s.step_name,
+                        "duration_ms": int(s.duration_ms or 0),
+                        "metadata": s.extra or {},
+                    }
+                )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to load step timings for audit_id={}", audit_id)
+    return out
+
+
+def _render_audit_log(self_user_id: str) -> None:
+    """Render the Audit Log expander (filters → table → detail view)."""
+    st.caption(
+        "Last 50–250 prompts answered by the chat. Pick a row from the "
+        "dropdown below the table to see its full step-by-step timing."
+    )
+
+    # Filter row
+    col_scope, col_range, col_limit = st.columns([1, 1, 1])
+    with col_scope:
+        only_self = (
+            st.selectbox(
+                "User",
+                options=("Just me", "All users"),
+                index=0,
+                key="audit_scope",
+                help=(
+                    "‘All users’ shows every recorded prompt across the "
+                    "whole installation. Filter to ‘Just me’ to focus on "
+                    "your own activity."
+                ),
+            )
+            == "Just me"
+        )
+    with col_range:
+        date_label = st.selectbox(
+            "Date range",
+            options=list(_DATE_RANGE_OPTIONS.keys()),
+            index=1,  # default: last 7 days
+            key="audit_range",
+        )
+    with col_limit:
+        limit = st.selectbox(
+            "Limit",
+            options=_LIMIT_OPTIONS,
+            index=1,  # default: 100
+            key="audit_limit",
+        )
+
+    # Optional: free-form date override (only the start date — anything
+    # newer than that). Folded behind a small expander so the default
+    # "Last 7 days" UX stays one click away.
+    custom_since: datetime | None = None
+    with st.expander("Advanced — custom start date", expanded=False):
+        use_custom = st.checkbox(
+            "Use custom start date", value=False, key="audit_use_custom_date"
+        )
+        if use_custom:
+            today = datetime.utcnow().date()
+            picked = st.date_input(
+                "Start date (UTC)",
+                value=today - timedelta(days=7),
+                key="audit_custom_date",
+            )
+            custom_since = datetime.combine(picked, dt_time.min)
+
+    if custom_since is not None:
+        since = custom_since
+    else:
+        delta = _DATE_RANGE_OPTIONS[date_label]
+        since = (datetime.utcnow() - delta) if delta is not None else None
+
+    # Refresh button — useful because Streamlit only re-runs on widget
+    # interaction, so a freshly-arrived audit row wouldn't appear until
+    # the user touched something else.
+    if st.button("🔄 Refresh", key="audit_refresh", use_container_width=True):
+        st.rerun()
+
+    rows = _load_audit_rows(
+        self_user_id=self_user_id,
+        only_self=only_self,
+        since=since,
+        limit=int(limit),
+    )
+
+    if not rows:
+        st.info(
+            "No audit rows yet for this filter. Ask a question in the chat "
+            "to generate one — the audit logger writes a row per prompt, "
+            "even on errors."
+        )
+        return
+
+    # Summary metrics — a quick at-a-glance view above the table.
+    total = len(rows)
+    failed = sum(1 for r in rows if not r["success"])
+    total_cost = sum(r["cost_usd"] for r in rows)
+    total_tokens = sum(r["tokens_total"] for r in rows)
+    avg_duration = (
+        sum(r["duration_ms"] for r in rows) / total if total else 0.0
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Prompts", f"{total}", delta=f"{failed} failed" if failed else None)
+    m2.metric("Total cost", _format_cost_usd(total_cost))
+    m3.metric("Total tokens", f"{total_tokens:,}")
+    m4.metric("Avg duration", _format_duration_ms(int(avg_duration)))
+
+    # Sortable summary table.
+    table_df = pd.DataFrame(
+        [
+            {
+                "": _audit_status_icon(r["success"], r["source_type"]),
+                "Timestamp (UTC)": r["timestamp"].strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ) if r["timestamp"] else "",
+                "User": r["user_email"],
+                "Source": r["source_type"],
+                "Duration": _format_duration_ms(r["duration_ms"]),
+                "Tokens": r["tokens_total"],
+                "Cost": _format_cost_usd(r["cost_usd"]),
+                "Model": (
+                    f"{r['provider']}/{r['model']}"
+                    if r["provider"] or r["model"]
+                    else "—"
+                ),
+                "Prompt": (r["prompt_text"][:80] + "…")
+                if len(r["prompt_text"]) > 80
+                else r["prompt_text"],
+                "id": r["id"],
+            }
+            for r in rows
+        ]
+    )
+
+    # Hide the raw id column from the rendered view but keep it in the
+    # underlying frame so the dropdown can map a label back to a row.
+    st.dataframe(
+        table_df.drop(columns=["id"]),
+        use_container_width=True,
+        hide_index=True,
+        height=min(420, 38 * (len(rows) + 1) + 4),
+    )
+
+    # Detail-row picker. Labels include the timestamp + first 60 chars of
+    # the prompt so duplicates don't collide.
+    label_to_id: dict[str, str] = {}
+    label_options: list[str] = []
+    for r in rows:
+        ts = (
+            r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            if r["timestamp"]
+            else "(no ts)"
+        )
+        snippet = r["prompt_text"][:60].replace("\n", " ")
+        if len(r["prompt_text"]) > 60:
+            snippet += "…"
+        icon = _audit_status_icon(r["success"], r["source_type"])
+        label = (
+            f"{icon} {ts} · {r['user_email']} · "
+            f"{_format_duration_ms(r['duration_ms'])} · {snippet or '(empty)'}"
+        )
+        # Disambiguate by appending a short id slug if labels collide.
+        if label in label_to_id:
+            label = f"{label} [{r['id'][:6]}]"
+        label_to_id[label] = r["id"]
+        label_options.append(label)
+
+    chosen = st.selectbox(
+        "View step timings for…",
+        options=["—"] + label_options,
+        index=0,
+        key="audit_detail_pick",
+    )
+    if chosen == "—":
+        return
+
+    audit_id = label_to_id[chosen]
+    chosen_row = next((r for r in rows if r["id"] == audit_id), None)
+    if not chosen_row:
+        return
+
+    st.markdown("---")
+    st.markdown(f"### Audit detail · `{audit_id}`")
+
+    meta_l, meta_r = st.columns(2)
+    with meta_l:
+        st.markdown(
+            f"**User:** {chosen_row['user_email']}  \n"
+            f"**Source path:** {chosen_row['source_type']}  \n"
+            f"**Provider/model:** "
+            f"{(chosen_row['provider'] or '—')}/"
+            f"{(chosen_row['model'] or '—')}  \n"
+            f"**Success:** {'✅' if chosen_row['success'] else '❌'}"
+        )
+    with meta_r:
+        st.markdown(
+            f"**Total duration:** {_format_duration_ms(chosen_row['duration_ms'])}  \n"
+            f"**Prompt tokens:** {chosen_row['tokens_prompt']:,}  \n"
+            f"**Completion tokens:** {chosen_row['tokens_completion']:,}  \n"
+            f"**Cost:** {_format_cost_usd(chosen_row['cost_usd'])}"
+        )
+
+    if chosen_row["error_message"]:
+        st.error(chosen_row["error_message"])
+
+    if chosen_row["prompt_text"]:
+        st.markdown("**Prompt:**")
+        st.code(chosen_row["prompt_text"], language="text")
+
+    steps = _load_step_timings(audit_id)
+    if not steps:
+        st.caption("No step timings recorded for this audit row.")
+        return
+
+    # Step-by-step table — duration + the JSONB extras (rendered as a
+    # short JSON string column so an operator can scan all steps at a
+    # glance without each one expanding).
+    import json as _json
+
+    steps_df = pd.DataFrame(
+        [
+            {
+                "Step": s["step_name"],
+                "Duration": _format_duration_ms(s["duration_ms"]),
+                "ms": s["duration_ms"],
+                "Metadata": _json.dumps(
+                    s["metadata"] or {}, default=str, sort_keys=True
+                ),
+            }
+            for s in steps
+        ]
+    )
+    st.dataframe(
+        steps_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(420, 38 * (len(steps) + 1) + 4),
+    )

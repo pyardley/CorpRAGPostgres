@@ -57,6 +57,78 @@ class Settings(BaseSettings):
     # Rows per upsert batch. We still chunk for memory + WAL pressure.
     VECTOR_UPSERT_BATCH_SIZE: int = 250
 
+    # ── Audit & cost accounting ──────────────────────────────────────────────
+    #
+    # The chat layer always writes a row to ``query_audit_logs`` per user
+    # prompt and a child row to ``query_step_timings`` per measured step.
+    # These flags + the rate table below let an operator tune storage
+    # growth and pricing accuracy without code changes.
+    #
+    # Master switch — set ``AUDIT_LOG_ENABLED=false`` in .env to disable
+    # audit writes entirely (helpers no-op, the chains skip recording).
+    # Useful in tests / hot benchmark loops.
+    AUDIT_LOG_ENABLED: bool = True
+
+    # Truncate stored ``prompt_text`` to this many chars. Keeps the
+    # table small for users that paste long SQL or PDF excerpts.
+    AUDIT_PROMPT_MAX_CHARS: int = 4000
+
+    # Approximate USD pricing per 1K tokens — (prompt_rate, completion_rate).
+    # Lookups are case-insensitive, longest-key-wins substring match
+    # against the configured model name (so "gpt-4o-mini-2025-08-07"
+    # still resolves to the "gpt-4o-mini" rate). Same table is consumed
+    # by ``app.utils.estimate_cost`` which is called from BOTH the
+    # status bar AND the audit logger so the figures never disagree.
+    #
+    # Update both rates here when prices move; no code change required.
+    LLM_COST_PER_1K_TOKENS: dict[str, dict[str, tuple[float, float]]] = {
+        "openai": {
+            # GPT-4o family
+            "gpt-4o-mini":   (0.000150, 0.000600),
+            "gpt-4o":        (0.002500, 0.010000),
+            # GPT-4 family
+            "gpt-4-turbo":   (0.010000, 0.030000),
+            "gpt-4.1-mini":  (0.000400, 0.001600),
+            "gpt-4.1":       (0.002000, 0.008000),
+            "gpt-4":         (0.030000, 0.060000),
+            # GPT-3.5 family
+            "gpt-3.5":       (0.000500, 0.001500),
+            # o-series reasoning models
+            "o1-mini":       (0.003000, 0.012000),
+            "o1":            (0.015000, 0.060000),
+            "o3-mini":       (0.001100, 0.004400),
+        },
+        "anthropic": {
+            # Claude 4.x (current generation)
+            "claude-opus-4":   (0.015000, 0.075000),
+            "claude-sonnet-4": (0.003000, 0.015000),
+            "claude-haiku-4":  (0.001000, 0.005000),
+            # Claude 3.5 / 3 (kept for back-compat with older model strings)
+            "claude-3-5-sonnet": (0.003000, 0.015000),
+            "claude-3-5-haiku":  (0.000800, 0.004000),
+            "claude-3-opus":     (0.015000, 0.075000),
+            "claude-3-sonnet":   (0.003000, 0.015000),
+            "claude-3-haiku":    (0.000250, 0.001250),
+            # Generic family fallbacks (matched after the more specific keys
+            # above thanks to longest-key-wins ordering).
+            "claude-opus":   (0.015000, 0.075000),
+            "claude-sonnet": (0.003000, 0.015000),
+            "claude-haiku":  (0.000800, 0.004000),
+        },
+        "grok": {
+            # xAI Grok family
+            "grok-2-1212": (0.002000, 0.010000),
+            "grok-2":      (0.002000, 0.010000),
+            "grok-beta":   (0.005000, 0.015000),
+            "grok":        (0.005000, 0.015000),
+        },
+    }
+
+    # Fallback rate when the (provider, model) pair isn't in the table.
+    # Conservative — better to slightly over-estimate than to silently
+    # show $0 for an unknown model.
+    LLM_DEFAULT_COST_PER_1K_TOKENS: tuple[float, float] = (0.001000, 0.003000)
+
     @property
     def embedding_dim(self) -> int:
         if self.EMBEDDINGS_PROVIDER == "huggingface":

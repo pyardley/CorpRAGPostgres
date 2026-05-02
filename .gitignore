@@ -2,6 +2,10 @@
 .env
 *.db
 *.sqlite3
+client_secret*.json
+token.json
+credentials.json
+*_oauth_token.json
 
 # Python
 .venv/
@@ -26,12 +30,4 @@ import_chroma_ts.py
 *.swo
 
 # OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Docker volumes / data
-data/
+.DS_

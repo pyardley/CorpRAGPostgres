@@ -10,6 +10,9 @@ Exposes `run_migrations(engine)` which:
      several million rows on a tiny instance.
   4. Applies any additive ``ALTER TABLE`` column changes listed in
      ``_ADDITIVE_COLUMNS`` (still best-effort, no down-migration support).
+  5. Creates additive indexes (composite / partial) listed in
+     ``_ADDITIVE_INDEXES`` — used for query-shape-specific tuning that
+     SQLAlchemy's column-decl indexes don't cover.
 
 Called from ``app.utils.init_db()`` on every Streamlit / CLI startup, so a
 fresh database becomes usable just by setting ``DATABASE_URL`` and running
@@ -44,6 +47,41 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "ON vector_chunks (email_provider) "
         "WHERE email_provider IS NOT NULL",
     ),
+    # ── Audit logging indexes ───────────────────────────────────────────
+    # SQLAlchemy already declares these via Index(...) in the model
+    # files, but listing them here as well keeps the migration robust
+    # against models being imported in a different order or being
+    # partially registered when a fresh DB is being bootstrapped.
+    (
+        "ix_query_audit_logs_user_ts",
+        "query_audit_logs",
+        "CREATE INDEX IF NOT EXISTS ix_query_audit_logs_user_ts "
+        "ON query_audit_logs (user_id, timestamp DESC)",
+    ),
+    (
+        "ix_query_audit_logs_timestamp",
+        "query_audit_logs",
+        "CREATE INDEX IF NOT EXISTS ix_query_audit_logs_timestamp "
+        "ON query_audit_logs (timestamp DESC)",
+    ),
+    (
+        "ix_query_audit_logs_success",
+        "query_audit_logs",
+        "CREATE INDEX IF NOT EXISTS ix_query_audit_logs_success "
+        "ON query_audit_logs (success)",
+    ),
+    (
+        "ix_query_step_timings_audit_id",
+        "query_step_timings",
+        "CREATE INDEX IF NOT EXISTS ix_query_step_timings_audit_id "
+        "ON query_step_timings (audit_id)",
+    ),
+    (
+        "ix_query_step_timings_step_duration",
+        "query_step_timings",
+        "CREATE INDEX IF NOT EXISTS ix_query_step_timings_step_duration "
+        "ON query_step_timings (step_name, duration_ms)",
+    ),
 )
 
 
@@ -71,12 +109,14 @@ def run_migrations(engine: Engine) -> None:
     import models.ingestion_log  # noqa: F401
     import models.user_accessible_resource  # noqa: F401
     import models.vector_chunk  # noqa: F401
+    import models.query_audit_log  # noqa: F401
+    import models.query_step_timing  # noqa: F401
 
     # 1. pgvector extension must exist before vector_chunks can be created.
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
 
-    # 2. Tables.
+    # 2. Tables. ``create_all`` is idempotent — existing tables are skipped.
     Base.metadata.create_all(bind=engine)
 
     # 3. HNSW vector index. Created post-table because SQLAlchemy doesn't

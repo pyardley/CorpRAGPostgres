@@ -118,6 +118,39 @@ overwrite, not a duplicate.
 
 ---
 
+## Chat Status Bar
+
+The chat surface carries a persistent footer-style **status bar** that shows
+running session totals after every answer:
+
+| Column      | What it shows                                                        |
+| ----------- | -------------------------------------------------------------------- |
+| **Tokens**  | Cumulative `prompt + completion` tokens across the session.          |
+| **Cost**    | USD estimate, summed from the same price table the audit log uses.   |
+| **Time**    | Wall-clock seconds spent answering, plus the per-prompt average.     |
+| **Prompts** | Number of user prompts answered this session.                        |
+| **Model**   | The current `provider / model` (`openai / gpt-4o-mini`, etc.).       |
+
+Implementation in one paragraph: each call to the RAG or hybrid chain
+populates a small audit record (`prompt_tokens`, `completion_tokens`,
+`cost_usd`, `duration_seconds`, `provider`, `model`) on the returned
+`RAGAnswer.usage`. The chat layer overrides `duration_seconds` with the
+user-perceived wall-clock time and feeds it into
+`app.utils.update_session_totals`, which accumulates into
+`st.session_state["session_totals"]`. The bar (`render_status_bar`)
+reads the same dict on every rerun so it survives reruns automatically.
+
+The totals reset on **logout** (Streamlit clears `session_state`) and
+when the **🗑 Clear chat** button is clicked. Hide the bar via the
+**Show status bar** checkbox in the sidebar.
+
+> ⚠ Costs are **estimates** based on a built-in per-1K-token price
+> table — fine for dashboards, not authoritative for billing. Provider
+> price changes need a one-line update to `_COST_PER_1K_TOKENS` in
+> `app/utils.py`.
+
+---
+
 ## Setup
 
 ### 1. Get a PostgreSQL ≥ 14 with pgvector
@@ -757,6 +790,144 @@ or wrap `get_db()` to do it).
 
 ---
 
+## Audit & Performance Logging
+
+Every chat prompt produces two pieces of durable telemetry:
+
+1. **`query_audit_logs`** — one high-level row per user prompt:
+   `id`, `user_id`, `timestamp`, `prompt_text` (truncated), `total_duration_ms`,
+   `tokens_prompt`, `tokens_completion`, `estimated_cost_usd`, `llm_provider`,
+   `llm_model`, `success`, `error_message`, `source_type`
+   (`"rag"` | `"hybrid"` | `"mcp_only"`).
+
+2. **`query_step_timings`** — N child rows per audit entry, one per measured
+   step in the answer pipeline. Each row carries `step_name`, `duration_ms`,
+   and a JSONB `metadata` blob with step-specific extras (retrieved-chunk
+   counts, MCP row counts, hop indices, token counts per LLM hop, …).
+
+### What gets measured
+
+The pipeline is timed end-to-end with `time.perf_counter()` from the chat
+layer. Steps emitted on a typical RAG turn:
+
+```
+build_filter         -- translate sidebar selection into the metadata filter
+vector_retrieval     -- pgvector top-K cosine + de-dup
+build_context        -- group hits by resource, build numbered LLM context
+llm_invocation       -- single llm.invoke(messages)
+post_processing      -- extract text + assemble the audit record
+total                -- mirror of total_duration_ms (no JOIN required)
+```
+
+The hybrid (MCP) path additionally emits one `llm_invocation` per hop
+(with `metadata.hop = N`) and one `mcp_tool_call:<tool_name>` per
+round-trip, with `metadata.row_count` / `metadata.server_duration_ms`
+copied from the MCP-server response. The direct-SELECT fast path skips
+the LLM entirely and emits a single `mcp_tool_call:sql_table_query` step
+with `metadata.fast_path = true`.
+
+### Cost estimation
+
+Token-to-USD conversion uses the rate table on
+`settings.LLM_COST_PER_1K_TOKENS` in [`app/config.py`](app/config.py).
+Lookups are case-insensitive, longest-key-wins substring matches, so
+`"gpt-4o-mini-2025-08-07"` resolves to the `gpt-4o-mini` rate without
+the table needing to know about every dated snapshot. Rates ship for
+**OpenAI** (GPT-4o, GPT-4.1, GPT-4 turbo, GPT-3.5, o1/o3 reasoning),
+**Anthropic** (Claude 4 Opus / Sonnet / Haiku, 3.5 / 3 family), and
+**xAI Grok** (grok-2, grok-beta). When a (provider, model) pair isn't
+in the table, `LLM_DEFAULT_COST_PER_1K_TOKENS` is used as a
+conservative fallback so the audit row never silently shows `$0` for
+an unknown model.
+
+The same rate table is consumed by the chat status bar, so the
+in-session counter and the persisted audit row always agree.
+
+### Always-on, never-fatal
+
+`app.utils.log_query_audit` is wrapped in a `try / except` that swallows
+all errors — a broken DB connection or a missing column must never
+take the chat down. Even on the failure path (LLM timeout, MCP server
+down, retrieval exception) the chat layer still calls the helper with
+`success=False` and the partial step timings, so the audit table
+captures _what was running_ when the failure happened.
+
+To disable audit logging entirely (e.g. for hot benchmark loops or
+test runs), set `AUDIT_LOG_ENABLED=false` in `.env`. The `prompt_text`
+field is truncated at write time to `AUDIT_PROMPT_MAX_CHARS` (default
+4000) so paste-bombs don't bloat the table.
+
+### How to view it
+
+A new **📋 Audit Log** expander at the bottom of the sidebar surfaces
+the audit data without a SQL client:
+
+* **Filters** — User scope (Just me / All users), Date range
+  (24h / 7d / 30d / All time, plus a custom-start-date override), and
+  Limit (50 / 100 / 250).
+* **Summary metrics** — total prompts, failed prompts, total cost,
+  total tokens, average duration across the active filter.
+* **Sortable table** — Timestamp · User · Source · Duration · Tokens ·
+  Cost · Model · Prompt-snippet, with a status icon (✅ rag /
+  ⚡ hybrid / 🟠 mcp-only / ❌ failed).
+* **Detail view** — pick any row from the dropdown below the table
+  and the page expands a panel with the full prompt, the audit
+  metadata, the error (if any), and a **step-by-step timing table**
+  showing every `query_step_timings` row for that prompt with its
+  JSONB metadata.
+
+### Querying the data directly
+
+The tables are plain Postgres — you can also analyse them ad-hoc:
+
+```sql
+-- Slowest steps over the last 24 hours
+SELECT step_name,
+       COUNT(*)                AS calls,
+       AVG(duration_ms)::int   AS avg_ms,
+       MAX(duration_ms)        AS max_ms
+FROM   query_step_timings t
+JOIN   query_audit_logs   a ON a.id = t.audit_id
+WHERE  a.timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY step_name
+ORDER BY avg_ms DESC;
+
+-- Per-user spend this month
+SELECT u.email,
+       COUNT(*)                          AS prompts,
+       SUM(a.estimated_cost_usd)::numeric(10,4) AS spend_usd,
+       SUM(a.tokens_prompt + a.tokens_completion) AS tokens
+FROM   query_audit_logs a
+JOIN   users u ON u.id = a.user_id
+WHERE  a.timestamp >= DATE_TRUNC('month', NOW())
+GROUP BY u.email
+ORDER BY spend_usd DESC;
+```
+
+### Privacy & storage growth
+
+Prompts are stored in cleartext (truncated, but not encrypted).
+Operationally:
+
+* **PII / sensitive content.** Treat `query_audit_logs.prompt_text` as
+  user-content of the same sensitivity as the chat history. If the
+  installation handles regulated data, lower `AUDIT_PROMPT_MAX_CHARS`
+  to a snippet length (e.g. 200) or set it to `0` to skip the prompt
+  entirely; the timing/cost columns remain useful on their own.
+* **Retention.** Both tables are append-only. A per-month estimate at
+  ~1 KB per audit row + ~6 step rows × ~0.3 KB each gives roughly
+  3 KB per prompt. 10 000 prompts/month ≈ 30 MB. Add a nightly
+  `DELETE FROM query_audit_logs WHERE timestamp < NOW() - INTERVAL
+  '90 days'` (the FK on `query_step_timings` cascades) once the
+  archive policy is decided.
+* **Encryption at rest.** If your Postgres host doesn't already
+  encrypt at rest, the same `cryptography.Fernet` machinery used for
+  credentials in [`app/utils.py`](app/utils.py) can be applied to
+  `prompt_text` — keep the audit row queryable for cost/duration
+  metrics while keeping the prompt body opaque to a casual DB read.
+
+---
+
 ## Hybrid RAG + MCP (Live SQL Server table data)
 
 CorporateRAG also ships a **Model-Context-Protocol-style server** that
@@ -937,26 +1108,20 @@ A small scheduler (cron, Celery beat, GitHub Actions, the Cowork
 `python -m app.ingestion.cli --source all --mode incremental` keeps the
 index fresh without anybody clicking buttons.
 
-### 4. Audit log of queries
-
-Log every `(user_id, query, filter_dict, citations)` to a `query_logs`
-table — useful for compliance reviews and for debugging "why did the
-model say X?".
-
-### 5. Hybrid search (BM25 + cosine)
+### 4. Hybrid search (BM25 + cosine)
 
 Postgres makes this trivial: add a `tsvector` column on `vector_chunks`,
 GIN-index it, and combine `ts_rank` + `1 - (embedding <=> :q)` as the
 final score. Often a measurable improvement for keyword-heavy queries
 (error codes, IDs, exact phrases).
 
-### 6. Reranking with a cross-encoder
+### 5. Reranking with a cross-encoder
 
 A second-stage cross-encoder reranker (e.g. `bge-reranker-base`) over the
 top-50 from pgvector, returning the top-8 to the LLM. Tens of milliseconds
 of latency; meaningful accuracy bump on tricky retrievals.
 
-### 7. Streaming LLM responses
+### 6. Streaming LLM responses
 
 `render_chat` currently calls `llm.invoke()` and renders the full answer
 once it returns. Switching to `llm.stream()` and `st.write_stream()`
