@@ -53,88 +53,76 @@ class Settings(BaseSettings):
     TOP_K: int = 8
     SCORE_THRESHOLD: float = 0.10
 
-    # ── Vector store ops ─────────────────────────────────────────────────────
-    # Rows per upsert batch. We still chunk for memory + WAL pressure.
-    VECTOR_UPSERT_BATCH_SIZE: int = 250
-
-    # ── Audit & cost accounting ──────────────────────────────────────────────
+    # HNSW runtime search effort (pgvector ``hnsw.ef_search``).
     #
-    # The chat layer always writes a row to ``query_audit_logs`` per user
-    # prompt and a child row to ``query_step_timings`` per measured step.
-    # These flags + the rate table below let an operator tune storage
-    # growth and pricing accuracy without code changes.
+    # Controls how many candidates the HNSW graph traversal explores per
+    # query. The pgvector default is 40, which is fine when results are
+    # tightly clustered but causes recall misses when one source has a
+    # dense neighbourhood near the query embedding (e.g. lots of similar
+    # marketing emails) and crowds out a higher-scoring chunk in another
+    # source. Symptom: filtering to the "right" source surfaces a hit at
+    # score 0.35, but enabling all sources returns only 0.32–0.34 hits
+    # from the noisy source — the 0.35 chunk should rank #1 globally
+    # but never makes it into the top-K candidate set.
     #
-    # Master switch — set ``AUDIT_LOG_ENABLED=false`` in .env to disable
-    # audit writes entirely (helpers no-op, the chains skip recording).
-    # Useful in tests / hot benchmark loops.
-    AUDIT_LOG_ENABLED: bool = True
+    # 200 is a comfortable default: ~5× the pgvector default, materially
+    # better recall, still sub-millisecond on millions of rows. Bump to
+    # 400+ if you still see the noisy-source effect; lower to 80–100 if
+    # query latency matters more than recall on extremely large indexes.
+    # Applied per-statement via ``SET LOCAL hnsw.ef_search`` so it only
+    # affects the SELECT in ``core.retriever.retrieve`` and never leaks
+    # to other sessions sharing the connection pool.
+    HNSW_EF_SEARCH: int = 200
 
-    # Truncate stored ``prompt_text`` to this many chars. Keeps the
-    # table small for users that paste long SQL or PDF excerpts.
-    AUDIT_PROMPT_MAX_CHARS: int = 4000
-
-    # Approximate USD pricing per 1K tokens — (prompt_rate, completion_rate).
-    # Lookups are case-insensitive, longest-key-wins substring match
-    # against the configured model name (so "gpt-4o-mini-2025-08-07"
-    # still resolves to the "gpt-4o-mini" rate). Same table is consumed
-    # by ``app.utils.estimate_cost`` which is called from BOTH the
-    # status bar AND the audit logger so the figures never disagree.
+    # Per-source diversity quota.
     #
-    # Update both rates here when prices move; no code change required.
-    LLM_COST_PER_1K_TOKENS: dict[str, dict[str, tuple[float, float]]] = {
-        "openai": {
-            # GPT-4o family
-            "gpt-4o-mini":   (0.000150, 0.000600),
-            "gpt-4o":        (0.002500, 0.010000),
-            # GPT-4 family
-            "gpt-4-turbo":   (0.010000, 0.030000),
-            "gpt-4.1-mini":  (0.000400, 0.001600),
-            "gpt-4.1":       (0.002000, 0.008000),
-            "gpt-4":         (0.030000, 0.060000),
-            # GPT-3.5 family
-            "gpt-3.5":       (0.000500, 0.001500),
-            # o-series reasoning models
-            "o1-mini":       (0.003000, 0.012000),
-            "o1":            (0.015000, 0.060000),
-            "o3-mini":       (0.001100, 0.004400),
-        },
-        "anthropic": {
-            # Claude 4.x (current generation)
-            "claude-opus-4":   (0.015000, 0.075000),
-            "claude-sonnet-4": (0.003000, 0.015000),
-            "claude-haiku-4":  (0.001000, 0.005000),
-            # Claude 3.5 / 3 (kept for back-compat with older model strings)
-            "claude-3-5-sonnet": (0.003000, 0.015000),
-            "claude-3-5-haiku":  (0.000800, 0.004000),
-            "claude-3-opus":     (0.015000, 0.075000),
-            "claude-3-sonnet":   (0.003000, 0.015000),
-            "claude-3-haiku":    (0.000250, 0.001250),
-            # Generic family fallbacks (matched after the more specific keys
-            # above thanks to longest-key-wins ordering).
-            "claude-opus":   (0.015000, 0.075000),
-            "claude-sonnet": (0.003000, 0.015000),
-            "claude-haiku":  (0.000800, 0.004000),
-        },
-        "grok": {
-            # xAI Grok family
-            "grok-2-1212": (0.002000, 0.010000),
-            "grok-2":      (0.002000, 0.010000),
-            "grok-beta":   (0.005000, 0.015000),
-            "grok":        (0.005000, 0.015000),
-        },
-    }
+    # Even with a healthy ``HNSW_EF_SEARCH`` it's possible for one source
+    # to legitimately fill all TOP_K slots — e.g. a thousand near-identical
+    # marketing emails clustered just above the relevance threshold. The
+    # retriever guards against that by fetching a wider candidate pool
+    # (``TOP_K * RETRIEVAL_FETCH_MULTIPLIER`` rows) and then capping how
+    # many chunks any single source contributes to the final top-K
+    # (``MAX_HITS_PER_SOURCE``).
+    #
+    # The cap is soft: if there aren't enough hits from other sources to
+    # fill ``TOP_K``, the retriever backfills from the overflow in
+    # score order, so single-source queries (or selections where only
+    # one source has matches) still return a full result set.
+    #
+    # Defaults: fetch 4× the candidates, cap each source at 4 of TOP_K=8.
+    # Set ``MAX_HITS_PER_SOURCE`` ≥ ``TOP_K`` to disable the quota.
+    RETRIEVAL_FETCH_MULTIPLIER: int = 4
+    MAX_HITS_PER_SOURCE: int = 4
 
-    # Fallback rate when the (provider, model) pair isn't in the table.
-    # Conservative — better to slightly over-estimate than to silently
-    # show $0 for an unknown model.
-    LLM_DEFAULT_COST_PER_1K_TOKENS: tuple[float, float] = (0.001000, 0.003000)
-
-    @property
-    def embedding_dim(self) -> int:
-        if self.EMBEDDINGS_PROVIDER == "huggingface":
-            return self.HF_EMBEDDING_DIMENSION
-        return self.EMBEDDING_DIMENSION
-
-
-# Singleton – import this everywhere
-settings = Settings()
+    # ── Hybrid retrieval (vector + keyword) ──────────────────────────────────
+    #
+    # Pure dense retrieval struggles with rare-token queries (error codes,
+    # ticket numbers, SKUs, identifiers like "XYZ999") because the embedding
+    # is dominated by the surrounding semantic context, not the literal
+    # token. Hybrid retrieval runs a Postgres full-text search (FTS) in
+    # parallel with the vector search and fuses the two ranked lists with
+    # Reciprocal Rank Fusion (RRF). Lexical matching catches the
+    # rare-token case; semantic matching catches the conceptual case.
+    #
+    # ``RETRIEVAL_MODE``
+    #     ``"vector"`` — original behaviour, vector similarity only.
+    #     ``"hybrid"`` — vector + keyword, RRF-fused. Requires the
+    #     ``vector_chunks.text_search`` generated column + GIN index that
+    #     ``models.migrations`` provisions automatically on first run.
+    #
+    # ``RRF_K``
+    #     Smoothing constant for Reciprocal Rank Fusion. The standard
+    #     value from the original RRF paper is 60. Lower → top-ranked
+    #     items dominate the fused score; higher → lower-ranked items
+    #     get a fairer share. Rarely worth tuning.
+    #
+    # ``FTS_LANGUAGE``
+    #     Postgres text-search configuration name. ``"english"`` is the
+    #     default install. Switch to ``"simple"`` to disable stemming
+    #     and stop-word removal — useful for code-heavy corpora where
+    #     "running" should not match "run" and "the" / "is" should still
+    #     be searchable. Used by both the generated tsvector column and
+    #     the query-time ``websearch_to_tsquery`` call.
+    RETRIEVAL_MODE: Literal["vector", "hybrid"] = "hybrid"
+    RRF_K: int = 60
+    FTS_LANGUAGE: str = "english

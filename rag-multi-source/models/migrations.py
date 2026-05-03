@@ -13,6 +13,11 @@ Exposes `run_migrations(engine)` which:
   5. Creates additive indexes (composite / partial) listed in
      ``_ADDITIVE_INDEXES`` — used for query-shape-specific tuning that
      SQLAlchemy's column-decl indexes don't cover.
+  6. Optionally applies Row-Level Security policies on ``vector_chunks``
+     and ``user_accessible_resources`` (gated on ``settings.ENABLE_RLS``).
+     Policies key on the per-session GUC ``app.current_user_id`` set by
+     :func:`app.utils.set_current_user_for_rls` — see the
+     ``_apply_rls_policies`` block below for the full SQL.
 
 Called from ``app.utils.init_db()`` on every Streamlit / CLI startup, so a
 fresh database becomes usable just by setting ``DATABASE_URL`` and running
@@ -27,6 +32,7 @@ from loguru import logger
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
+from app.config import settings
 from models.base import Base
 
 
@@ -36,6 +42,32 @@ _ADDITIVE_COLUMNS: Iterable[tuple[str, str, str]] = (
     # Email source — added after the original 4-source schema was deployed.
     # Nullable so existing rows (jira/confluence/sql/git) stay valid.
     ("vector_chunks", "email_provider", "VARCHAR(32) NULL"),
+    # Content fingerprint (SHA-256 hex) — OB1-inspired dedup. Nullable
+    # so existing rows are valid; the next re-ingest backfills them.
+    # CHAR(64) is exact-fit for a SHA-256 hex digest.
+    ("vector_chunks", "content_fingerprint", "CHAR(64) NULL"),
+    # Hybrid retrieval — Postgres full-text search vector. Generated
+    # column kept in sync automatically by Postgres on every INSERT /
+    # UPDATE, so the application write path is unchanged. ``setweight``
+    # gives title matches a stronger weight ('A') than body matches
+    # ('B'); ``ts_rank_cd`` honours those weights at query time.
+    # ``coalesce`` keeps the expression total over NULL columns so the
+    # generated column is never NULL.
+    #
+    # NB: the language config is hard-coded to ``english`` here because
+    # generated-column expressions must be immutable, and ``to_tsvector``
+    # is only treated as immutable when its first argument is a regclass
+    # literal. If you change ``FTS_LANGUAGE`` in settings you must also
+    # rebuild this column with the matching language — drop it, change
+    # this DDL, and re-run migrations.
+    (
+        "vector_chunks",
+        "text_search",
+        "tsvector GENERATED ALWAYS AS ("
+        "setweight(to_tsvector('english', coalesce(title, '')), 'A') || "
+        "setweight(to_tsvector('english', coalesce(text, '')), 'B')"
+        ") STORED",
+    ),
 )
 
 # (index_name, table_name, ddl). Idempotent — checked via _index_exists.
@@ -82,76 +114,24 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "CREATE INDEX IF NOT EXISTS ix_query_step_timings_step_duration "
         "ON query_step_timings (step_name, duration_ms)",
     ),
-)
-
-
-def _existing_columns(engine: Engine, table: str) -> set[str]:
-    inspector = inspect(engine)
-    if table not in inspector.get_table_names():
-        return set()
-    return {col["name"] for col in inspector.get_columns(table)}
-
-
-def _index_exists(engine: Engine, table: str, index_name: str) -> bool:
-    inspector = inspect(engine)
-    if table not in inspector.get_table_names():
-        return False
-    return any(
-        ix.get("name") == index_name for ix in inspector.get_indexes(table)
-    )
-
-
-def run_migrations(engine: Engine) -> None:
-    """Ensure the schema (and pgvector) are up to date. Safe to re-run."""
-
-    # Import all model modules so SQLAlchemy registers them on Base.metadata.
-    import models.user  # noqa: F401
-    import models.ingestion_log  # noqa: F401
-    import models.user_accessible_resource  # noqa: F401
-    import models.vector_chunk  # noqa: F401
-    import models.query_audit_log  # noqa: F401
-    import models.query_step_timing  # noqa: F401
-
-    # 1. pgvector extension must exist before vector_chunks can be created.
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-
-    # 2. Tables. ``create_all`` is idempotent — existing tables are skipped.
-    Base.metadata.create_all(bind=engine)
-
-    # 3. HNSW vector index. Created post-table because SQLAlchemy doesn't
-    #    have first-class support for `USING hnsw` + opclass at column-decl
-    #    time. m=16 / ef_construction=64 are pgvector's defaults — fine for
-    #    most corpora; tune higher if recall isn't satisfactory.
-    with engine.begin() as conn:
-        if not _index_exists(engine, "vector_chunks", "ix_vector_chunks_hnsw"):
-            logger.info("Creating HNSW index on vector_chunks.embedding…")
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_vector_chunks_hnsw "
-                    "ON vector_chunks USING hnsw "
-                    "(embedding vector_cosine_ops) "
-                    "WITH (m = 16, ef_construction = 64)"
-                )
-            )
-
-    # 4. Additive column changes.
-    with engine.begin() as conn:
-        for table, column, ddl in _ADDITIVE_COLUMNS:
-            if column in _existing_columns(engine, table):
-                continue
-            logger.info("Adding column {}.{}", table, column)
-            conn.execute(
-                text(f'ALTER TABLE "{table}" ADD COLUMN {column} {ddl}')
-            )
-
-    # 5. Additive indexes (CREATE INDEX IF NOT EXISTS already idempotent,
-    #    but we double-check the inspector first to avoid noisy logs).
-    with engine.begin() as conn:
-        for index_name, table, ddl in _ADDITIVE_INDEXES:
-            if _index_exists(engine, table, index_name):
-                continue
-            logger.info("Creating index {} on {}", index_name, table)
-            conn.execute(text(ddl))
-
-    logger.info("Schema migrations complete.")
+    # ── Content fingerprint dedup (OB1-inspired) ────────────────────────
+    # Equality lookup on the SHA-256 hex; partial so the index only
+    # carries rows that have been processed by the new fingerprint code
+    # path (fresh ingests + any row touched after the migration).
+    (
+        "ix_vector_chunks_content_fingerprint",
+        "vector_chunks",
+        "CREATE INDEX IF NOT EXISTS ix_vector_chunks_content_fingerprint "
+        "ON vector_chunks (content_fingerprint) "
+        "WHERE content_fingerprint IS NOT NULL",
+    ),
+    # ── Hybrid retrieval (Postgres FTS) ─────────────────────────────────
+    # GIN index over the generated ``text_search`` tsvector column drives
+    # the keyword side of hybrid retrieval (``core.retriever`` runs an
+    # FTS query in parallel with the vector search and fuses the results
+    # via Reciprocal Rank Fusion). GIN scales linearly with the corpus
+    # and is the standard pgsql FTS index — no extension required.
+    (
+        "ix_vector_chunks_text_search",
+        "vector_chunks",
+        "CREATE
