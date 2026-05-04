@@ -230,7 +230,11 @@ def render_chat(state: SelectionState) -> None:
                 logger.debug("Chat filter: {}", filter_dict)
 
                 with StepTimer(chat_steps, "vector_retrieval") as t_retr:
-                    hits = retrieve(prompt, filter_dict)
+                    # user_id is required when ENABLE_RLS=True so the
+                    # RLS policies on vector_chunks recognise the
+                    # caller. The retriever no-ops the binding when
+                    # RLS is disabled.
+                    hits = retrieve(prompt, filter_dict, user_id=user["id"])
                     t_retr.extra["retrieved_count"] = len(hits)
 
                 history = [

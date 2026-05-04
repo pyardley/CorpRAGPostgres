@@ -48,6 +48,7 @@ from app.config import settings
 from app.utils import grant_access
 from core.vector_store import (
     ResourceChunk,
+    compute_content_fingerprint,
     delete_by_filter,
     delete_resource,
     upsert_chunks,
@@ -187,7 +188,10 @@ class BaseIngestor(ABC):
                     self.source,
                     self.scope,
                 )
-                delete_by_filter(self.scope_filter())
+                # user_id is passed for RLS; the policy reads it from
+                # the per-session GUC on the connection used by
+                # delete_by_filter's own get_db() block.
+                delete_by_filter(self.scope_filter(), user_id=self.user_id)
                 since = None
             else:
                 since = self._incremental_since()
@@ -293,10 +297,22 @@ class BaseIngestor(ABC):
 
         # Wipe stale chunks for this resource so re-ingest with fewer chunks
         # leaves no orphan tail entries (full mode already wiped the whole scope).
+        # Note: when fingerprint-dedup short-circuits a re-embed, the
+        # per-resource pre-delete here would still wipe the row before
+        # the dedup check sees it — so we skip the pre-delete entirely
+        # when ENABLE_CONTENT_FINGERPRINT_DEDUP is on. The ON CONFLICT
+        # DO UPDATE inside upsert_chunks() still gives us in-place
+        # overwrite semantics for changed rows; the only loss is
+        # "orphan tail" chunks (chunk_index N+1..) when the new content
+        # is shorter than the old. Those are explicitly cleaned up
+        # below by deleting any stored chunk_index >= len(chunks).
         if self.mode == "incremental":
-            delete_resource(resource.resource_id)
+            if settings.ENABLE_CONTENT_FINGERPRINT_DEDUP:
+                self._prune_orphan_tail_chunks(resource.resource_id, len(chunks))
+            else:
+                delete_resource(resource.resource_id, user_id=self.user_id)
 
-        upserted = upsert_chunks(chunks)
+        upserted = upsert_chunks(chunks, user_id=self.user_id)
         result.items_processed += 1
         result.vectors_upserted += upserted
 
@@ -332,6 +348,11 @@ class BaseIngestor(ABC):
                 "last_updated": resource.last_updated,
                 **resource.metadata,
             }
+            # Compute the SHA-256 fingerprint up-front so the upsert
+            # path can short-circuit re-embeds for unchanged chunks
+            # without a second pass over the text. Same canonical form
+            # (lower-cased, whitespace-collapsed) used in vector_store.
+            fingerprint = compute_content_fingerprint(piece)
             chunks.append(
                 ResourceChunk(
                     resource_id=resource.resource_id,
@@ -339,6 +360,42 @@ class BaseIngestor(ABC):
                     chunk_index=i,
                     text=piece,
                     metadata=md,
+                    content_fingerprint=fingerprint,
                 )
             )
         return chunks
+
+    def _prune_orphan_tail_chunks(
+        self, resource_id: str, kept_chunks: int
+    ) -> None:
+        """
+        Remove any stored chunks for ``resource_id`` whose ``chunk_index``
+        is >= ``kept_chunks``. Called when fingerprint dedup is enabled
+        so we keep the in-place overwrite behaviour without nuking the
+        rows we'd otherwise short-circuit.
+
+        Without this, a resource that shrinks from 10 chunks to 3
+        would leave chunks 3..9 as stale residue.
+        """
+        from sqlalchemy import delete as _delete
+
+        from app.utils import get_db
+        from models.vector_chunk import VectorChunk
+
+        with get_db() as db:
+            from app.utils import set_current_user_for_rls
+
+            set_current_user_for_rls(db, self.user_id)
+            result = db.execute(
+                _delete(VectorChunk)
+                .where(VectorChunk.resource_id == resource_id)
+                .where(VectorChunk.chunk_index >= kept_chunks)
+            )
+            n = int(result.rowcount or 0)
+        if n:
+            logger.debug(
+                "Pruned {} orphan-tail chunks for {} (kept {}).",
+                n,
+                resource_id,
+                kept_chunks,
+            )

@@ -12,7 +12,13 @@ Public surface
 * :class:`ResourceChunk` — what each ingestor produces (one chunk of one
   resource, ready to embed + insert).
 * :func:`upsert_chunks(chunks)` — embed + ``INSERT … ON CONFLICT DO UPDATE``
-  by ``(resource_id, chunk_index)``. Re-running is a clean replace.
+  by ``(resource_id, chunk_index)``. Re-running is a clean replace, and now
+  short-circuits when an existing row's ``content_fingerprint`` already
+  matches the incoming chunk (skips the embed call entirely).
+* :func:`compute_content_fingerprint(text)` — SHA-256 over the
+  whitespace-normalised, lower-cased chunk body. Stable across re-ingests
+  and across sources, so the same paragraph copy-pasted into Confluence
+  AND Jira hashes to the same digest.
 * :func:`delete_resource(resource_id)` — wipe one resource cleanly.
 * :func:`delete_by_filter(filter_dict)` — bulk wipe (used by ``--mode full``).
 * :func:`build_query_filter(...)` — helper for the chat layer; returns a dict
@@ -24,10 +30,18 @@ Vectors are shared org-wide. Tenancy is enforced **at query time** by the
 ``WHERE`` clause built from ``build_query_filter`` + the user's
 ``user_accessible_resources`` rows. There is no ``user_id`` column on
 ``vector_chunks`` and no per-user duplication.
+
+When ``settings.ENABLE_RLS`` is on, every read/write path additionally
+binds the active user_id to the ``app.current_user_id`` GUC before
+issuing the statement so the database-level Row-Level Security policies
+on ``vector_chunks`` / ``user_accessible_resources`` recognise the
+caller. See :func:`app.utils.set_current_user_for_rls` for the helper.
 """
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
@@ -37,7 +51,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
-from app.utils import get_db
+from app.utils import get_db, set_current_user_for_rls
 from core.llm import get_embeddings
 from models.vector_chunk import VectorChunk
 
@@ -55,6 +69,54 @@ class ResourceChunk:
     chunk_index: int
     text: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    # SHA-256 hex digest of the *normalised* chunk text. Optional on the
+    # dataclass so legacy callers continue to work; the upsert path will
+    # compute it lazily if missing. Populated by BaseIngestor._chunk()
+    # for every new ingest so the dedup short-circuit fires on
+    # subsequent runs without recomputing.
+    content_fingerprint: Optional[str] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fingerprint helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Whitespace runs collapse to a single space; combined with lower-casing
+# this means "Hello   World\n\n" and "hello world" hash to the same
+# digest — the dedup is robust to formatting churn (trailing newlines,
+# CRLF↔LF, double-spacing) that doesn't change semantics.
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalise_for_fingerprint(text: str) -> str:
+    """Stable canonical form for hashing — lower-cased, whitespace-collapsed."""
+    if not text:
+        return ""
+    # NUL bytes are stripped at the row level (see _strip_nul) but
+    # filter here too so they can't poison the hash space.
+    cleaned = text.replace("\x00", "").strip().lower()
+    return _WHITESPACE_RE.sub(" ", cleaned)
+
+
+def compute_content_fingerprint(text: str) -> str:
+    """
+    SHA-256 hex digest of the normalised chunk body.
+
+    OB1-inspired: lets the upsert path skip re-embedding rows whose
+    body hasn't changed (saves the embedding API hit, which dominates
+    the cost of an incremental re-ingest) and lets us notice when the
+    same content has been ingested twice through different sources
+    (e.g. a README that lives both in Git and in a Confluence page).
+
+    The 64-character hex digest fits exactly in the CHAR(64) column on
+    ``vector_chunks.content_fingerprint``. Returns ``""`` for empty
+    input — callers should treat empty fingerprints as "skip the
+    short-circuit" rather than "match every empty row".
+    """
+    norm = _normalise_for_fingerprint(text)
+    if not norm:
+        return ""
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,6 +182,12 @@ def _row_payload(chunk: ResourceChunk, embedding: list[float]) -> dict[str, Any]
 
     promoted = {key: md.pop(key, None) for key in _PROMOTED_FIELDS}
 
+    # Lazy fingerprint computation — the BaseIngestor pre-fills this
+    # but legacy / direct callers may pass a ResourceChunk without one.
+    fingerprint = chunk.content_fingerprint
+    if not fingerprint:
+        fingerprint = compute_content_fingerprint(chunk.text)
+
     return {
         "resource_id": _strip_nul(chunk.resource_id),
         "source": chunk.source,
@@ -131,6 +199,10 @@ def _row_payload(chunk: ResourceChunk, embedding: list[float]) -> dict[str, Any]
         "object_name": _strip_nul(md.pop("object_name", None)),
         "last_updated": _strip_nul(md.pop("last_updated", None)),
         "extra": md,
+        # Empty-string fingerprint -> store NULL so the partial index
+        # excludes the row. We only ever hash non-empty bodies; the
+        # ingestor already drops empty chunks earlier in the pipeline.
+        "content_fingerprint": fingerprint or None,
         **promoted,
     }
 
@@ -144,9 +216,18 @@ def _batched(seq: list[Any], n: int) -> Iterable[list[Any]]:
 # Existence / lookup
 # ──────────────────────────────────────────────────────────────────────────────
 
-def resource_exists(resource_id: str) -> bool:
-    """True if at least one chunk for this resource is already stored."""
+def resource_exists(
+    resource_id: str, *, user_id: Optional[str] = None
+) -> bool:
+    """True if at least one chunk for this resource is already stored.
+
+    When RLS is enabled, the lookup honours the per-user policy — pass
+    ``user_id`` for an authoritative answer in tenancy-sensitive code
+    paths. Admin tooling can omit it to mean "any chunk visible to a
+    BYPASSRLS role".
+    """
     with get_db() as db:
+        set_current_user_for_rls(db, user_id)
         return db.execute(
             select(VectorChunk.id)
             .where(VectorChunk.resource_id == resource_id)
@@ -172,7 +253,46 @@ def _upsert_stmt(rows: list[dict[str, Any]]):
     )
 
 
-def upsert_chunks(chunks: list[ResourceChunk]) -> int:
+def _existing_fingerprints(
+    db, candidates: list[tuple[str, int]]
+) -> dict[tuple[str, int], Optional[str]]:
+    """
+    For the given (resource_id, chunk_index) pairs, return the currently
+    stored ``content_fingerprint`` keyed by the same tuple. Missing rows
+    map to ``None`` (they need to be inserted regardless of dedup).
+    Used to short-circuit re-embeds when the body hasn't changed.
+    """
+    if not candidates:
+        return {}
+
+    # Group by resource_id so we can issue one IN-clause per resource —
+    # the (resource_id, chunk_index) unique index makes this very fast.
+    by_resource: dict[str, list[int]] = {}
+    for rid, idx in candidates:
+        by_resource.setdefault(rid, []).append(idx)
+
+    found: dict[tuple[str, int], Optional[str]] = {}
+    for rid, indices in by_resource.items():
+        rows = db.execute(
+            select(
+                VectorChunk.resource_id,
+                VectorChunk.chunk_index,
+                VectorChunk.content_fingerprint,
+            ).where(
+                VectorChunk.resource_id == rid,
+                VectorChunk.chunk_index.in_(indices),
+            )
+        ).all()
+        for r in rows:
+            found[(r[0], int(r[1]))] = r[2]
+    return found
+
+
+def upsert_chunks(
+    chunks: list[ResourceChunk],
+    *,
+    user_id: Optional[str] = None,
+) -> int:
     """
     Embed and ``INSERT … ON CONFLICT DO UPDATE`` the chunks. Returns the
     number of rows actually written.
@@ -182,6 +302,18 @@ def upsert_chunks(chunks: list[ResourceChunk]) -> int:
     ``(resource_id, chunk_index)``, so re-ingesting a resource overwrites
     its chunks in place.
 
+    Content-fingerprint dedup (OB1-inspired)
+    ----------------------------------------
+    Before embedding any batch we look up the currently-stored
+    ``content_fingerprint`` for each ``(resource_id, chunk_index)`` and
+    drop any incoming chunk whose hash matches what's already there.
+    This is the hot path during incremental re-ingests of unchanged
+    documents and saves the OpenAI embedding API call entirely. The
+    full check is per-row equality on a SHA-256 hex digest; a
+    collision would require an attacker who can already write into
+    ``vector_chunks``, at which point the dedup is the least of your
+    worries.
+
     Robustness: each batch is wrapped in a SAVEPOINT (``begin_nested``)
     so a single bad row (e.g. a previously-undetected control-character
     or Postgres-incompatible payload) doesn't poison the whole outer
@@ -190,6 +322,17 @@ def upsert_chunks(chunks: list[ResourceChunk]) -> int:
     savepoints — successful rows still land, failures are logged with
     their ``resource_id`` + ``chunk_index`` so the next "weird payload"
     is one ``grep`` away from being identifiable.
+
+    Parameters
+    ----------
+    chunks
+        The chunks to insert / update. Pre-populated fingerprints on
+        each ``ResourceChunk`` are honoured; missing ones are computed
+        on the fly.
+    user_id
+        Optional user_id bound to the session for RLS. Required when
+        ``settings.ENABLE_RLS`` is True — the policies will reject
+        writes from a session with no GUC set.
     """
     if not chunks:
         return 0
@@ -197,11 +340,45 @@ def upsert_chunks(chunks: list[ResourceChunk]) -> int:
     embeddings = get_embeddings()
     total = 0
     skipped = 0
+    deduped = 0
     with get_db() as db:
+        # RLS: bind user_id to the session before any read or write.
+        # No-op when ENABLE_RLS is False (see app.utils).
+        set_current_user_for_rls(db, user_id)
+
         for batch in _batched(chunks, settings.VECTOR_UPSERT_BATCH_SIZE):
-            vectors = embeddings.embed_documents([c.text for c in batch])
+            # ── Pre-compute fingerprints for every chunk in the batch
+            #    so we can short-circuit identical rows before embedding.
+            for c in batch:
+                if not c.content_fingerprint:
+                    c.content_fingerprint = compute_content_fingerprint(c.text)
+
+            # ── Dedup: ask the DB what fingerprints we already have
+            #    for these (resource_id, chunk_index) pairs. Skip any
+            #    chunk whose stored fingerprint matches — body
+            #    unchanged means we don't need to spend an embedding
+            #    API call OR a DB write on it.
+            to_process: list[ResourceChunk] = []
+            if settings.ENABLE_CONTENT_FINGERPRINT_DEDUP:
+                existing = _existing_fingerprints(
+                    db, [(c.resource_id, c.chunk_index) for c in batch]
+                )
+                for c in batch:
+                    stored = existing.get((c.resource_id, c.chunk_index))
+                    if stored and c.content_fingerprint and stored == c.content_fingerprint:
+                        deduped += 1
+                        continue
+                    to_process.append(c)
+            else:
+                to_process = list(batch)
+
+            if not to_process:
+                continue
+
+            vectors = embeddings.embed_documents([c.text for c in to_process])
             rows = [
-                _row_payload(chunk, vec) for chunk, vec in zip(batch, vectors)
+                _row_payload(chunk, vec)
+                for chunk, vec in zip(to_process, vectors)
             ]
 
             # Fast path: single bulk INSERT inside a savepoint.
@@ -244,13 +421,18 @@ def upsert_chunks(chunks: list[ResourceChunk]) -> int:
 
     if skipped:
         logger.warning(
-            "Upserted {} chunks to vector_chunks ({} dropped due to "
-            "DB-level rejection — see ERROR lines above).",
+            "Upserted {} chunks to vector_chunks ({} deduped by fingerprint, "
+            "{} dropped due to DB-level rejection — see ERROR lines above).",
             total,
+            deduped,
             skipped,
         )
     else:
-        logger.info("Upserted {} chunks to vector_chunks.", total)
+        logger.info(
+            "Upserted {} chunks to vector_chunks ({} deduped by fingerprint).",
+            total,
+            deduped,
+        )
     return total
 
 
@@ -258,9 +440,16 @@ def upsert_chunks(chunks: list[ResourceChunk]) -> int:
 # Delete
 # ──────────────────────────────────────────────────────────────────────────────
 
-def delete_resource(resource_id: str) -> int:
-    """Delete every chunk for a single resource. Returns count deleted."""
+def delete_resource(
+    resource_id: str, *, user_id: Optional[str] = None
+) -> int:
+    """Delete every chunk for a single resource. Returns count deleted.
+
+    Honours RLS when ``user_id`` is supplied — required for the
+    ingestor's per-resource pre-delete in incremental mode.
+    """
     with get_db() as db:
+        set_current_user_for_rls(db, user_id)
         result = db.execute(
             delete(VectorChunk).where(VectorChunk.resource_id == resource_id)
         )
@@ -270,7 +459,9 @@ def delete_resource(resource_id: str) -> int:
     return n
 
 
-def delete_by_filter(filter_dict: dict[str, Any]) -> int:
+def delete_by_filter(
+    filter_dict: dict[str, Any], *, user_id: Optional[str] = None
+) -> int:
     """
     Bulk-delete chunks that match a simple filter dict.
 
@@ -281,6 +472,9 @@ def delete_by_filter(filter_dict: dict[str, Any]) -> int:
         ``email_provider`` — a string, a list, or ``{"$in": [...]}``
 
     Used by ``--mode full`` to wipe a scope before re-ingesting it.
+
+    When RLS is enabled, ``user_id`` must be supplied for the policy
+    check; otherwise the DELETE will silently affect zero rows.
     """
     stmt = delete(VectorChunk)
     clauses = []
@@ -298,6 +492,7 @@ def delete_by_filter(filter_dict: dict[str, Any]) -> int:
         stmt = stmt.where(*clauses)
 
     with get_db() as db:
+        set_current_user_for_rls(db, user_id)
         result = db.execute(stmt)
         n = int(result.rowcount or 0)
     logger.info("Deleted {} chunks matching {}", n, filter_dict)

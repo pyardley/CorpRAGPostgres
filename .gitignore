@@ -30,4 +30,12 @@ import_chroma_ts.py
 *.swo
 
 # OS
-.DS_
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker volumes / data
+data/

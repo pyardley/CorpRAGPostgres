@@ -751,42 +751,168 @@ against the source system**. Concretely:
   an ingestion themselves cannot query the data — there's no
   `user_accessible_resources` row for the retriever to use.
 
-### Optional: PostgreSQL Row-Level Security
+---
 
-If you'd rather have the database itself enforce per-user filtering rather
-than rely on the application building the right `WHERE` clause, you can
-opt into Postgres RLS:
+## Security & Deduplication Enhancements
+
+Two OB1 (Open Brain)-inspired upgrades sit on top of the original
+multi-tenancy model:
+
+1. **Content fingerprint deduplication** — every chunk carries a
+   SHA-256 hex digest of its normalised body. The upsert path uses
+   the fingerprint to skip re-embedding any row whose content hasn't
+   changed since the previous ingest. Embedding API calls dominate
+   the cost of an incremental re-ingest, so dedup pays for itself
+   the first time you re-run an ingestor against an unchanged corpus.
+
+2. **PostgreSQL Row-Level Security** as defence-in-depth on top of
+   the existing application-layer `WHERE` clause. The database
+   itself refuses to surface chunks the active user wasn't granted —
+   a regression in `filter_to_where`, an admin running a naked
+   `SELECT *` from psql against the wrong role, or a future MCP tool
+   that forgets to apply the access table all fail closed.
+
+### 1. Content fingerprint deduplication
+
+A `content_fingerprint CHAR(64)` column on `vector_chunks` stores a
+SHA-256 hex digest of the chunk text after normalisation
+(lower-cased, whitespace-collapsed, NUL-stripped). The fingerprint is
+computed in `BaseIngestor._chunk()` and consumed in
+`core.vector_store.upsert_chunks()`:
+
+```python
+# What the upsert path does for every batch
+existing = _existing_fingerprints(db, [(c.resource_id, c.chunk_index) for c in batch])
+to_process = [c for c in batch if existing.get((c.resource_id, c.chunk_index)) != c.content_fingerprint]
+# Only chunks that survived the dedup are sent to OpenAI / HF for embedding.
+```
+
+Properties:
+
+- **Stable across re-ingests.** Whitespace churn (CRLF↔LF, double
+  spaces, trailing newlines) doesn't change the hash, so a Confluence
+  page re-rendered through markdownify with slightly different
+  spacing still dedups against itself.
+- **Cross-source aware.** The same paragraph copy-pasted into Jira
+  and Confluence hashes to the same digest — useful diagnostic for
+  finding accidental content duplication across systems.
+- **Cheap.** SHA-256 over a 1 KB chunk is microseconds; the saving
+  is one OpenAI embedding API hit per skipped row.
+- **Indexed.** A partial index `ix_vector_chunks_content_fingerprint`
+  covers `WHERE content_fingerprint IS NOT NULL` for ad-hoc dedup
+  audits (`SELECT content_fingerprint, COUNT(*) FROM vector_chunks
+  GROUP BY 1 HAVING COUNT(*) > 1`).
+- **Opt-in to disable.** Set `ENABLE_CONTENT_FINGERPRINT_DEDUP=false`
+  in `.env` to force re-embeds on every upsert (useful for
+  benchmarking embedding latency).
+
+When fingerprint dedup is on, incremental re-ingests skip the
+per-resource `delete_resource()` call and instead use a narrower
+`_prune_orphan_tail_chunks()` that only removes chunk rows whose
+`chunk_index >= len(new_chunks)`. This preserves "shrinking
+documents leave no orphans" semantics without nuking rows that the
+dedup short-circuit could have saved.
+
+### 2. PostgreSQL Row-Level Security (RLS)
+
+The migration runner enables RLS on `vector_chunks` and
+`user_accessible_resources` and installs SELECT / INSERT / UPDATE /
+DELETE policies keyed on a per-session GUC,
+`app.current_user_id`. The application binds the GUC immediately
+after opening any tenancy-sensitive session via
+`app.utils.set_current_user_for_rls(db, user_id)` —
+implemented as `SET LOCAL` so the binding is automatically reset at
+COMMIT/ROLLBACK and never leaks across pooled connections.
 
 ```sql
--- 1. Add a session-scoped current-user setting.
-ALTER TABLE vector_chunks ENABLE ROW LEVEL SECURITY;
-
--- 2. Allow users to read only chunks whose source/key combination they
---    have a row for in user_accessible_resources.
-CREATE POLICY vc_select_policy ON vector_chunks FOR SELECT
-USING (
-    EXISTS (
-        SELECT 1
-        FROM user_accessible_resources uar
-        WHERE uar.user_id = current_setting('app.user_id')::text
-          AND uar.source = vector_chunks.source
+-- vector_chunks SELECT policy (installed automatically)
+CREATE POLICY vector_chunks_tenant_select ON vector_chunks
+FOR SELECT USING (
+    current_setting('app.current_user_id', true) IS NOT NULL
+    AND EXISTS (
+        SELECT 1 FROM user_accessible_resources uar
+        WHERE uar.user_id = current_setting('app.current_user_id', true)
+          AND uar.source  = vector_chunks.source
           AND uar.resource_identifier = COALESCE(
               vector_chunks.project_key,
               vector_chunks.space_key,
               vector_chunks.db_name,
-              vector_chunks.git_scope
+              vector_chunks.git_scope,
+              vector_chunks.email_provider
           )
     )
 );
-
--- 3. The app sets the current user per session:
---    SET app.user_id = '<uuid>';
 ```
 
-The app-level filter approach (default) and RLS are not mutually exclusive
-— RLS gives you defence-in-depth at the cost of having to set
-`app.user_id` on every connection (use SQLAlchemy `event.listen("connect", ...)`
-or wrap `get_db()` to do it).
+The application-layer `WHERE` clause stays in place — RLS is purely
+additional. If both layers agree, performance is identical (the
+planner short-circuits the EXISTS check when the WHERE clause has
+already eliminated rows). If they ever disagree, RLS wins and the
+chat surfaces an empty result instead of leaking a chunk.
+
+#### Enable / disable
+
+RLS is **on by default**. Toggle with:
+
+```ini
+# .env
+ENABLE_RLS=true   # default — install + enforce policies
+ENABLE_RLS=false  # legacy / admin-tool deployments — skip the policy install
+```
+
+When `ENABLE_RLS=false`:
+
+- The migration runner skips `_apply_rls_policies()` entirely.
+- `set_current_user_for_rls()` becomes a no-op, so existing call
+  sites have zero overhead.
+- Existing deployments upgrade with **zero behavioural change** —
+  the new column is created, but tenancy stays application-only.
+
+To back the policies out of an already-migrated database (e.g.
+because `scripts/vector_store_admin.py` is being run from a non-app
+DB role that doesn't set the GUC):
+
+```python
+from app.utils import engine
+from models.migrations import drop_rls_policies
+drop_rls_policies(engine)
+```
+
+#### Verifying it works
+
+After enabling, a quick psql session as the app's DB role:
+
+```sql
+-- Without binding the GUC: zero rows (RLS denying)
+SELECT COUNT(*) FROM vector_chunks;
+-- count: 0
+
+-- After binding to a real user: their accessible chunks only
+SELECT set_config('app.current_user_id', '<their-uuid>', true);
+SELECT COUNT(*) FROM vector_chunks;
+-- count: <their actual count>
+
+-- A user_id with no grants returns zero
+SELECT set_config('app.current_user_id', '00000000-0000-0000-0000-000000000000', true);
+SELECT COUNT(*) FROM vector_chunks;
+-- count: 0
+```
+
+#### Operational notes
+
+- **Admin scripts** (`scripts/vector_store_admin.py`) connect as the
+  same DB role as the app. If you need to run `--strategy report` /
+  `purge-source` / `nuke` against a database with RLS on, either run
+  the script as a Postgres superuser (RLS is bypassed for `BYPASSRLS`
+  and superuser roles) or temporarily unset the policies via
+  `drop_rls_policies(engine)` from a Python REPL.
+- **Connection pooling.** `set_current_user_for_rls()` uses
+  `set_config(..., true)` which is the SQL equivalent of `SET
+  LOCAL` — transaction-scoped, automatically reset at COMMIT /
+  ROLLBACK. Safe with PgBouncer in transaction mode.
+- **Monitoring.** Every policy is named `*_select / *_insert /
+  *_update / *_delete` so `SELECT * FROM pg_policies` gives an
+  auditor a one-screen view of what's enforced.
 
 ---
 

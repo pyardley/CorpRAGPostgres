@@ -38,7 +38,7 @@ from typing import Any, Generator, Iterable, Optional
 import streamlit as st
 from cryptography.fernet import Fernet
 from loguru import logger
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
@@ -84,6 +84,91 @@ def get_db() -> Generator[Session, None, None]:
         raise
     finally:
         db.close()
+
+
+# ── Row-Level Security helpers ───────────────────────────────────────────────
+#
+# The RLS policies installed by ``models.migrations._apply_rls_policies``
+# read ``current_setting('app.current_user_id', true)`` to decide which
+# rows the current session can see. The application calls
+# :func:`set_current_user_for_rls` immediately after opening a session
+# (and before any SELECT against ``vector_chunks`` /
+# ``user_accessible_resources``). When ``settings.ENABLE_RLS`` is False
+# the helper is a cheap no-op so existing deployments behave exactly as
+# before.
+#
+# Why ``SET LOCAL``? It's transaction-scoped — the GUC is reset when the
+# transaction ends, which is critical with connection pooling (a
+# subsequent checkout against the same physical connection must NOT
+# inherit the previous request's user_id). Combined with SQLAlchemy's
+# implicit-transaction model (a SELECT auto-begins one), every
+# ``get_db()``-style block gets its own clean tenancy context.
+
+
+def set_current_user_for_rls(db: Session, user_id: str | None) -> None:
+    """
+    Bind ``user_id`` to the current session's ``app.current_user_id``
+    GUC so the RLS policies on ``vector_chunks`` /
+    ``user_accessible_resources`` can recognise the caller.
+
+    Safe to call repeatedly within a single transaction (the last value
+    wins). No-op when ``settings.ENABLE_RLS`` is False or ``user_id``
+    is empty/None.
+
+    Notes
+    -----
+    * Uses ``SET LOCAL`` so the binding is automatically reset at
+      ``COMMIT`` / ``ROLLBACK`` and never leaks to the next checkout
+      from the connection pool.
+    * The value is interpolated as a parameter to defeat any SQL
+      injection vector in case ``user_id`` ever comes from
+      attacker-controlled input — though today it's always a UUID
+      pulled from the bcrypt-authenticated session.
+    * The helper does NOT raise on failure: a misconfigured DB role
+      (e.g. one that doesn't allow ``SET``) shouldn't take the chat
+      down — it'll just see an empty result set under RLS, which is
+      the correct fail-closed behaviour anyway.
+    """
+    if not settings.ENABLE_RLS:
+        return
+    if not user_id:
+        # Without a bound user_id the RLS policies see NULL and return
+        # zero rows. Surface this loudly — it's almost always a bug
+        # (we're about to run a query that will silently return empty).
+        logger.debug(
+            "set_current_user_for_rls called with empty user_id; "
+            "RLS policies will deny all rows."
+        )
+        return
+    try:
+        # SET LOCAL requires a bound transaction. SQLAlchemy auto-begins
+        # one on the first execute() if there isn't one, so this is safe
+        # even on a brand-new session.
+        db.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": str(user_id)},
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.exception(
+            "Could not set RLS user_id (continuing — RLS will deny rows)"
+        )
+
+
+@contextmanager
+def get_db_for_user(user_id: str | None) -> Generator[Session, None, None]:
+    """
+    Convenience wrapper around :func:`get_db` that binds the current
+    user_id for RLS before yielding the session.
+
+    Prefer this over a bare ``get_db()`` for any code path that reads
+    or writes ``vector_chunks`` / ``user_accessible_resources`` so the
+    RLS GUC is always set. Code paths that only touch tenancy-free
+    tables (``users``, ``ingestion_logs``, ``query_audit_logs``, …)
+    can still use the plain ``get_db()`` if they want.
+    """
+    with get_db() as db:
+        set_current_user_for_rls(db, user_id)
+        yield db
 
 
 # ── Encryption ────────────────────────────────────────────────────────────────

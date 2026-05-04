@@ -22,6 +22,12 @@ Key design points
   ANN index is created in ``models.migrations`` because column-level index
   declarations don't accept the ``vector_cosine_ops`` operator class on
   every SQLAlchemy version.
+* ``content_fingerprint`` (CHAR(64)) holds a SHA-256 hex digest of the
+  *normalised* chunk text. Inspired by the OB1 (Open Brain) project, it
+  lets the upsert path short-circuit on identical bodies that arrive
+  through different sources or repeated re-ingests — embeddings are
+  expensive, fingerprints are essentially free. The column is nullable
+  so existing rows stay valid until they're re-processed.
 """
 
 from __future__ import annotations
@@ -78,6 +84,16 @@ class VectorChunk(Base):
     text = Column(Text, nullable=False)
     embedding = Column(Vector(settings.embedding_dim), nullable=False)
 
+    # SHA-256 hex digest of the normalised chunk text (lower-cased,
+    # whitespace-collapsed). Used by the upsert path to skip re-embedding
+    # a chunk whose body hasn't changed and to detect cross-source
+    # duplicates (a Confluence page that was also posted to a Jira
+    # comment, the same README copied across two repos, etc.).
+    # Nullable so a fresh schema migration on an existing install can
+    # backfill lazily — every re-ingest fills the column for the rows
+    # it touches.
+    content_fingerprint = Column(String(64), nullable=True)
+
     created_at = Column(
         DateTime, default=datetime.utcnow, nullable=False
     )
@@ -119,6 +135,14 @@ class VectorChunk(Base):
             "ix_vector_chunks_email_provider",
             "email_provider",
             postgresql_where=Column("email_provider").isnot(None),
+        ),
+        # Partial index on the fingerprint — only populated rows are
+        # interesting, and the lookup is always equality-by-hash. Kept
+        # narrow so it doesn't bloat WAL on bulk re-ingests.
+        Index(
+            "ix_vector_chunks_content_fingerprint",
+            "content_fingerprint",
+            postgresql_where=Column("content_fingerprint").isnot(None),
         ),
     )
 
