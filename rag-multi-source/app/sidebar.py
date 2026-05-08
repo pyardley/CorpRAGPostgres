@@ -254,8 +254,7 @@ def _trigger_ingestion(user_id: str, source: str, mode: str, scope: str) -> None
                 )
             except Exception as exc:
                 any_failed = True
-                logger.exception("Ingestion failed for {}", src)
-                status.write(f"❌ {src}: {exc}")
+                _render_ingestion_failure(status, src, exc)
 
         if any_failed:
             status.update(
@@ -667,6 +666,41 @@ def _render_mcp_status() -> None:
         )
 
 
+# Friendly failure renderer
+def _render_ingestion_failure(status, label: str, exc: BaseException) -> None:
+    """
+    Render an ingestion failure inside an active ``st.status`` block.
+
+    Special case: a typed :class:`OAuthCredentialError` (raised by the
+    Email ingestor when a stored OAuth refresh token has expired or
+    been revoked) gets a numbered, clickable resolution path rendered
+    via ``st.error`` + ``st.markdown``. Everything else falls back to
+    a one-line ``❌ {exc}`` message — same as before.
+
+    The OAuthCredentialError import is lazy so a regression in the
+    Email module can't break the whole sidebar.
+    """
+    try:
+        from app.ingestion.email_ingestor import OAuthCredentialError
+        is_auth_err = isinstance(exc, OAuthCredentialError)
+    except Exception:  # noqa: BLE001 - defensive
+        is_auth_err = False
+
+    if is_auth_err:
+        # Loguru already logged the friendly message at WARNING level
+        # from inside fetch_resources; we only need to surface it in
+        # the UI here. Header line first, then the markdown block.
+        status.write(
+            f"❌ **{label}** — authentication failed (see steps below)."
+        )
+        status.markdown(exc.as_markdown())  # type: ignore[attr-defined]
+    else:
+        # Generic exception — keep the existing terse one-liner and
+        # log the full traceback for debugging.
+        logger.exception("Ingestion failed for {}", label)
+        status.write(f"❌ {label}: {exc}")
+
+
 # Recipe-driven ingestion UI
 def _render_recipe_ingestion(user_id: str) -> None:
     """
@@ -785,10 +819,11 @@ def _trigger_recipe_ingestion(
                 expanded=False,
             )
         except Exception as exc:
-            logger.exception("Recipe '{}' failed", recipe_name)
-            status.write(f"❌ {exc}")
+            _render_ingestion_failure(status, recipe_name, exc)
             status.update(
-                label=f"Recipe '{recipe_name}' failed: {exc}",
+                label=(
+                    f"Recipe '{recipe_name}' failed — see steps above."
+                ),
                 state="error",
                 expanded=True,
             )

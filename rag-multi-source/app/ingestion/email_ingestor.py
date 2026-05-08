@@ -111,9 +111,149 @@ from typing import Any, Iterable, Optional
 
 import requests
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.ingestion.base import BaseIngestor, SourceResource
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Friendly auth-failure error
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class OAuthCredentialError(RuntimeError):
+    """A user-actionable failure to authenticate against an email provider.
+
+    Raised when a stored OAuth refresh token has been expired, revoked,
+    or rejected by the identity provider. Carries enough detail for
+    both terminal logs and the Streamlit UI to render numbered
+    resolution steps + a clickable doc URL — so the user never has to
+    decode ``invalid_grant: Token has been expired or revoked.`` again.
+
+    Use the dedicated factory :meth:`for_gmail` / :meth:`for_outlook`
+    instead of constructing instances directly; they encode the
+    correct provider name, doc URL, and resolution steps so the
+    surface stays consistent.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        summary: str,
+        steps: list[str],
+        help_url: str,
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        self.provider = provider
+        self.summary = summary
+        self.steps = list(steps)
+        self.help_url = help_url
+        self.cause = cause
+        super().__init__(self._render_plain())
+
+    # ── Renderers ────────────────────────────────────────────────────
+
+    def _render_plain(self) -> str:
+        """Single-string form used as the exception message + log line."""
+        lines = [
+            f"[email/{self.provider}] {self.summary}",
+            "",
+            "How to fix:",
+        ]
+        for i, step in enumerate(self.steps, 1):
+            lines.append(f"  {i}. {step}")
+        lines.append("")
+        lines.append(f"More info: {self.help_url}")
+        return "\n".join(lines)
+
+    def as_markdown(self) -> str:
+        """Markdown form for nice rendering in the Streamlit status block."""
+        out = [
+            f"**{self.provider.title()} authentication failed.** {self.summary}",
+            "",
+            "**How to fix:**",
+        ]
+        for i, step in enumerate(self.steps, 1):
+            out.append(f"{i}. {step}")
+        out.append("")
+        out.append(f"📖 [Documentation / step-by-step guide]({self.help_url})")
+        return "\n".join(out)
+
+    # ── Factories ────────────────────────────────────────────────────
+
+    @classmethod
+    def for_gmail(cls, cause: BaseException) -> "OAuthCredentialError":
+        return cls(
+            provider="gmail",
+            summary=(
+                "Google rejected the stored OAuth refresh token "
+                "(error=invalid_grant). The token is expired or has been "
+                "revoked. The most common cause for a dev install is the "
+                "OAuth consent screen still being in 'Testing' mode, where "
+                "Google expires tokens after 7 days."
+            ),
+            steps=[
+                "From the rag-multi-source/ folder with the venv active, "
+                "run:  python scripts/gmail_get_refresh_token.py",
+                "Sign in as the mailbox owner in the browser tab that "
+                "opens, and click 'Allow' on the read-only Gmail "
+                "permission prompt.",
+                "Copy the printed refresh token (or the full token.json "
+                "blob).",
+                "In the Streamlit sidebar → Credentials → Email → Gmail, "
+                "paste the new value into 'Refresh Token' (or 'Full "
+                "token.json'), tick 'Clear' on any old value, and save.",
+                "(Optional, recommended) Move the OAuth consent screen "
+                "from 'Testing' to 'In production' at "
+                "https://console.cloud.google.com/apis/credentials/"
+                "consent — that removes the 7-day token expiry entirely.",
+            ],
+            help_url=(
+                "https://console.cloud.google.com/apis/credentials/consent"
+            ),
+            cause=cause,
+        )
+
+    @classmethod
+    def for_outlook(cls, cause: BaseException) -> "OAuthCredentialError":
+        return cls(
+            provider="outlook",
+            summary=(
+                "Microsoft rejected the stored OAuth refresh token "
+                "(invalid_grant / AADSTS70008 / AADSTS700082). The token "
+                "is expired, revoked, or no longer valid for the user. "
+                "Refresh tokens for personal accounts last 90 days "
+                "without use; tenant Conditional Access policies can "
+                "also force re-auth."
+            ),
+            steps=[
+                "Re-issue a fresh refresh token: visit "
+                "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/"
+                "authorize with response_type=code, scope=offline_access "
+                "Mail.Read, and complete the consent flow as the mailbox "
+                "owner. Exchange the resulting code for tokens at "
+                "/oauth2/v2.0/token.",
+                "Copy the new refresh_token from the token endpoint "
+                "response.",
+                "In the Streamlit sidebar → Credentials → Email → Outlook, "
+                "paste the new value into 'Refresh Token', tick 'Clear' on "
+                "any old value, and save.",
+                "Confirm in Azure Portal → App registrations → your app → "
+                "Authentication that 'Allow public client flows' is "
+                "enabled (delegated refresh tokens require it) and that "
+                "the Mail.Read delegated permission is granted.",
+            ],
+            help_url=(
+                "https://learn.microsoft.com/en-us/azure/active-directory/"
+                "develop/v2-oauth2-auth-code-flow"
+            ),
+            cause=cause,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,6 +365,10 @@ class _OutlookProvider:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
+        # OAuthCredentialError represents user action required (expired
+        # refresh token). Retrying it would just delay the actionable
+        # message by 2-10 seconds × 3 attempts — surface immediately.
+        retry=retry_if_not_exception_type(OAuthCredentialError),
     )
     def _refresh_access_token(self) -> None:
         url = _OAUTH2_TOKEN_URL.format(tenant=self.tenant_id)
@@ -248,6 +392,29 @@ class _OutlookProvider:
             }
         resp = requests.post(url, data=body, timeout=30)
         if not resp.ok:
+            # Try to detect Microsoft's "user must re-consent" failure
+            # mode (``invalid_grant``) and translate it into a friendly,
+            # numbered resolution path. Other 4xx/5xx codes (transient
+            # network blips, 500s on Microsoft's side) keep going through
+            # the existing retry / raise_for_status branch.
+            error_code = ""
+            try:
+                error_code = (resp.json() or {}).get("error", "") or ""
+            except ValueError:
+                # Microsoft sometimes returns HTML on outage — fine,
+                # we just don't get a structured error code.
+                pass
+            if error_code == "invalid_grant":
+                logger.warning(
+                    "[email/outlook] refresh-token rejected by Microsoft "
+                    "(invalid_grant); user action required."
+                )
+                raise OAuthCredentialError.for_outlook(
+                    requests.HTTPError(
+                        f"{resp.status_code} {resp.reason}: {resp.text[:300]}",
+                        response=resp,
+                    )
+                )
             logger.error(
                 "[email/outlook] token request failed: {} {}",
                 resp.status_code,
@@ -465,9 +632,19 @@ class _GmailProvider:
             )
 
         if not creds.valid:
+            from google.auth.exceptions import RefreshError
             from google.auth.transport.requests import Request
 
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                # Translate Google's cryptic ``invalid_grant`` into a
+                # numbered, actionable resolution path. The plain ``str``
+                # form goes into the log; the sidebar additionally
+                # renders ``as_markdown()`` so the user gets clickable
+                # links to the Google Cloud Console + the regen script
+                # from inside Streamlit.
+                raise OAuthCredentialError.for_gmail(exc) from exc
 
         self._service = build(
             "gmail", "v1", credentials=creds, cache_discovery=False
@@ -1215,6 +1392,16 @@ class EmailIngestor(BaseIngestor):
             self._folder_override = scope
 
         self._providers = self._build_providers()
+        # Per-run record of which providers failed so we can re-raise the
+        # first OAuth failure when *every* provider failed (avoids a
+        # misleading "complete ✓" banner with zero items in the UI).
+        self._provider_failures: list[tuple[str, BaseException]] = []
+
+    def _record_provider_failure(
+        self, provider_name: str, exc: BaseException
+    ) -> None:
+        """Capture a provider failure so we can decide whether to re-raise."""
+        self._provider_failures.append((provider_name, exc))
 
     # ── Provider construction ───────────────────────────────────────────────
 
@@ -1312,14 +1499,50 @@ class EmailIngestor(BaseIngestor):
                 yield from prov.fetch(
                     start=start, end=end, folder_override=self._folder_override
                 )
+            except OAuthCredentialError as auth_err:
+                # User-actionable: print the friendly numbered steps at
+                # WARNING level (no traceback — that just buries the
+                # resolution path). The sidebar's _trigger_ingestion
+                # will additionally render this nicely if the error
+                # bubbles up; here we keep going so that other
+                # providers in the same run still complete.
+                #
+                # Log every line of the rendered message so the user
+                # gets the same multi-step guide they'd see in the UI
+                # without us having to know how loguru formats
+                # multi-line strings on this terminal.
+                for line in str(auth_err).splitlines():
+                    logger.warning(line)
+                self._record_provider_failure(prov.name, auth_err)
+                continue
             except Exception as exc:
                 logger.exception(
                     "[email/{}] provider failed: {}", prov.name, exc
                 )
+                self._record_provider_failure(prov.name, exc)
                 # Don't kill the whole run if one provider hiccups — let
                 # the other one still complete. Re-raise only if every
                 # provider failed (BaseIngestor would mark the run errored).
                 continue
+
+        # If every configured provider failed and at least one of them
+        # was an OAuth credential issue, re-raise the first one so the
+        # sidebar's status block ends in an "error" state with the
+        # actionable message instead of a misleading "complete" banner
+        # over zero items.
+        if (
+            self._providers
+            and len(self._provider_failures) == len(self._providers)
+        ):
+            first_auth = next(
+                (
+                    err for _name, err in self._provider_failures
+                    if isinstance(err, OAuthCredentialError)
+                ),
+                None,
+            )
+            if first_auth is not None:
+                raise first_auth
 
     # ── Window selection ────────────────────────────────────────────────────
 
