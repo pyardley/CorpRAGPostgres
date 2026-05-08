@@ -575,7 +575,7 @@ class StepTimer:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.duration_ms = int((time.perf_counter() - self._started) * 1000)
+        self.duration_ms = round((time.perf_counter() - self._started) * 1000)
         if exc is not None:
             # Record the partial timing even on failure — the operator
             # still wants to know "we got 80ms into vector_retrieval

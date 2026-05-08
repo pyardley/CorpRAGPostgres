@@ -1,9 +1,10 @@
 # CorporateRAG — System Documentation
 
 > A production-ready, multi-tenant **hybrid RAG + MCP** platform that lets a whole organisation ask
-> natural-language questions across **Jira**, **Confluence**, **SQL Server** and **Git (GitHub)** —
-> with optional **live, read-only access to SQL Server table data** via a Model-Context-Protocol
-> server — from a single Streamlit chat interface, all backed by **PostgreSQL + pgvector**.
+> natural-language questions across **Jira**, **Confluence**, **SQL Server**, **Git (GitHub)**, and
+> **Email (Outlook / Gmail / Yahoo)** — with optional **live, read-only access to SQL Server table
+> data** via a Model-Context-Protocol server — from a single Streamlit chat interface, all backed by
+> **PostgreSQL + pgvector**.
 
 ---
 
@@ -38,20 +39,41 @@ classical RAG path (semantic search over historical/static content), the assista
 
 ### Key features
 
-- **Single-database design.** Users, encrypted credentials, ingestion logs, per-user access rows
-  _and_ vector embeddings all live in one Postgres database — no second hop, no two-system drift.
+- **Single-database design.** Users, encrypted credentials, ingestion logs, per-user access rows,
+  audit logs, _and_ vector embeddings all live in one Postgres database — no second hop, no two-system drift.
 - **Multi-source RAG.** First-class ingestors for Jira Cloud, Confluence Cloud, SQL Server
-  (procs/views/tables), and GitHub repositories (commits + files).
+  (procs/views/tables), GitHub repositories (commits + files), and **Email** (Outlook / Microsoft
+  365 via Graph API, Gmail via OAuth, Yahoo Mail via IMAP + app password).
+- **Hybrid retrieval (vector + FTS + RRF).** Every retrieval query runs both a cosine ANN search
+  over the HNSW index and a Postgres full-text search query in parallel. The two ranked lists are
+  fused with Reciprocal Rank Fusion so rare-token queries (error codes, ticket IDs, identifiers)
+  are caught by FTS even when the embedding misses them.
+- **Per-source diversity quota.** A configurable `MAX_HITS_PER_SOURCE` cap prevents one noisy
+  source (e.g. a dense cluster of marketing emails) from crowding out higher-scoring hits from
+  other sources. Backfill from overflow keeps single-source queries whole.
 - **Hybrid RAG + MCP.** A FastAPI MCP server exposes safe, read-only `sql_table_query` and
   `sql_list_databases` tools. The chat agent calls them when the user wants live row data while
   RAG continues to provide schema, documentation, and code context.
 - **Multi-tenancy by query-time filter.** Vectors are stored _once_; tenancy is enforced by a
   `WHERE` clause built from the user's [`user_accessible_resources`](models/user_accessible_resource.py:1) rows.
+- **PostgreSQL Row-Level Security (defence-in-depth).** When `ENABLE_RLS=true` (the default), RLS
+  policies on `vector_chunks` and `user_accessible_resources` keyed on the session GUC
+  `app.current_user_id` provide a database-level backstop — a regression in the app-layer filter
+  can never surface another user's chunks.
+- **Content fingerprint deduplication.** Every chunk is SHA-256 hashed at ingest time. If the
+  fingerprint matches the stored value the chunk is skipped, saving embedding API calls on
+  incremental runs where most content is unchanged.
 - **Stable resource IDs + idempotent upserts.** Re-ingestion overwrites in place via
   `INSERT … ON CONFLICT DO UPDATE`.
-- **HNSW ANN index.** Sub-millisecond top-K cosine search via `pgvector ≥ 0.5`.
+- **HNSW ANN index.** Sub-millisecond top-K cosine search via `pgvector ≥ 0.5`, with
+  `hnsw.ef_search` raised per-statement (default 200 vs the pgvector default of 40) to
+  improve recall across dense multi-source corpora.
 - **Encrypted credentials at rest.** Fernet-encrypted per-user connector credentials.
 - **Pluggable LLMs and embeddings.** OpenAI, Anthropic, Grok; OpenAI or HuggingFace embeddings.
+- **Audit logging + cost accounting.** Every user prompt writes a `query_audit_logs` row (tokens,
+  cost, latency, provider/model, success) plus child `query_step_timings` rows (per-step breakdown
+  for vector retrieval, each MCP tool call, LLM invocation, and post-processing). The sidebar
+  exposes a live audit log view.
 
 ### High-level architecture
 
@@ -68,7 +90,8 @@ flowchart LR
     MCP[MCP Server<br/>FastAPI]
     SQL[(SQL Server<br/>live data)]
     Ingest[Ingestion CLI / UI]
-    Sources[(Jira · Confluence ·<br/>SQL Server · Git)]
+    Sources[(Jira · Confluence ·<br/>SQL Server · Git · Email)]
+    Audit[(query_audit_logs<br/>query_step_timings)]
 
     User --> UI --> Sidebar --> Chat
     Chat -->|pure RAG| RAG --> PG
@@ -77,12 +100,13 @@ flowchart LR
     Hybrid -->|tool calls| MCP --> SQL
     RAG --> LLM
     Hybrid --> LLM
+    Chat -->|audit write| Audit
     Ingest --> Sources
     Ingest --> PG
 ```
 
-_Figure 1 — How users, the Streamlit app, the RAG path, the hybrid MCP path, and the ingestion
-pipeline relate. PostgreSQL is the single source of truth for vectors, identities, and access._
+_Figure 1 — How users, the Streamlit app, the RAG path, the hybrid MCP path, ingestion, and audit
+relate. PostgreSQL is the single source of truth for vectors, identities, access, and audit data._
 
 ---
 
@@ -97,38 +121,51 @@ flowchart TB
         I2[Confluence Ingestor]
         I3[SQL Ingestor]
         I4[Git Ingestor]
-        IB[BaseIngestor<br/>chunking + dedup]
+        I5[Email Ingestor<br/>Outlook / Gmail / Yahoo]
+        IB[BaseIngestor<br/>chunking + fingerprint dedup]
         I1 --> IB
         I2 --> IB
         I3 --> IB
         I4 --> IB
+        I5 --> IB
     end
 
     subgraph Storage["PostgreSQL + pgvector (single DB)"]
-        VC[(vector_chunks<br/>HNSW index)]
+        VC[(vector_chunks<br/>HNSW + GIN indexes)]
         UAR[(user_accessible_resources)]
         UC[(user_credentials<br/>Fernet-encrypted)]
         IL[(ingestion_logs)]
         US[(users)]
+        QAL[(query_audit_logs)]
+        QST[(query_step_timings)]
     end
 
     subgraph Retrieval["Query path"]
         Q[User question]
         BF[build_query_filter]
-        R[Retriever<br/>cosine ANN + WHERE]
+        RLS[set_current_user_for_rls]
+        VS[Vector search<br/>cosine ANN + WHERE]
+        FS[FTS search<br/>websearch_to_tsquery + GIN]
+        RRF[RRF fusion]
+        Quota[per-source quota]
         DD[deduplicate_by_resource]
-        Q --> BF --> R --> DD
+        Q --> BF --> RLS --> VS
+        RLS --> FS
+        VS --> RRF
+        FS --> RRF
+        RRF --> Quota --> DD
     end
 
-    subgraph LLMPath["Reasoning"]
+    subgraph LLMPath["Reasoning + Audit"]
         Hits[Top-K chunks]
         Tools[MCP Tools<br/>sql_table_query<br/>sql_list_databases]
         Bind[llm.bind_tools]
         Loop[Tool-calling loop<br/>≤ MAX_TOOL_HOPS]
         Answer[Final answer + citations]
+        AuditW[Audit write<br/>query_audit_logs<br/>query_step_timings]
         Hits --> Bind
         Tools --> Bind
-        Bind --> Loop --> Answer
+        Bind --> Loop --> Answer --> AuditW
     end
 
     subgraph MCPSubsys["MCP server (FastAPI)"]
@@ -140,19 +177,23 @@ flowchart TB
 
     IB -->|embed + upsert| VC
     IB -->|grant_access| UAR
-    Sources[(Jira · Confluence ·<br/>SQL Server · Git)] --> Ingestion
+    Sources[(Jira · Confluence ·<br/>SQL Server · Git · Email)] --> Ingestion
 
     UAR -->|scopes| BF
     DD --> Hits
     Loop -->|tool call| MCPSubsys
     Exec --> SQL[(SQL Server)]
     MCPSubsys -->|markdown rows| Loop
-    R --> VC
+    VS --> VC
+    FS --> VC
+    AuditW --> QAL
+    AuditW --> QST
 ```
 
 _Figure 2 — Full pipeline. Ingestion writes once into `vector_chunks` and grants per-user scope
-access. Queries combine cosine similarity with a `WHERE` clause derived from the user's accessible
-resources. The hybrid path lets the LLM also call live MCP tools._
+access. Queries combine cosine similarity and FTS keyword search (RRF-fused) with a `WHERE` clause
+derived from the user's accessible resources, plus optional RLS. The hybrid path lets the LLM call
+live MCP tools. Every prompt is audited._
 
 ### 2.2 Module / component diagram
 
@@ -174,6 +215,7 @@ flowchart LR
         conf[confluence_ingestor.py]
         sqli[sql_ingestor.py]
         gitp[git_ingestor.py]
+        email[email_ingestor.py]
         cli[cli.py]
     end
 
@@ -199,6 +241,8 @@ flowchart LR
         muar[user_accessible_resource.py]
         mvc[vector_chunk.py]
         mmig[migrations.py]
+        mqal[query_audit_log.py]
+        mqst[query_step_timing.py]
     end
 
     main --> sidebar
@@ -224,6 +268,7 @@ flowchart LR
     cli --> conf
     cli --> sqli
     cli --> gitp
+    cli --> email
     base --> vstore
     base --> miln
     base --> utils
@@ -231,6 +276,7 @@ flowchart LR
     conf --> base
     sqli --> base
     gitp --> base
+    email --> base
     server --> sqltools
     server --> mcfg
     sqltools --> utils
@@ -238,6 +284,8 @@ flowchart LR
     mcpmgr --> mcfg
     utils --> modbase
     utils --> mmig
+    utils --> mqal
+    utils --> mqst
 ```
 
 _Figure 3 — Module-level dependencies. The `app/` package is the UI; `core/` houses the RAG and
@@ -279,27 +327,28 @@ rag-multi-source/
 │   ├── main.py                          # Streamlit entry point
 │   ├── auth.py                          # bcrypt login + session helpers
 │   ├── config.py                        # pydantic-settings for the app
-│   ├── chat.py                          # chat panel; routes RAG vs hybrid
-│   ├── sidebar.py                       # source toggles, scope picker, MCP toggle
-│   ├── utils.py                         # DB engine, Fernet, credential / access helpers
+│   ├── chat.py                          # chat panel; routes RAG vs hybrid + audit writes
+│   ├── sidebar.py                       # source toggles, scope picker, MCP toggle, audit log
+│   ├── utils.py                         # DB engine, Fernet, credential / access / audit helpers
 │   ├── mcp_manager.py                   # supervises the MCP child process
 │   └── ingestion/
 │       ├── __init__.py
-│       ├── base.py                      # BaseIngestor (chunk + upsert + access grant)
+│       ├── base.py                      # BaseIngestor (chunk + fingerprint dedup + upsert + access grant)
 │       ├── cli.py                       # `python -m app.ingestion.cli`
 │       ├── jira_ingestor.py
 │       ├── confluence_ingestor.py
 │       ├── sql_ingestor.py
-│       └── git_ingestor.py
+│       ├── git_ingestor.py
+│       └── email_ingestor.py            # Outlook (Graph API) / Gmail (OAuth) / Yahoo (IMAP)
 │
 ├── core/                                # RAG + MCP runtime
 │   ├── __init__.py
 │   ├── llm.py                           # LLM + Embeddings factories
 │   ├── vector_store.py                  # upsert / delete / query-filter builder
-│   ├── retriever.py                     # pgvector cosine ANN + filter-to-WHERE
-│   ├── rag_chain.py                     # pure-RAG prompt + LLM call + citations
+│   ├── retriever.py                     # hybrid vector+FTS retrieval, per-source quota, RLS
+│   ├── rag_chain.py                     # pure-RAG prompt + LLM call + citations + audit
 │   ├── mcp_client.py                    # httpx client + LangChain StructuredTools
-│   └── mcp_chain.py                     # hybrid answerer (RAG + bound MCP tools)
+│   └── mcp_chain.py                     # hybrid answerer (RAG + bound MCP tools) + audit
 │
 ├── mcp_server/                          # Independent FastAPI process
 │   ├── __init__.py
@@ -315,12 +364,15 @@ rag-multi-source/
 │   ├── user.py                          # User + UserCredential
 │   ├── ingestion_log.py                 # IngestionLog
 │   ├── user_accessible_resource.py      # The access table
-│   ├── vector_chunk.py                  # vector_chunks (Vector(dim) + JSONB)
-│   └── migrations.py                    # idempotent schema + HNSW + pgvector ext
+│   ├── vector_chunk.py                  # vector_chunks (Vector(dim) + JSONB + tsvector)
+│   ├── query_audit_log.py               # QueryAuditLog — one row per user prompt
+│   ├── query_step_timing.py             # QueryStepTiming — per-step breakdown
+│   └── migrations.py                    # idempotent schema + HNSW + GIN + RLS
 │
 └── scripts/                             # Operator utilities
     ├── __init__.py
     ├── debug_sql.py                     # diagnose SQL ingest visibility
+    ├── gmail_get_refresh_token.py       # one-time Gmail OAuth refresh token helper
     └── vector_store_admin.py            # report / purge-source / nuke
 ```
 
@@ -379,7 +431,9 @@ rag-multi-source/
 
 - **Purpose.** Singleton `pydantic-settings` configuration.
 - **What it does.** Reads `.env`, exposes typed settings: DB URL, embedding/LLM provider, chunking
-  parameters, retrieval `TOP_K` and `SCORE_THRESHOLD`, and `VECTOR_UPSERT_BATCH_SIZE`.
+  parameters, retrieval `TOP_K`, `SCORE_THRESHOLD`, `HNSW_EF_SEARCH`, `RETRIEVAL_MODE`,
+  `MAX_HITS_PER_SOURCE`, `ENABLE_RLS`, `ENABLE_CONTENT_FINGERPRINT_DEDUP`, audit settings, and
+  `VECTOR_UPSERT_BATCH_SIZE`.
 - **How it works.** Uses `SettingsConfigDict(env_file=".env", extra="ignore")` so unknown env
   vars don't error. The computed property `embedding_dim` returns the active provider's
   dimensionality so the [`VectorChunk.embedding`](models/vector_chunk.py:76) column auto-sizes.
@@ -388,7 +442,7 @@ rag-multi-source/
 #### [`app/utils.py`](app/utils.py:1)
 
 - **Purpose.** Shared infrastructure — DB engine/session, Fernet encryption, credential and access
-  helpers.
+  helpers, RLS GUC binding, audit helpers.
 - **What it does.**
   - Builds a single SQLAlchemy `engine` and `SessionLocal` against `settings.DATABASE_URL` with
     `pool_pre_ping=True` (survives idle drops on Supabase / Neon / RDS).
@@ -401,6 +455,13 @@ rag-multi-source/
     Fernet.
   - `grant_access` / `list_accessible` / `revoke_access` manipulate the multi-tenancy
     [`UserAccessibleResource`](models/user_accessible_resource.py:29) table.
+  - `set_current_user_for_rls(db, user_id)` issues `SET LOCAL app.current_user_id = :uid` on the
+    current session so the PostgreSQL RLS policies on `vector_chunks` / `user_accessible_resources`
+    can identify the caller. No-op when `ENABLE_RLS=false` or `user_id` is `None`.
+  - `log_query_audit(...)` / `log_step_timing(...)` write [`QueryAuditLog`](models/query_audit_log.py:1)
+    and [`QueryStepTiming`](models/query_step_timing.py:1) rows. No-op when `AUDIT_LOG_ENABLED=false`.
+  - `estimate_cost(provider, model, tokens_prompt, tokens_completion)` uses the
+    `LLM_COST_PER_1K_TOKENS` rate table with longest-key-wins substring matching.
 - **Snippet — context-managed session:**
   ```python
   @contextmanager
@@ -416,32 +477,37 @@ rag-multi-source/
           db.close()
   ```
 - **Notes.** Credentials are encrypted at rest only. If `ENCRYPTION_KEY` rotates without
-  re-encryption, prior values become unreadable.
+  re-encryption, prior values become unreadable. The `set_current_user_for_rls` call uses
+  `SET LOCAL` so it is scoped to the active transaction and never leaks across pooled connections.
 
 #### [`app/chat.py`](app/chat.py:1)
 
-- **Purpose.** Chat UI: turn each user message into a metadata-filtered pgvector retrieval and an
-  LLM call, then render the result with citations.
+- **Purpose.** Chat UI: turn each user message into a metadata-filtered hybrid pgvector retrieval
+  and an LLM call, then render the result with citations and write audit rows.
 - **What it does.**
   - `_build_filter(state)` calls
-    [`build_query_filter`](core/vector_store.py:231) with the four "accessible scopes" lists from
+    [`build_query_filter`](core/vector_store.py:231) with the accessible scopes lists from
     the sidebar.
   - `render_chat(state)` walks `st.session_state["messages"]`, accepts a new prompt via
-    `st.chat_input`, calls [`retrieve()`](core/retriever.py:44), and routes to either the pure RAG
+    `st.chat_input`, calls [`retrieve()`](core/retriever.py:280) (which runs hybrid
+    vector+FTS retrieval by default), and routes to either the pure RAG
     path or [`answer_question_with_mcp()`](core/mcp_chain.py:192) when
     `state.use_mcp_sql and "sql" in state.sources`.
-  - `_render_citations` formats per-source badges (Jira/Confluence/SQL/Git) including a special
-    `⚡ SQL (live, MCP)` for synthetic citations produced by the hybrid chain.
+  - Times each step with `time.perf_counter()` and calls `log_query_audit` + per-step
+    `log_step_timing` helpers after the answer is assembled.
+  - `_render_citations` formats per-source badges (Jira/Confluence/SQL/Git/Email) including a
+    special `⚡ SQL (live, MCP)` for synthetic citations produced by the hybrid chain.
 - **Key relationships.** `app.auth`, `app.sidebar`, `core.rag_chain`, `core.retriever`,
-  `core.vector_store`, `core.mcp_chain`.
+  `core.vector_store`, `core.mcp_chain`, `app.utils`.
 - **Notes.** A first-turn `st.rerun()` synchronises the sidebar's "🗑 Clear chat" disabled state
   with the now-non-empty `messages` list (Streamlit only re-renders the sidebar on the next
-  interaction otherwise).
+  interaction otherwise). A status bar tracks running session totals for prompts, tokens, cost,
+  and time.
 
 #### [`app/sidebar.py`](app/sidebar.py:1)
 
 - **Purpose.** Sidebar — sign-out, source toggles, scope pickers, credential forms, ingestion
-  trigger, MCP toggle, and access management.
+  trigger, MCP toggle, access management, and audit log viewer.
 - **What it does.**
   - Defines the [`SelectionState`](app/sidebar.py:39) dataclass which is the contract between
     sidebar and chat.
@@ -457,6 +523,8 @@ rag-multi-source/
     🟢 / 🟡 / 🔴 indicator under the MCP toggle.
   - The `🛡 Manage my access` expander surfaces `list_accessible` rows and lets the user revoke a
     scope (visibility revocation only — does not delete chunks).
+  - The `📋 Audit Log` expander queries `query_audit_logs` for the current user and shows a
+    filterable table (date range, success/fail) with drill-down into per-step timings.
 - **Snippet — selection state:**
   ```python
   @dataclass
@@ -467,6 +535,7 @@ rag-multi-source/
       confluence_spaces: list[str] = field(default_factory=list)
       sql_databases: list[str] = field(default_factory=list)
       git_scopes: list[str] = field(default_factory=list)
+      email_providers: list[str] = field(default_factory=list)
       use_mcp_sql: bool = False
   ```
 
@@ -496,11 +565,12 @@ rag-multi-source/
 - **What it does.**
   - Provides the contract: subclasses set `source` and implement `fetch_resources()`,
     `scope_filter()`, `resource_identifier_for()`.
-  - The base class handles chunking (a shared `RecursiveCharacterTextSplitter`), full-vs-
-    incremental dispatch, `INSERT … ON CONFLICT DO UPDATE` via
-    [`upsert_chunks`](core/vector_store.py:121), per-resource pre-delete in incremental mode (so
-    re-ingest with fewer chunks leaves no orphans), `IngestionLog` row management, and
-    `grant_access()` calls into the access table.
+  - The base class handles chunking (a shared `RecursiveCharacterTextSplitter`), **content
+    fingerprint deduplication** (SHA-256 over normalised text — if the fingerprint matches the
+    stored value the chunk skips the embed call), full-vs-incremental dispatch,
+    `INSERT … ON CONFLICT DO UPDATE` via [`upsert_chunks`](core/vector_store.py:121),
+    per-resource pre-delete in incremental mode (so re-ingest with fewer chunks leaves no
+    orphans), `IngestionLog` row management, and `grant_access()` calls into the access table.
 - **Key relationships.** Calls `core.vector_store`, `app.utils.grant_access`, writes
   `IngestionLog` rows.
 - **Snippet — abstract API:**
@@ -520,16 +590,18 @@ rag-multi-source/
 - **Notes — full vs incremental.**
   - `full` → `delete_by_filter(scope_filter())` then re-fetch.
   - `incremental` → `since = last_successful_run.last_item_updated_at`; per-resource
-    `delete_resource()` before re-upsert so chunk counts only ever shrink cleanly.
+    `delete_resource()` before re-upsert so chunk counts only ever shrink cleanly. Fingerprint
+    dedup short-circuits the embed API call for any chunk whose body hasn't changed.
 
 #### [`app/ingestion/cli.py`](app/ingestion/cli.py:1)
 
 - **Purpose.** Command-line driver for ingestion (`python -m app.ingestion.cli`).
 - **What it does.** Authenticates (email + bcrypt, password prompted), loads the user's encrypted
   credentials, instantiates the right ingestor via `_make_ingestor`, and calls `.run()`.
-- **How it works.** `ALL_SOURCES = ["jira", "confluence", "sql", "git"]` lets `--source all`
-  iterate. Errors per source are caught and logged so a single bad source doesn't take the whole
-  batch down.
+- **How it works.** `ALL_SOURCES = ["jira", "confluence", "sql", "git", "email"]` lets
+  `--source all` iterate. Errors per source are caught and logged so a single bad source doesn't
+  take the whole batch down. The `email` source accepts an optional `--month YYYY-MM` argument
+  (translated to `--mode month` internally).
 - **Key relationships.** Imported by the sidebar's `_trigger_ingestion` (UI) and used directly
   from terminals.
 
@@ -537,7 +609,8 @@ rag-multi-source/
 
 - **Purpose.** Index Jira Cloud issues + their comments.
 - **What it does.** Iterates issues via the new `POST /rest/api/3/search/jql` endpoint with cursor
-  pagination (`nextPageToken`) — Atlassian retired the legacy `GET /rest/api/3/search` in May 2025. For each issue, it produces a `SourceResource` containing the summary, description (ADF
+  pagination (`nextPageToken`) — Atlassian retired the legacy `GET /rest/api/3/search` in May 2025.
+  For each issue, it produces a `SourceResource` containing the summary, description (ADF
   → text), status, type, assignee/reporter, labels, and up to `MAX_COMMENTS_PER_ISSUE = 200`
   comments (overflow comments fetched from `/rest/api/3/issue/{key}/comment`).
 - **resource_id format.** `jira:{ISSUE_KEY}` (e.g. `jira:PROJ-123`).
@@ -589,24 +662,36 @@ rag-multi-source/
 
 #### [`app/ingestion/email_ingestor.py`](app/ingestion/email_ingestor.py:1)
 
-- **Purpose.** Ingest messages from Outlook / Microsoft 365 (via the Graph API) and / or Gmail
-  (via the Google API client) into the same `vector_chunks` table as every other source.
-- **Providers.** Detected from credential keys — `outlook_*` registers the Outlook provider,
-  `gmail_*` (or `gmail_token_json`) registers Gmail. Both can be active in a single run.
+- **Purpose.** Ingest messages from Outlook / Microsoft 365 (via the Graph API), Gmail
+  (via the Google API client), and **Yahoo Mail** (via IMAP + app password), in any combination,
+  from a single ingestion run.
+- **Providers.** Detected from credential keys:
+  - `outlook_*` keys → Outlook / M365 provider (delegated refresh-token flow preferred; client-
+    credentials flow also supported).
+  - `gmail_*` or `gmail_token_json` → Gmail provider.
+  - `yahoo_email_address` + `yahoo_app_password` → Yahoo Mail provider (IMAP/STARTTLS to
+    `imap.mail.yahoo.com:993`). Yahoo deprecated public OAuth2 for third-party apps; the supported
+    integration is an account-scoped 16-character app password generated at
+    login.yahoo.com → Account → Security → "Generate app password".
 - **Modes.**
   - `incremental` (default) — since = last successful run's high-water mark, falling back to
     the **previous calendar month** when there is no prior log (sane first-run default).
   - `full` — wipe-then-rebuild for the configured providers (CLI-only).
   - `month` — combine with `--month YYYY-MM` to pin a specific calendar month.
-- **Scope.** `all` (both providers), `outlook`, `gmail`, or a folder/label name applied to
-  every active provider (e.g. `inbox`, `INBOX`).
-- **resource_id format.** `email:outlook:message:{graph_id}` or `email:gmail:message:{gmail_id}`.
-- **resource_identifier.** The provider name (`outlook` | `gmail`) — also written to the
-  new `email_provider` column on `vector_chunks` so each mailbox can be revoked / filtered
+- **Scope.** `all` (all configured providers), `outlook`, `gmail`, `yahoo`, or a folder/label
+  name applied to every active provider (e.g. `inbox`, `INBOX`, or a Yahoo IMAP folder name
+  such as `Sent`).
+- **resource_id format.**
+  - `email:outlook:message:{graph_id}`
+  - `email:gmail:message:{gmail_id}`
+  - `email:yahoo:message:{rfc822_message_id_or_uid_hash}`
+- **resource_identifier.** The provider name (`outlook` | `gmail` | `yahoo`) — also written to the
+  `email_provider` column on `vector_chunks` so each mailbox can be filtered / revoked
   independently.
 - **Reliability.** Tenacity exponential backoff on transient HTTP errors; honours Outlook's
   `Retry-After` on 429s; HTML bodies are stripped to plain text via markdownify before
-  chunking.
+  chunking. Yahoo subject lines are wrapped in double quotes before the search query so they
+  match as exact phrases rather than individual tokens.
 
 ### 4.3 `core/` — RAG and MCP runtime
 
@@ -639,9 +724,9 @@ rag-multi-source/
     `(resource_id, chunk_index)`, in batches of `VECTOR_UPSERT_BATCH_SIZE`.
   - `delete_resource(resource_id)` and `delete_by_filter(filter_dict)` cover incremental and
     full deletions respectively.
-  - `_PROMOTED_FIELDS = ("project_key", "space_key", "db_name", "git_scope")` — these are pulled
-    out of `chunk.metadata` onto their own indexed columns; the rest of `metadata` is stored as
-    JSONB in `extra`.
+  - `_PROMOTED_FIELDS = ("project_key", "space_key", "db_name", "git_scope", "email_provider")` —
+    these are pulled out of `chunk.metadata` onto their own indexed columns; the rest of `metadata`
+    is stored as JSONB in `extra`.
   - `build_query_filter(...)` turns sidebar selection into a structured `{"by_source": {...}}`
     dict; `filter_to_where(...)` converts that into a SQLAlchemy WHERE expression of the form
     `(source='jira' AND project_key IN (…)) OR (source='confluence' AND space_key IN (…)) OR …`.
@@ -657,14 +742,52 @@ rag-multi-source/
 
 #### [`core/retriever.py`](core/retriever.py:1)
 
-- **Purpose.** Cosine ANN retrieval via pgvector, with the tenancy `WHERE` clause baked in.
-- **What it does.** `retrieve(query, filter_dict)` embeds the query, builds a SQLAlchemy
-  `select(...)` that returns the promoted columns + JSONB `extra` + similarity expression
-  (`1 - (embedding <=> :vec)`), `WHERE` filtered by `filter_to_where()` and the
-  `SCORE_THRESHOLD`, ordered by cosine distance, capped at `TOP_K`. Returns
-  `list[RetrievedChunk]`.
-- **Snippet — the SQL we emit (conceptually):**
+- **Purpose.** Hybrid vector + FTS retrieval with per-source diversity quota, RLS integration,
+  and elevated HNSW recall.
+- **What it does.** `retrieve(query, filter_dict, *, user_id)`:
+  1. Embeds the query and fetches `TOP_K * RETRIEVAL_FETCH_MULTIPLIER` candidates from both
+     the **vector search** path and (when `RETRIEVAL_MODE="hybrid"`) the **FTS keyword search**
+     path, running both in the same DB transaction.
+  2. **HNSW recall boost.** Issues `SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}` before the
+     vector SELECT (default 200 vs the pgvector default of 40). The `SET LOCAL` scoping means
+     the change is transaction-local and never leaks to other sessions on the connection pool.
+     This eliminates the "dense neighbourhood" effect where one source's cluster crowds out a
+     higher-scoring chunk from another source before it even enters the candidate set.
+  3. **RLS bind.** Calls `set_current_user_for_rls(db, user_id)` which issues `SET LOCAL
+     app.current_user_id = :uid`. The RLS policies on `vector_chunks` then enforce tenancy at
+     the database level — a defence-in-depth backstop against app-layer filter regressions.
+  4. **FTS keyword search** (hybrid mode only). Runs `websearch_to_tsquery` against the
+     `text_search` generated column (GIN-indexed). The score threshold is **not** applied here —
+     the point of the keyword path is to surface lexical matches the embedding would miss.
+     `setweight` gives title tokens weight `'A'` and body tokens weight `'B'`; `ts_rank_cd`
+     honours those weights at query time.
+  5. **RRF fusion.** `_rrf_fuse(vector_rows, keyword_rows, k=RRF_K)` accumulates
+     `1 / (k + rank)` for each `(resource_id, chunk_index)` key across both ranked lists.
+     A chunk endorsed by both retrievers receives the sum of both reciprocal ranks — exactly
+     the behaviour that makes RRF surface rare-token matches without penalising semantic hits.
+  6. **Per-source quota.** `_apply_source_quota(fused_rows, TOP_K, MAX_HITS_PER_SOURCE)` caps
+     how many chunks any single source can contribute. If there aren't enough hits from other
+     sources the retriever backfills from the overflow in score order, so single-source queries
+     and narrow filters still return a full result set.
+  7. Returns `list[RetrievedChunk]`.
+- **`deduplicate_by_resource(hits)`.** Keeps one chunk per `resource_id` (the highest-scoring
+  one). Used so the user-visible "Sources" list shows one entry per resource even when several
+  chunks of the same Jira ticket / Confluence page were among the top-K.
+- **Snippet — hybrid branch in `retrieve()`:**
+  ```python
+  if mode == "hybrid":
+      keyword_rows = _run_keyword_search(
+          db, query, embedding, where_clause, candidate_limit
+      )
+      fused_rows = _rrf_fuse(vector_rows, keyword_rows, k=int(settings.RRF_K))
+  else:
+      fused_rows = vector_rows
+
+  rows = _apply_source_quota(fused_rows, top_k, max_per_source)
+  ```
+- **Conceptual SQL emitted (vector branch):**
   ```sql
+  SET LOCAL hnsw.ef_search = 200;
   SELECT resource_id, source, chunk_index, text, title, url, …,
          1 - (embedding <=> :query_vec) AS similarity
   FROM vector_chunks
@@ -673,11 +796,17 @@ rag-multi-source/
       …
     AND 1 - (embedding <=> :query_vec) >= :threshold
   ORDER BY embedding <=> :query_vec
-  LIMIT :top_k;
+  LIMIT :candidate_limit;
   ```
-- **`deduplicate_by_resource(hits)`.** Keeps one chunk per `resource_id` (the highest-scoring
-  one). Used so the user-visible "Sources" list shows one entry per resource even when several
-  chunks of the same Jira ticket / Confluence page were among the top-K.
+- **Conceptual SQL emitted (FTS branch):**
+  ```sql
+  SELECT …, ts_rank_cd(text_search, websearch_to_tsquery('english', :q)) AS rank
+  FROM vector_chunks
+  WHERE <filter clauses>
+    AND text_search @@ websearch_to_tsquery('english', :q)
+  ORDER BY rank DESC
+  LIMIT :candidate_limit;
+  ```
 
 #### [`core/rag_chain.py`](core/rag_chain.py:1)
 
@@ -690,7 +819,8 @@ rag-multi-source/
      chunks concatenated underneath the same number — guaranteeing the LLM's `[N]` matches the
      user-visible `[N]`.
   4. Builds messages with the `SYSTEM_PROMPT` (cite-strictly rules), up to 6 turns of history,
-     and the user block. Calls `llm.invoke(messages)` and wraps the response in a `RAGAnswer`.
+     and the user block. Calls `llm.invoke(messages)` and wraps the response in a `RAGAnswer`
+     (which includes token usage for the audit layer).
 - **Snippet — citation-numbering loop:**
   ```python
   grouped: dict[str, list[RetrievedChunk]] = {}
@@ -851,10 +981,11 @@ The single `DeclarativeBase` shared by all model modules.
 - **Purpose.** _The_ multi-tenancy access table.
 - **What it does.** Each row says: "user X is allowed to query `vector_chunks` whose `source`
   column equals `<source>` AND whose per-source identifier column (`project_key` / `space_key`
-  / `db_name` / `git_scope`) equals `<resource_identifier>`".
+  / `db_name` / `git_scope` / `email_provider`) equals `<resource_identifier>`".
 - **Notes.** Unique on `(user_id, source, resource_identifier)`. Populated by ingestors via
   `grant_access()`. Treat this table as the security boundary — anyone able to write into it
-  can grant themselves access to any ingested scope.
+  can grant themselves access to any ingested scope. RLS policies (when enabled) enforce that
+  each user can only SELECT / mutate their own rows.
 
 #### [`models/vector_chunk.py`](models/vector_chunk.py:1)
 
@@ -862,24 +993,98 @@ The single `DeclarativeBase` shared by all model modules.
 - **Schema highlights.**
   - `(resource_id, chunk_index)` is unique → `INSERT … ON CONFLICT DO UPDATE` makes re-ingest a
     clean overwrite.
-  - Per-source promoted columns: `project_key`, `space_key`, `db_name`, `git_scope`. Each row
-    populates exactly one. Each has a partial index (`postgresql_where=column.isnot(None)`)
-    keeping the index small.
+  - Per-source promoted columns: `project_key`, `space_key`, `db_name`, `git_scope`,
+    `email_provider`. Each row populates exactly one. Each has a partial index
+    (`postgresql_where=column.isnot(None)`) keeping the index small.
+  - `content_fingerprint` — `CHAR(64)` SHA-256 hex of normalised chunk text. Used by
+    `BaseIngestor` to skip re-embedding unchanged chunks; partial-indexed for fast equality
+    lookups.
+  - `text_search` — `tsvector GENERATED ALWAYS AS (…) STORED`. A Postgres generated column
+    kept in sync automatically on every write. `setweight` gives title tokens weight `'A'` and
+    body tokens weight `'B'` so `ts_rank_cd` at query time rewards title matches over body
+    matches. The GIN index `ix_vector_chunks_text_search` drives the FTS side of hybrid
+    retrieval. Not declared on the SQLAlchemy model (the column is migration-managed);
+    `core.retriever` references it via `literal_column("text_search")`.
   - `extra` — JSONB column mapped to the Python attribute `extra` but the DB column name
     `metadata` (preserves backward compatibility while avoiding the SQLAlchemy reserved name).
   - `embedding = Column(Vector(settings.embedding_dim), nullable=False)`.
+
+#### [`models/query_audit_log.py`](models/query_audit_log.py:1)
+
+- **Purpose.** `QueryAuditLog` — one row per user prompt answered by the chat layer.
+- **Schema.**
+  - `id` — UUID string.
+  - `user_id` — FK to `users`.
+  - `timestamp` — UTC datetime, indexed.
+  - `prompt_text` — truncated to `AUDIT_PROMPT_MAX_CHARS` (default 4000) at write time.
+  - `total_duration_ms` — wall-clock from the chat layer's perspective.
+  - `tokens_prompt`, `tokens_completion`, `estimated_cost_usd` — token usage + cost. Zero on
+    the direct-SELECT MCP fast path (no LLM call).
+  - `llm_provider`, `llm_model` — plain strings so adding a new provider needs no migration.
+  - `success`, `error_message`.
+  - `source_type` — `"rag"` | `"hybrid"` | `"mcp_only"`.
+- **Relationships.** Has a one-to-many with `QueryStepTiming` (`cascade="all, delete-orphan"`).
+- **Indexes.** Composite `(user_id, timestamp DESC)` for the sidebar's "last N queries by user"
+  query; standalone `timestamp DESC` for admin-level cross-user views; `success`.
+
+#### [`models/query_step_timing.py`](models/query_step_timing.py:1)
+
+- **Purpose.** `QueryStepTiming` — one row per measured step inside a single `QueryAuditLog`.
+- **Schema.**
+  - `id` — UUID string.
+  - `audit_id` — FK to `query_audit_logs` with `ON DELETE CASCADE`.
+  - `step_name` — conventional names (see below).
+  - `duration_ms`.
+  - `extra` — JSONB (`metadata` in the DB) for step-specific data (row counts, hop index, etc.).
+- **Step-name conventions.**
+
+  | `step_name`                              | Emitted by                                                   |
+  | ---------------------------------------- | ------------------------------------------------------------ |
+  | `build_filter`                           | Both chains — time to translate sidebar to metadata filter   |
+  | `vector_retrieval`                       | Both chains — pgvector top-K cosine (+ FTS in hybrid mode)   |
+  | `llm_invocation`                         | RAG chain (once); hybrid chain (once per hop, `hop` in meta) |
+  | `mcp_tool_call:sql_table_query`          | Hybrid chain — one per MCP tool round-trip                   |
+  | `mcp_tool_call:sql_list_databases`       | Hybrid chain — one per MCP tool round-trip                   |
+  | `post_processing`                        | Both chains — citation assembly, dedup, answer formatting    |
+  | `total`                                  | Both chains — duplicate of `total_duration_ms` for table-only queries |
+
+- **Indexes.** `audit_id` (FK lookup); composite `(step_name, duration_ms)` for analytics
+  (`SELECT step_name, AVG(duration_ms) … GROUP BY step_name`).
 
 #### [`models/migrations.py`](models/migrations.py:1)
 
 - **Purpose.** Tiny idempotent migration runner.
 - **What it does.**
   1. `CREATE EXTENSION IF NOT EXISTS vector` (must precede table creation).
-  2. `Base.metadata.create_all(bind=engine)`.
+  2. `Base.metadata.create_all(bind=engine)` — creates all declared tables (idempotent).
   3. Creates the HNSW index `ix_vector_chunks_hnsw` on `vector_chunks.embedding USING hnsw
 (embedding vector_cosine_ops) WITH (m=16, ef_construction=64)` if missing.
-  4. Applies any `_ADDITIVE_COLUMNS` declared at the top of the file (currently empty).
+  4. Applies `_ADDITIVE_COLUMNS` — post-launch column additions handled via `ALTER TABLE IF NOT
+     EXISTS` checks:
+     - `vector_chunks.email_provider` (`VARCHAR(32) NULL`) — email source.
+     - `vector_chunks.content_fingerprint` (`CHAR(64) NULL`) — SHA-256 hex for fingerprint dedup.
+     - `vector_chunks.text_search` (`tsvector GENERATED ALWAYS AS … STORED`) — hybrid FTS.
+  5. Applies `_ADDITIVE_INDEXES` — each runs in its own transaction (failure on one doesn't
+     poison the rest). Includes:
+     - `ix_vector_chunks_email_provider` — partial index on `email_provider`.
+     - `ix_vector_chunks_content_fingerprint` — partial index on `content_fingerprint`.
+     - `ix_vector_chunks_text_search` — GIN index driving the FTS keyword side of hybrid retrieval.
+     - Audit table indexes: `ix_query_audit_logs_user_ts`, `ix_query_audit_logs_timestamp`,
+       `ix_query_audit_logs_success`, `ix_query_step_timings_audit_id`,
+       `ix_query_step_timings_step_duration`.
+  6. Applies PostgreSQL Row-Level Security policies (gated on `settings.ENABLE_RLS=True`):
+     - Enables RLS on `vector_chunks` and `user_accessible_resources`.
+     - Creates `vector_chunks_tenant_select` — allows SELECT only for rows whose
+       `(source, promoted-identifier)` appears in the session user's `user_accessible_resources`.
+     - Creates write policies (`vector_chunks_tenant_insert/update/delete`) that allow writes when
+       the session GUC `app.current_user_id` is set.
+     - Creates `uar_owner_*` policies so users only see / mutate their own grant rows.
+     - All policies key on `current_setting('app.current_user_id', true)` set by
+       `app.utils.set_current_user_for_rls` per request via `SET LOCAL`.
 - **Notes.** Sub-millisecond top-K cosine search up to several million rows on a tiny instance
-  with HNSW defaults.
+  with HNSW defaults. The `_index_exists` helper uses `pg_class` directly rather than
+  SQLAlchemy's inspector to avoid false negatives on GIN / expression indexes that the inspector
+  can silently omit on some SQLAlchemy versions.
 
 ### 4.6 `scripts/` — Operations utilities
 
@@ -897,6 +1102,12 @@ Diagnoses why the SQL ingestor isn't picking up tables. Prints (1) chunks indexe
 `source='sql'`, (2) `CURRENT_USER`, `DB_NAME()`, `SUSER_SNAME()` in the actual landed connection,
 and (3) the difference between `INFORMATION_SCHEMA.TABLES`, `sys.tables`, and `sys.views` — which
 distinguishes permission issues from query issues on locked-down installs.
+
+#### [`scripts/gmail_get_refresh_token.py`](scripts/gmail_get_refresh_token.py:1)
+
+One-time OAuth helper that runs the installed-app consent flow for Gmail and prints the resulting
+refresh token to stdout. Used once per user account to obtain the `gmail_refresh_token` credential
+stored in `user_credentials`. Requires `client_secret.json` (downloaded from Google Cloud Console).
 
 ---
 
@@ -916,14 +1127,19 @@ BaseIngestor.run()
    └── incremental → since = last successful run's last_item_updated_at
         │
         ▼
-fetch_resources(since)            ← per-source REST/SQL/PyGithub iteration
+fetch_resources(since)            ← per-source REST/IMAP/PyGithub iteration
         │  yields SourceResource(resource_id, title, text, url, last_updated, metadata)
         ▼
 _chunk(resource)                  ← RecursiveCharacterTextSplitter
         │  → list[ResourceChunk] keyed (resource_id, chunk_index)
         ▼
+fingerprint_check(chunk)          ← SHA-256 over normalised text
+   ├── matches stored fingerprint → skip embed (no API call)
+   └── new / changed             → embed(text)
+        │
+        ▼
 delete_resource(resource_id)      ← incremental only (full already wiped)
-upsert_chunks(chunks)             ← embed(text) + INSERT … ON CONFLICT DO UPDATE
+upsert_chunks(chunks)             ← INSERT … ON CONFLICT DO UPDATE
         │
         ▼
 grant_access(user_id, source, identifier)
@@ -932,7 +1148,8 @@ grant_access(user_id, source, identifier)
 IngestionLog row updated (status, items_processed, vectors_upserted, last_item_updated_at)
 ```
 
-**Why two modes?** Incremental is the user-facing default (cheap, only re-embeds changed items).
+**Why two modes?** Incremental is the user-facing default (cheap, only re-embeds changed items;
+fingerprint dedup saves embed calls even for touched resources whose body is unchanged).
 Full is a CLI-only admin operation because `delete_by_filter` deletes by **metadata filter** —
 not by `user_id` — so a full run from a user with a narrower view than the previous ingestor
 would silently delete the other user's chunks.
@@ -955,15 +1172,19 @@ sequenceDiagram
     participant MS as MCP Server
     participant MSSQL as SQL Server
     participant LLM as LLM
+    participant AUD as Audit (query_audit_logs)
 
     U->>UI: type prompt
     UI->>SB: render → SelectionState (sources, scopes, use_mcp_sql)
     UI->>CH: render_chat(state)
     CH->>VS: build_query_filter(sources, accessible_*)
     VS-->>CH: {by_source: {...}}
-    CH->>R: retrieve(prompt, filter_dict)
-    R->>PG: SELECT … WHERE filter AND similarity ≥ threshold ORDER BY embedding<=>:vec LIMIT TOP_K
-    PG-->>R: rows
+    CH->>R: retrieve(prompt, filter_dict, user_id)
+    R->>PG: SET LOCAL hnsw.ef_search; SET LOCAL app.current_user_id
+    R->>PG: SELECT … WHERE filter AND similarity ≥ threshold ORDER BY embedding<=>:vec LIMIT candidate_limit
+    R->>PG: (hybrid) SELECT … WHERE text_search @@ websearch_to_tsquery(…) ORDER BY rank DESC LIMIT candidate_limit
+    PG-->>R: vector rows + FTS rows
+    R->>R: RRF fusion + per-source quota
     R-->>CH: list[RetrievedChunk]
 
     alt use_mcp_sql == True and "sql" in sources
@@ -999,17 +1220,20 @@ sequenceDiagram
         RAG-->>CH: RAGAnswer
     end
 
-    CH-->>UI: render answer + Sources list
+    CH->>AUD: log_query_audit + log_step_timing (per step)
+    CH-->>UI: render answer + Sources list + status bar update
     UI-->>U: response
 ```
 
-_Figure 4 — Sequence of one user query, with both branches (pure RAG vs hybrid MCP)._
+_Figure 4 — Sequence of one user query, with both branches (pure RAG vs hybrid MCP). The
+retriever now runs vector + FTS in parallel and fuses via RRF. Every prompt is audited._
 
 ### 5.3 Permissions and metadata filtering
 
 1. **Ingestion grants access.** Every successfully processed resource calls
    [`grant_access(user_id, source, identifier)`](app/utils.py:132). The `identifier` is the
-   `project_key` / `space_key` / `db_name` / `git_scope` — i.e. **scope-level**, not item-level.
+   `project_key` / `space_key` / `db_name` / `git_scope` / `email_provider` — i.e.
+   **scope-level**, not item-level.
 2. **Sidebar reads access.** [`_scope_picker()`](app/sidebar.py:248) calls
    [`list_accessible(db, user_id, source)`](app/utils.py:159) — the only source of truth for
    "what scopes is _this user_ allowed to query".
@@ -1017,16 +1241,22 @@ _Figure 4 — Sequence of one user query, with both branches (pure RAG vs hybrid
    [`build_query_filter`](core/vector_store.py:231) → `{"by_source": {...}}`.
 4. **Retriever turns it into SQL.** [`filter_to_where`](core/vector_store.py:269) emits
    per-source `(source = X AND <key_col> IN (...))` clauses joined with `OR`. The full SQL is the
-   conjunction of that with the cosine threshold.
-5. **MCP also enforces tenancy.**
+   conjunction of that with the cosine threshold (and FTS match in hybrid mode).
+5. **RLS provides defence-in-depth.** `set_current_user_for_rls(db, user_id)` issues
+   `SET LOCAL app.current_user_id = :uid` before the SELECT. The `vector_chunks_tenant_select`
+   policy re-checks the session user's access against `user_accessible_resources` at the database
+   level. A regression in `filter_to_where` cannot surface another user's chunks.
+6. **MCP also enforces tenancy.**
    [`sql_tools.table_query`](mcp_server/tools/sql_tools.py:379) re-checks
    `db_name in list_accessible(user_id, "sql")` server-side, _before_ validating or executing.
    The chat-layer filter is not the only gate — the MCP server is independently authoritative.
 
-> **Trust model.** The `vector_chunks` table has no `user_id` column. The security boundary is
-> the [`user_accessible_resources`](models/user_accessible_resource.py:29) table. Anyone able to
-> write rows into it can grant themselves access to any ingested scope. Optional Postgres RLS
-> policies (see the README) provide defence-in-depth.
+> **Trust model.** The `vector_chunks` table has no `user_id` column. The primary security
+> boundary is the [`user_accessible_resources`](models/user_accessible_resource.py:29) table.
+> PostgreSQL RLS (enabled by default) provides a second, database-level boundary keyed on the
+> per-session `app.current_user_id` GUC. Together they form a two-layer defence — anyone able
+> to write rows into `user_accessible_resources` can grant themselves access to any ingested
+> scope, but bypassing the app-layer filter alone is insufficient when RLS is active.
 
 ---
 
@@ -1101,7 +1331,8 @@ refuses to call an obviously-needed tool.
    [`VectorChunk`](models/vector_chunk.py:48) such as `slack_channel`).
 2. **Update the schema and migrations.** Add the column to `VectorChunk`, a partial index, and
    add it to `_PROMOTED_FIELDS` and `_FILTER_COLUMNS_BY_SOURCE` in
-   [`core/vector_store.py`](core/vector_store.py:66).
+   [`core/vector_store.py`](core/vector_store.py:66). Add the column to `_ADDITIVE_COLUMNS` in
+   [`models/migrations.py`](models/migrations.py:41) so existing deployments get it on next boot.
 3. **Implement the ingestor.** Subclass [`BaseIngestor`](app/ingestion/base.py:104) in
    `app/ingestion/slack_ingestor.py`:
    ```python
@@ -1158,8 +1389,10 @@ cp .env.example .env       # set DATABASE_URL, OPENAI_API_KEY, ENCRYPTION_KEY
 streamlit run app/main.py
 ```
 
-On first start the app runs [`run_migrations`](models/migrations.py:51): enables `vector`,
-creates tables, builds the HNSW index. The MCP server is auto-started by
+On first start the app runs [`run_migrations`](models/migrations.py:436): enables `vector`,
+creates tables, builds the HNSW index, adds additive columns (`email_provider`,
+`content_fingerprint`, `text_search`), creates GIN + audit indexes, and applies RLS policies
+when `ENABLE_RLS=true`. The MCP server is auto-started by
 [`ensure_mcp_running()`](app/mcp_manager.py:171) on first authenticated load.
 
 ### 8.2 Run the MCP server standalone
@@ -1179,10 +1412,13 @@ curl -H "X-MCP-Token: $MCP_SHARED_TOKEN" http://127.0.0.1:8765/mcp/tools
 
 ```bash
 # Incremental (per-source + scope)
-python -m app.ingestion.cli --source jira       --mode incremental --scope PROJ  --email me@org.com
-python -m app.ingestion.cli --source confluence --mode incremental --scope DOCS  --email me@org.com
-python -m app.ingestion.cli --source sql        --mode incremental --scope mydb  --email me@org.com
-python -m app.ingestion.cli --source git        --mode incremental --scope main  --email me@org.com
+python -m app.ingestion.cli --source jira       --mode incremental --scope PROJ    --email me@org.com
+python -m app.ingestion.cli --source confluence --mode incremental --scope DOCS    --email me@org.com
+python -m app.ingestion.cli --source sql        --mode incremental --scope mydb    --email me@org.com
+python -m app.ingestion.cli --source git        --mode incremental --scope main    --email me@org.com
+python -m app.ingestion.cli --source email      --mode incremental --scope all     --email me@org.com
+python -m app.ingestion.cli --source email      --mode incremental --scope outlook --email me@org.com
+python -m app.ingestion.cli --source email      --month 2025-04                    --email me@org.com
 
 # Everything at once (admin-friendly)
 python -m app.ingestion.cli --source all --mode incremental --scope all --email me@org.com
@@ -1195,36 +1431,47 @@ python -m app.ingestion.cli --source confluence --mode full --scope DOCS --email
 
 ```bash
 python -m scripts.vector_store_admin --strategy report
-python -m scripts.vector_store_admin --strategy purge-source --source jira
+python -m scripts.vector_store_admin --strategy purge-source --source email
 python -m scripts.vector_store_admin --strategy nuke --confirm-i-know-what-im-doing
 ```
 
 ### 8.5 Environment variables (summary)
 
-| Variable                                                | Default                                  | Purpose                                    |
-| ------------------------------------------------------- | ---------------------------------------- | ------------------------------------------ |
-| `APP_SECRET_KEY`                                        | `change-me…`                             | Streamlit session signing                  |
-| `ENCRYPTION_KEY`                                        | _(auto)_                                 | Fernet key for encrypted credentials       |
-| `DATABASE_URL`                                          | local Postgres                           | `postgresql+psycopg://…`                   |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_PRE_PING` | 5 / 10 / true                            | SQLAlchemy pool tuning                     |
-| `EMBEDDINGS_PROVIDER`                                   | `openai`                                 | `openai` or `huggingface`                  |
-| `OPENAI_API_KEY`                                        | —                                        | required when `EMBEDDINGS_PROVIDER=openai` |
-| `EMBEDDING_MODEL`                                       | `text-embedding-3-small`                 | OpenAI embedding model                     |
-| `EMBEDDING_DIMENSION`                                   | `1536`                                   | Must match the model                       |
-| `HUGGINGFACE_EMBEDDING_MODEL`                           | `sentence-transformers/all-MiniLM-L6-v2` | HF fallback                                |
-| `HF_EMBEDDING_DIMENSION`                                | `384`                                    | Match the HF model                         |
-| `LLM_PROVIDER`                                          | `openai`                                 | `openai` / `anthropic` / `grok`            |
-| `OPENAI_CHAT_MODEL`                                     | `gpt-4o-mini`                            | OpenAI chat model                          |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`                 | — / `claude-sonnet-4-6`                  | Anthropic                                  |
-| `GROK_API_KEY` / `GROK_BASE_URL` / `GROK_MODEL`         | — / xAI URL / `grok-2-1212`              | xAI Grok                                   |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP`                          | 1000 / 200                               | Text splitter                              |
-| `TOP_K` / `SCORE_THRESHOLD`                             | 8 / 0.10                                 | Retrieval                                  |
-| `VECTOR_UPSERT_BATCH_SIZE`                              | 250                                      | Embedding batch size                       |
-| `MCP_HOST` / `MCP_PORT`                                 | `127.0.0.1` / `8765`                     | MCP bind                                   |
-| `MCP_SHARED_TOKEN`                                      | _(auto-per-process)_                     | `X-MCP-Token`                              |
-| `MCP_SQL_MAX_ROWS` / `MCP_SQL_DEFAULT_ROWS`             | 100 / 50                                 | Row caps                                   |
-| `MCP_SQL_QUERY_TIMEOUT_SECONDS`                         | 15                                       | Per-statement timeout                      |
-| `MCP_LOG_LEVEL`                                         | `INFO`                                   | loguru level for the MCP server            |
+| Variable                                                | Default                                  | Purpose                                         |
+| ------------------------------------------------------- | ---------------------------------------- | ----------------------------------------------- |
+| `APP_SECRET_KEY`                                        | `change-me…`                             | Streamlit session signing                        |
+| `ENCRYPTION_KEY`                                        | _(auto)_                                 | Fernet key for encrypted credentials            |
+| `DATABASE_URL`                                          | local Postgres                           | `postgresql+psycopg://…`                         |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_PRE_PING` | 5 / 10 / true                            | SQLAlchemy pool tuning                          |
+| `EMBEDDINGS_PROVIDER`                                   | `openai`                                 | `openai` or `huggingface`                       |
+| `OPENAI_API_KEY`                                        | —                                        | required when `EMBEDDINGS_PROVIDER=openai`      |
+| `EMBEDDING_MODEL`                                       | `text-embedding-3-small`                 | OpenAI embedding model                          |
+| `EMBEDDING_DIMENSION`                                   | `1536`                                   | Must match the model                            |
+| `HUGGINGFACE_EMBEDDING_MODEL`                           | `sentence-transformers/all-MiniLM-L6-v2` | HF fallback                                    |
+| `HF_EMBEDDING_DIMENSION`                                | `384`                                    | Match the HF model                              |
+| `LLM_PROVIDER`                                          | `openai`                                 | `openai` / `anthropic` / `grok`                 |
+| `OPENAI_CHAT_MODEL`                                     | `gpt-4o-mini`                            | OpenAI chat model                               |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`                 | — / `claude-sonnet-4-6`                  | Anthropic                                       |
+| `GROK_API_KEY` / `GROK_BASE_URL` / `GROK_MODEL`         | — / xAI URL / `grok-2-1212`              | xAI Grok                                        |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP`                          | 1000 / 200                               | Text splitter                                   |
+| `TOP_K`                                                 | 8                                        | Maximum chunks returned to the LLM              |
+| `SCORE_THRESHOLD`                                       | 0.10                                     | Minimum cosine similarity (vector path)         |
+| `HNSW_EF_SEARCH`                                        | 200                                      | HNSW graph traversal depth per query; raise for better recall on dense multi-source corpora |
+| `RETRIEVAL_FETCH_MULTIPLIER`                            | 4                                        | Fetch `TOP_K × N` candidates before per-source quota |
+| `MAX_HITS_PER_SOURCE`                                   | 4                                        | Per-source chunk cap (soft; backfill from overflow) |
+| `RETRIEVAL_MODE`                                        | `hybrid`                                 | `vector` (cosine ANN only) or `hybrid` (vector + FTS + RRF) |
+| `RRF_K`                                                 | 60                                       | RRF smoothing constant (paper default; rarely needs tuning) |
+| `FTS_LANGUAGE`                                          | `english`                                | Postgres text-search config for `websearch_to_tsquery` |
+| `VECTOR_UPSERT_BATCH_SIZE`                              | 250                                      | Embedding batch size                            |
+| `ENABLE_RLS`                                            | `true`                                   | Apply PostgreSQL Row-Level Security on `vector_chunks` / `user_accessible_resources` |
+| `ENABLE_CONTENT_FINGERPRINT_DEDUP`                      | `true`                                   | Skip re-embedding chunks whose SHA-256 fingerprint is unchanged |
+| `AUDIT_LOG_ENABLED`                                     | `true`                                   | Write `query_audit_logs` + `query_step_timings` rows |
+| `AUDIT_PROMPT_MAX_CHARS`                                | 4000                                     | Truncate stored prompt text to this length      |
+| `MCP_HOST` / `MCP_PORT`                                 | `127.0.0.1` / `8765`                     | MCP bind                                        |
+| `MCP_SHARED_TOKEN`                                      | _(auto-per-process)_                     | `X-MCP-Token`                                   |
+| `MCP_SQL_MAX_ROWS` / `MCP_SQL_DEFAULT_ROWS`             | 100 / 50                                 | Row caps                                        |
+| `MCP_SQL_QUERY_TIMEOUT_SECONDS`                         | 15                                       | Per-statement timeout                           |
+| `MCP_LOG_LEVEL`                                         | `INFO`                                   | loguru level for the MCP server                 |
 
 ---
 
@@ -1232,19 +1479,27 @@ python -m scripts.vector_store_admin --strategy nuke --confirm-i-know-what-im-do
 
 ### 9.1 Glossary
 
-| Term                        | Definition                                                                                                                                                                                                                         |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Resource**                | A logical document fetched from a source (Jira issue, Confluence page, SQL object, Git commit/file).                                                                                                                               |
-| **`resource_id`**           | Stable, source-prefixed identifier of a resource. Format: `jira:PROJ-123`, `confluence:page-9876`, `sql:server.db.schema.obj`, `git:owner/repo@branch:file:path` etc.                                                              |
-| **Chunk**                   | A sub-segment of a resource produced by `RecursiveCharacterTextSplitter`, stored as a row in `vector_chunks` keyed `(resource_id, chunk_index)`.                                                                                   |
-| **Promoted field**          | A metadata key that is materialised into its own indexed column (`project_key` / `space_key` / `db_name` / `git_scope`) for fast filtering.                                                                                        |
-| **`resource_identifier`**   | The scope-level identifier written into `user_accessible_resources` — the `project_key` / `space_key` / `db_name` / `git_scope`.                                                                                                   |
-| **Dynamic metadata filter** | The `{"by_source": {...}}` dict produced by `build_query_filter` from the user's accessible scopes; turned into a SQL `WHERE` by `filter_to_where`.                                                                                |
-| **Hybrid path**             | The chat flow that binds MCP tools onto the LLM in addition to the RAG context. Active when the sidebar's `Use Live SQL Table Data (MCP)` toggle is on.                                                                            |
-| **MCP**                     | "Model Context Protocol" — a tool-call envelope (`name` / `description` / `input_schema`). This project ships an HTTP/JSON variant; the on-the-wire shape is compatible with `langchain-mcp-adapters` / Anthropic stdio transport. |
-| **HNSW**                    | Hierarchical Navigable Small Worlds — `pgvector ≥ 0.5` ANN index used for sub-millisecond top-K cosine search.                                                                                                                     |
-| **Tenancy**                 | The query-time mechanism enforcing per-user data visibility, implemented by combining the cosine search with a `WHERE` clause derived from `user_accessible_resources`.                                                            |
-| **Direct-SELECT fast path** | A short-circuit in `core/mcp_chain.py` that executes a user-pasted `SELECT` directly via the MCP tool, bypassing the LLM's tool-call decision.                                                                                     |
+| Term                          | Definition                                                                                                                                                                                                                          |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Resource**                  | A logical document fetched from a source (Jira issue, Confluence page, SQL object, Git commit/file, email message).                                                                                                                  |
+| **`resource_id`**             | Stable, source-prefixed identifier of a resource. Format: `jira:PROJ-123`, `confluence:page-9876`, `sql:server.db.schema.obj`, `git:owner/repo@branch:file:path`, `email:outlook:message:{id}`, `email:gmail:message:{id}`, `email:yahoo:message:{id}`. |
+| **Chunk**                     | A sub-segment of a resource produced by `RecursiveCharacterTextSplitter`, stored as a row in `vector_chunks` keyed `(resource_id, chunk_index)`.                                                                                    |
+| **Promoted field**            | A metadata key materialised into its own indexed column (`project_key` / `space_key` / `db_name` / `git_scope` / `email_provider`) for fast filtering.                                                                              |
+| **`resource_identifier`**     | The scope-level identifier written into `user_accessible_resources` — the `project_key` / `space_key` / `db_name` / `git_scope` / `email_provider`.                                                                                 |
+| **Content fingerprint**       | SHA-256 hex of normalised chunk text, stored in `vector_chunks.content_fingerprint`. The ingest path compares this against the stored value and skips the embed API call for unchanged chunks.                                       |
+| **Hybrid retrieval**          | Running both a cosine ANN vector search and a Postgres FTS keyword search in parallel, then fusing the two ranked lists with Reciprocal Rank Fusion (RRF). Active when `RETRIEVAL_MODE="hybrid"` (the default).                       |
+| **RRF (Reciprocal Rank Fusion)** | A rank-combination method: each item scores `1 / (k + rank)` per list; items appearing in both lists accumulate the sum. `k=60` from the original paper. Chunks endorsed by both retrievers float to the top of the fused list.    |
+| **Per-source quota**          | A soft cap (`MAX_HITS_PER_SOURCE`) on how many chunks any single source can contribute to the final top-K. Overflow chunks backfill the result if there aren't enough hits from other sources.                                        |
+| **HNSW ef_search**            | The `hnsw.ef_search` pgvector setting that controls how many candidates the HNSW graph traversal explores per query. Raised to `HNSW_EF_SEARCH=200` per-statement (vs pgvector's default of 40) to improve recall on multi-source corpora. |
+| **Dynamic metadata filter**   | The `{"by_source": {...}}` dict produced by `build_query_filter` from the user's accessible scopes; turned into a SQL `WHERE` by `filter_to_where`.                                                                                  |
+| **Row-Level Security (RLS)**  | PostgreSQL feature that applies per-row access policies keyed on the session GUC `app.current_user_id`. Provides a database-level backstop for tenancy enforcement, active by default (`ENABLE_RLS=true`).                            |
+| **Hybrid path**               | The chat flow that binds MCP tools onto the LLM in addition to the RAG context. Active when the sidebar's `Use Live SQL Table Data (MCP)` toggle is on.                                                                              |
+| **MCP**                       | "Model Context Protocol" — a tool-call envelope (`name` / `description` / `input_schema`). This project ships an HTTP/JSON variant; the on-the-wire shape is compatible with `langchain-mcp-adapters` / Anthropic stdio transport.  |
+| **HNSW**                      | Hierarchical Navigable Small Worlds — `pgvector ≥ 0.5` ANN index used for sub-millisecond top-K cosine search.                                                                                                                      |
+| **Tenancy**                   | The query-time mechanism enforcing per-user data visibility, implemented by combining the cosine/FTS search with a `WHERE` clause derived from `user_accessible_resources`, reinforced by PostgreSQL RLS.                             |
+| **Direct-SELECT fast path**   | A short-circuit in `core/mcp_chain.py` that executes a user-pasted `SELECT` directly via the MCP tool, bypassing the LLM's tool-call decision.                                                                                       |
+| **`query_audit_logs`**        | One row per user prompt: tokens, cost, latency, provider, model, success, source type.                                                                                                                                               |
+| **`query_step_timings`**      | Child rows of `query_audit_logs` capturing per-step durations (vector retrieval, LLM invocation, each MCP tool call, post-processing) for performance analysis.                                                                      |
 
 ### 9.2 Future roadmap
 
@@ -1255,23 +1510,22 @@ python -m scripts.vector_store_admin --strategy nuke --confirm-i-know-what-im-do
    restrictions inside otherwise-public projects.
 3. **Background / scheduled ingestion** — cron, Celery beat, or GitHub Actions calling
    `python -m app.ingestion.cli --source all --mode incremental`.
-4. **Audit log of queries** — log every `(user_id, query, filter_dict, citations)` to a
-   `query_logs` table for compliance.
-5. **Hybrid search (BM25 + cosine)** — add a `tsvector` column on `vector_chunks` and combine
-   `ts_rank` with `1 - (embedding <=> :q)` for keyword-heavy queries.
-6. **Cross-encoder reranking** — second-stage `bge-reranker-base` over the top-50 from pgvector.
-7. **Streaming LLM responses** — switch `llm.invoke()` to `llm.stream()` + `st.write_stream()`
+4. **Cross-encoder reranking** — second-stage `bge-reranker-base` over the top-50 from pgvector
+   as an alternative or complement to RRF.
+5. **Streaming LLM responses** — switch `llm.invoke()` to `llm.stream()` + `st.write_stream()`
    for typewriter-style output.
-8. **Additional MCP sources.**
+6. **Additional MCP sources.**
    - **Git MCP** — live `git_log`, `git_blame`, `git_diff` tools via PyGithub.
    - **Confluence MCP** — `confluence_recent_pages`, `confluence_get_page` for fresh content.
    - **Jira MCP** — `jira_run_jql`, `jira_get_issue` for live ticket state.
-9. **WhatsApp / Teams / Email ingestion** — add `WhatsAppIngestor`, `TeamsIngestor`,
-   `EmailIngestor` (subclasses of `BaseIngestor`), each with its own promoted column
-   (e.g. `chat_room`, `mailbox_folder`) and matching scope picker in the sidebar.
-10. **Stdio MCP transport** — replace the HTTP/JSON transport with Anthropic's stdio MCP or
-    `langchain-mcp-adapters` to interoperate with off-the-shelf MCP-aware agents.
+7. **Stdio MCP transport** — replace the HTTP/JSON transport with Anthropic's stdio MCP or
+   `langchain-mcp-adapters` to interoperate with off-the-shelf MCP-aware agents.
+8. **WhatsApp / Teams ingestion** — add `WhatsAppIngestor`, `TeamsIngestor` (subclasses of
+   `BaseIngestor`), each with its own promoted column and matching scope picker in the sidebar.
+9. **Audit dashboard** — standalone ops page showing cost trends, slowest queries,
+   error rates, and per-user usage across the whole organisation (currently the sidebar shows
+   per-user audit only).
 
 ---
 
-_Document generated to reflect the codebase under `c:/Users/PaulYardley/Projects/CorporateRAGPostgres/rag-multi-source`._
+_Document updated to reflect the codebase under `c:/Users/PaulYardley/Projects/CorporateRAGPostgres/rag-multi-source` as of 2026-05-07._

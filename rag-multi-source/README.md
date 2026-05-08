@@ -650,6 +650,186 @@ rag-multi-source/
 
 ---
 
+## Recipes System — Add New Sources Easily
+
+The **Recipes system** is a lightweight, declarative layer on top of the
+existing `BaseIngestor` architecture. It lets you add a new corporate data
+source — Notion, ServiceNow, Linear, an internal REST API, a static folder
+of Markdown, anything that returns JSON or text — by writing a **single
+YAML file** instead of a full Python ingestor.
+
+### Why recipes?
+
+The classic ingestors (`jira_ingestor.py`, `confluence_ingestor.py`, …) are
+~250 lines each. Most of that code is boilerplate: HTTP auth, pagination,
+mapping JSON fields onto `SourceResource`, computing a stable
+`resource_id`. Recipes capture that boilerplate as configuration.
+
+| Feature                              | Without recipes               | With recipes              |
+| ------------------------------------ | ----------------------------- | ------------------------- |
+| Add a simple REST source             | New Python class (~150 lines) | New `.yaml` file (~30 lines) |
+| Try a new mapping locally            | Edit + reimport               | Edit YAML, rerun           |
+| Share a connector with the community | Fork + PR                     | Drop a YAML in `recipes/` |
+| Reuse complex Python logic           | n/a — already a class         | Recipe references the class |
+
+Existing hardcoded ingestors keep working unchanged. Recipes are
+**purely additive**.
+
+### Where recipes live
+
+```
+rag-multi-source/
+├── recipes/
+│   ├── __init__.py
+│   ├── recipe.py                 # Recipe dataclass + validation
+│   ├── registry.py               # Auto-discovery of YAML / .py recipes
+│   ├── example_jira.yaml         # Re-implements the Jira ingestor declaratively
+│   └── (your_source.yaml)        # Drop new YAML files here
+└── app/
+    └── ingestion/
+        └── recipe_runner.py      # Loads a recipe and runs it
+```
+
+Drop a `.yaml` file into `recipes/` (or any subfolder) and it appears
+automatically in:
+
+- The CLI: `python -m app.ingestion.cli --list-recipes`
+- The Streamlit sidebar: under **⚙️ Ingest data → Recipe**
+
+No registration step, no config edit.
+
+### Recipe YAML schema
+
+```yaml
+# Minimum recipe — declarative, no Python code needed.
+
+name: notion_pages              # Unique identifier (kebab/snake_case).
+source: notion                  # Logical source key. Goes into vector_chunks.source.
+description: "Notion pages by workspace database."
+credential_key: notion          # Key into user_credentials (`source` column).
+
+# How user-selected scope translates to a filter column on vector_chunks.
+# Use one of the existing promoted fields:
+#   project_key | space_key | db_name | git_scope | email_provider
+# …or "external_id" for sources that don't fit the existing buckets.
+scope_field: external_id
+scope_label: "Notion workspace"
+
+# Either delegate to a Python class …
+parser: app.ingestion.notion_ingestor.NotionIngestor
+
+# … or use the built-in generic HTTP/JSON parser (parser: builtin).
+config:
+  fetch:
+    type: http_json
+    url_template: "https://api.notion.com/v1/databases/{scope}/query"
+    method: POST
+    auth: bearer                        # bearer | basic | none
+    auth_token_field: integration_token # which credential field to send
+    headers:
+      Notion-Version: "2022-06-28"
+    pagination:
+      type: cursor                      # cursor | page | none
+      next_token_field: next_cursor
+      items_field: results
+      page_size: 100
+
+  resource_id_template: "notion:{id}"
+  title_template:        "{properties.Name.title.0.plain_text}"
+  text_template: |
+    # {properties.Name.title.0.plain_text}
+
+    {properties.Body.rich_text.0.plain_text}
+  url_template:           "https://notion.so/{id}"
+  last_updated_field:     "last_edited_time"
+  metadata_fields:
+    object_name: "id"
+    page_status: "properties.Status.select.name"
+
+# Optional chunking overrides (defaults to settings.CHUNK_SIZE / OVERLAP).
+chunk_size: 800
+chunk_overlap: 150
+```
+
+#### Field reference
+
+| Key                         | Required | Description                                                                                  |
+| --------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `name`                      | yes      | Unique recipe id. Defaults to the YAML filename (stem) if omitted.                           |
+| `source`                    | yes      | The logical source key (`vector_chunks.source`). Multiple recipes can share a source.        |
+| `description`               | no       | Shown in CLI listings and the sidebar dropdown.                                              |
+| `credential_key`            | yes      | The `user_credentials.source` row to load. Often equals `source`.                            |
+| `scope_field`               | yes      | Which promoted column the user-supplied scope maps to.                                       |
+| `scope_label`               | no       | Friendly label for the sidebar scope picker.                                                 |
+| `parser`                    | yes      | Either `"builtin"` or `"<module_path>.<ClassName>"` (subclass of `BaseIngestor`).            |
+| `python_module`             | no       | Alternative to `parser` — load a `.py` file in `recipes/` and use its exported `recipe`/class. |
+| `config`                    | when builtin | Builtin-parser config (see below).                                                       |
+| `chunk_size` / `chunk_overlap` | no    | Overrides the global chunking settings for this recipe only.                                 |
+
+#### Builtin parser config (`parser: builtin`)
+
+| Key                          | Description                                                                                    |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| `fetch.type`                 | `http_json` (REST) or `static` (a list embedded in the recipe — handy for testing).            |
+| `fetch.url_template`         | URL with `{credential_field}` and `{scope}` placeholders.                                      |
+| `fetch.method`               | `GET` or `POST` (default `GET`).                                                               |
+| `fetch.auth`                 | `basic` (uses `email`/`api_token`), `bearer` (uses `auth_token_field`), or `none`.             |
+| `fetch.headers`              | Static headers added to every request.                                                         |
+| `fetch.pagination`           | `none`, `cursor` (next_token_field), or `page` (start_field, page_size).                       |
+| `fetch.items_field`          | Path to the array of items in the response (e.g. `"results"`, `"data.items"`).                 |
+| `fetch.body_template`        | (POST only) Optional JSON body template.                                                       |
+| `resource_id_template`       | Format string. Field paths use dot notation: `{id}`, `{fields.summary}`, `{a.b.0.c}`.          |
+| `title_template`             | Likewise. Falls back to `resource_id` when blank.                                              |
+| `text_template`              | Multi-line template used as the chunk text.                                                    |
+| `url_template`               | URL to display in citations.                                                                   |
+| `last_updated_field`         | Path to the ISO-8601 timestamp used for incremental cutoff.                                    |
+| `metadata_fields`            | Dict mapping `metadata_key → field_path`. Anything mapped to `object_name` / `title` / `url` is promoted to its own column on `vector_chunks` automatically. |
+| `incremental_param`          | Name of the query parameter the API expects for "since" filtering (optional).                  |
+
+### Three ways to author a recipe
+
+1. **Pure YAML (`parser: builtin`)** — the fast path. Good for any source
+   whose REST API returns JSON arrays.
+2. **YAML pointing at a Python class (`parser: app.ingestion.…`)** — wraps
+   an existing `BaseIngestor` subclass so it shows up in the recipe list.
+   This is how the bundled `example_jira.yaml` works.
+3. **A `.py` file in `recipes/`** — exports a top-level `recipe = Recipe(…)`
+   plus optionally a `BaseIngestor` subclass. Useful when the parser logic
+   needs Python (HTML scraping, custom auth) but you still want it to be
+   discoverable like a YAML recipe.
+
+### CLI usage
+
+```bash
+# List every available recipe (built-in or user-authored).
+python -m app.ingestion.cli --list-recipes
+
+# Run a recipe by name.
+python -m app.ingestion.cli --recipe notion_pages \
+    --mode incremental --scope my-workspace-id \
+    --email me@org.com
+
+# Recipes coexist with the legacy --source flag — pick whichever you prefer.
+python -m app.ingestion.cli --source jira --mode incremental --scope PROJ
+```
+
+### Backward compatibility
+
+- Every existing ingestor (`JiraIngestor`, `ConfluenceIngestor`, …) works
+  exactly as before. Recipes never replace them — they wrap them.
+- The legacy `--source jira|confluence|sql|git|email` CLI flag continues
+  to function and is the default path.
+- `BaseIngestor` accepts a new optional `recipe` keyword. Subclasses that
+  don't pass one behave identically to the previous version.
+- The Streamlit sidebar still shows the existing source toggles + scope
+  pickers. The Recipe selector is an *additional* control alongside
+  them, not a replacement.
+
+See the **Next Steps** at the end of this file for a worked example of
+authoring a new recipe.
+
+---
+
 ## Operations
 
 ### Inspect the index
@@ -1041,215 +1221,4 @@ Operationally:
   to a snippet length (e.g. 200) or set it to `0` to skip the prompt
   entirely; the timing/cost columns remain useful on their own.
 * **Retention.** Both tables are append-only. A per-month estimate at
-  ~1 KB per audit row + ~6 step rows × ~0.3 KB each gives roughly
-  3 KB per prompt. 10 000 prompts/month ≈ 30 MB. Add a nightly
-  `DELETE FROM query_audit_logs WHERE timestamp < NOW() - INTERVAL
-  '90 days'` (the FK on `query_step_timings` cascades) once the
-  archive policy is decided.
-* **Encryption at rest.** If your Postgres host doesn't already
-  encrypt at rest, the same `cryptography.Fernet` machinery used for
-  credentials in [`app/utils.py`](app/utils.py) can be applied to
-  `prompt_text` — keep the audit row queryable for cost/duration
-  metrics while keeping the prompt body opaque to a casual DB read.
-
----
-
-## Hybrid RAG + MCP (Live SQL Server table data)
-
-CorporateRAG also ships a **Model-Context-Protocol-style server** that
-gives the chat agent safe, read-only, _live_ access to SQL Server table
-rows — on top of the existing RAG over schemas / stored-procedure code.
-
-```
-┌──────────── Streamlit chat ─────────────┐
-│  Q: "Show me the last 5 orders for      │
-│      customer 12345"                    │
-│  ┌─────────────────────────────────┐    │
-│  │ RAG retriever (pgvector)        │────┼──▶ schema/proc context
-│  │ + MCP tools (bound to LLM)      │────┼──▶ live row data
-│  └─────────────────────────────────┘    │
-│              │                          │
-│              ▼  bind_tools()            │
-│           OpenAI / Claude / Grok        │
-└─────────────────────────────────────────┘
-                │
-                ▼  HTTP+token (loopback)
-┌──────────── mcp_server (FastAPI) ───────┐
-│  POST /mcp/tools/sql_table_query        │
-│   • single-statement SELECT validator   │
-│   • TOP-N injection (≤ MCP_SQL_MAX_ROWS)│
-│   • per-user ODBC creds + USE [db]      │
-│   • per-statement timeout, full audit   │
-│  POST /mcp/tools/sql_list_databases     │
-└─────────────────────────────────────────┘
-```
-
-### What changed (code map)
-
-| Path                            | Purpose                                        |
-| ------------------------------- | ---------------------------------------------- |
-| `mcp_server/server.py`          | FastAPI app exposing MCP-style tool endpoints  |
-| `mcp_server/tools/sql_tools.py` | Read-only SELECT validator + executor          |
-| `mcp_server/config.py`          | `MCP_HOST` / `MCP_PORT` / row caps / token     |
-| `core/mcp_client.py`            | `httpx` client + LangChain `StructuredTool`s   |
-| `app/mcp_manager.py`            | Spawns/health-checks the MCP child process     |
-| `core/mcp_chain.py`             | Hybrid answerer: RAG context + bound MCP tools |
-| `app/sidebar.py`                | "⚡ Use Live SQL Table Data (MCP)" toggle      |
-| `app/chat.py`                   | Routes through `core.mcp_chain` when toggle on |
-| `app/main.py`                   | `ensure_mcp_running()` on first auth load      |
-
-### Safety guarantees (enforced server-side)
-
-- **Read-only.** Queries are tokenised with `sqlparse`; only a single
-  `SELECT` (or `WITH ... SELECT` CTE) is accepted. Any of
-  `INSERT/UPDATE/DELETE/MERGE/DROP/CREATE/ALTER/TRUNCATE/EXEC/EXECUTE/GRANT/REVOKE/BACKUP/RESTORE/sp_*/xp_*/fn_*/USE/GO/DBCC` rejects the request.
-- **Hard row cap.** `TOP (n)` is injected if missing, and the whole
-  query is wrapped in `SELECT TOP (n) * FROM (...)` to defeat
-  cleverness. `n ≤ MCP_SQL_MAX_ROWS` (default 100).
-- **Per-statement timeout.** `MCP_SQL_QUERY_TIMEOUT_SECONDS` (default 15s).
-- **Tenancy.** Every call requires `user_id`; the tool refuses to run
-  unless the user has a row for that database in
-  `user_accessible_resources` (i.e. they ran a SQL ingestion under
-  their account).
-- **Auditable.** Every call is logged via loguru with user, database,
-  query, row count and duration.
-- **Token-protected.** All `/mcp/*` endpoints require an `X-MCP-Token`
-  header. The Streamlit manager auto-generates one per process and
-  pins it to `.streamlit/mcp/token`.
-
-### Running the MCP server
-
-The Streamlit app starts it for you on first authenticated load. To run
-it standalone (e.g. for a separate microservice deployment):
-
-```bash
-# Set a stable token so other clients can connect
-export MCP_SHARED_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-
-# Start the server
-python -m mcp_server.server
-# or:
-uvicorn mcp_server.server:app --host 127.0.0.1 --port 8765
-```
-
-Health check:
-
-```bash
-curl http://127.0.0.1:8765/healthz
-```
-
-Tool discovery:
-
-```bash
-curl -H "X-MCP-Token: $MCP_SHARED_TOKEN" http://127.0.0.1:8765/mcp/tools
-```
-
-Manual table query:
-
-```bash
-curl -s -X POST http://127.0.0.1:8765/mcp/tools/sql_table_query \
-    -H "X-MCP-Token: $MCP_SHARED_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{
-          "user_id": "<user-uuid>",
-          "db_name": "customerdb",
-          "query": "SELECT TOP 5 * FROM dbo.Orders ORDER BY OrderDate DESC",
-          "max_rows": 5
-        }' | jq
-```
-
-### Using it from the chat
-
-1. Sign in to Streamlit.
-2. Sidebar → **SQL Server** → tick **Use Live SQL Table Data (MCP)**.
-3. Confirm the green "🟢 MCP: connected …" status line.
-4. Ask a row-data question, e.g.
-   _"What were the last 10 errors in dbo.AuditLog?"_ — the agent will
-   call `sql_table_query`, you'll see a markdown result table inline,
-   and the Sources list will show a "⚡ SQL (live, MCP)" entry alongside
-   any RAG citations.
-
-The toggle is **off by default** so the existing pure-RAG behaviour is
-unchanged for everyone who doesn't opt in.
-
-### Configuration (`.env`)
-
-| Variable                        | Default       | Purpose                                     |
-| ------------------------------- | ------------- | ------------------------------------------- |
-| `MCP_HOST`                      | `127.0.0.1`   | Bind address                                |
-| `MCP_PORT`                      | `8765`        | Bind port                                   |
-| `MCP_SHARED_TOKEN`              | _(generated)_ | Stable token; if unset, auto per-process    |
-| `MCP_SQL_MAX_ROWS`              | `100`         | Hard row cap                                |
-| `MCP_SQL_DEFAULT_ROWS`          | `50`          | Default row cap when caller doesn't specify |
-| `MCP_SQL_QUERY_TIMEOUT_SECONDS` | `15`          | Per-statement timeout                       |
-| `MCP_LOG_LEVEL`                 | `INFO`        | loguru level for the MCP server             |
-
-### Future-proofing: adding MCP for Git / Confluence / Jira
-
-The package layout is deliberately source-pluggable. To add a new
-source:
-
-1. Create `mcp_server/tools/<source>_tools.py` exposing
-   `TOOL_SPECS` + handler functions (mirror `sql_tools.py`).
-2. Wire two endpoints into `mcp_server/server.py` —
-   `POST /mcp/tools/<source>_<tool>`.
-3. Add typed methods on `core.mcp_client.MCPClient` and corresponding
-   `StructuredTool` factories in `build_mcp_tools()`.
-4. Optional: add a sidebar toggle on the same pattern as the SQL one
-   (`SelectionState.use_mcp_<source>` + chat-layer switch).
-
-The on-the-wire format is already MCP-compatible (tools with
-`name` / `description` / `input_schema`), so swapping HTTP for
-`langchain-mcp-adapters` / Anthropic's stdio transport later is a
-transport change, not a redesign.
-
----
-
-## Possible enhancements
-
-Things this codebase deliberately does not do today, listed in roughly
-ascending order of effort.
-
-### 1. Live source-system ACL re-validation at query time
-
-Today the access table is the only thing standing between users and
-resources. A natural hardening is to have the chat layer call back into
-each source on every query and intersect the live ACL with the granted
-scopes (Jira `/rest/api/3/permissions/project`, Confluence `space`
-permissions, SQL Server `HAS_DBACCESS`, GitHub `/repos/.../collaborators/.../permission`).
-Adds a per-query API hit (use a short-TTL session cache) but closes the
-"permissions changed at the source" gap.
-
-### 2. Per-chunk visibility (issue / page-level granularity)
-
-The current model is at _project / space / database / repo+branch_
-granularity. For chunk-level controls (e.g. a single Jira issue restricted
-inside an otherwise-public project), capture per-resource ACL during
-ingestion and AND it into the retriever filter.
-
-### 3. Background / scheduled ingestion
-
-A small scheduler (cron, Celery beat, GitHub Actions, the Cowork
-`schedule` skill) running
-`python -m app.ingestion.cli --source all --mode incremental` keeps the
-index fresh without anybody clicking buttons.
-
-### 4. Hybrid search (BM25 + cosine)
-
-Postgres makes this trivial: add a `tsvector` column on `vector_chunks`,
-GIN-index it, and combine `ts_rank` + `1 - (embedding <=> :q)` as the
-final score. Often a measurable improvement for keyword-heavy queries
-(error codes, IDs, exact phrases).
-
-### 5. Reranking with a cross-encoder
-
-A second-stage cross-encoder reranker (e.g. `bge-reranker-base`) over the
-top-50 from pgvector, returning the top-8 to the LLM. Tens of milliseconds
-of latency; meaningful accuracy bump on tricky retrievals.
-
-### 6. Streaming LLM responses
-
-`render_chat` currently calls `llm.invoke()` and renders the full answer
-once it returns. Switching to `llm.stream()` and `st.write_stream()`
-gives a typewriter-style response and noticeably improves perceived
-latency on long answers.
+  

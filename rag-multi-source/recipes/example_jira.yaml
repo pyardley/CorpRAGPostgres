@@ -1,0 +1,38 @@
+# Example recipe — Jira Cloud (delegates to the bundled JiraIngestor).
+#
+# This recipe demonstrates **Mode 2: wrap an existing BaseIngestor
+# subclass**. The Jira ingestor handles ADF parsing, comment overflow
+# pagination, and the post-2025 cursor-based search endpoint — none of
+# which are worth re-implementing inside a YAML template. So we just
+# point the recipe at the existing class and let the runner delegate.
+#
+# A pure-builtin Jira recipe would use `parser: builtin` plus a
+# `config:` block describing the REST endpoint, pagination, and field
+# mapping. See README → "Recipes System" for that pattern.
+
+name: example_jira
+source: jira
+description: "Jira Cloud — issues by project (delegates to JiraIngestor)."
+
+# Loaded from `user_credentials` where source = 'jira'. Contains the
+# usual `url`, `email`, `api_token` keys.
+credential_key: jira
+
+# `scope` (e.g. "PROJ" or "all") is filtered against this column on
+# vector_chunks. The Jira ingestor populates `project_key` for every
+# row it writes.
+scope_field: project_key
+scope_label: "Jira project key (e.g. PROJ) or 'all'"
+
+# Delegate to the bundled BaseIngestor subclass. The recipe runner
+# imports this class lazily and instantiates it with the same
+# (db, user_id, credentials, scope, mode) kwargs the CLI uses today.
+parser: app.ingestion.jira_ingestor.JiraIngestor
+
+# `config` is preserved verbatim and exposed to the parser as
+# `self.recipe.config`. The Jira class doesn't read any of these keys
+# at the moment — they're shown here purely to illustrate how a recipe
+# can carry parser-specific knobs without changing class code.
+config:
+  max_comments_per_issue: 200
+  page_size: 50

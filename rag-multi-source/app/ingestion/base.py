@@ -31,11 +31,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from loguru import logger
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:  # pragma: no cover - import-cycle dodge
+    # Recipe lives in a sibling top-level package and is purely
+    # *optional* for ingestion. We import lazily / under TYPE_CHECKING
+    # so the existing hardcoded ingestors don't pay a circular-import
+    # cost and so unit tests that stub out app.ingestion.base don't
+    # need to also stub recipes.
+    from recipes.recipe import Recipe
 
 
 # Type alias for the optional progress callback. Receives a snapshot dict like
@@ -114,17 +122,34 @@ class BaseIngestor(ABC):
         credentials: dict[str, str],
         scope: str,
         mode: str = "incremental",
+        *,
+        recipe: "Optional[Recipe]" = None,
     ):
         if mode not in {"full", "incremental"}:
             raise ValueError(f"mode must be 'full' or 'incremental', got {mode!r}")
+
+        # Recipe-driven mode: a Recipe can supply the ``source`` for a
+        # subclass that doesn't hardcode one (e.g. the generic builtin
+        # parser used by RecipeRunner). Subclasses that DO set ``source``
+        # at the class level continue to take precedence — recipes can
+        # decorate them, never override them.
+        if not self.source and recipe is not None:
+            # Mutating an instance attribute is fine; class-level
+            # ``source`` stays empty for subclasses without one.
+            self.source = recipe.source
         if not self.source:
-            raise NotImplementedError("Subclasses must set `source`.")
+            raise NotImplementedError(
+                "Subclasses must set `source` (or be driven by a Recipe)."
+            )
 
         self.db = db
         self.user_id = user_id
         self.credentials = credentials
         self.scope = scope          # "all" | project_key | space_key | db_name
         self.mode = mode
+        # Available to subclasses that opt into recipe metadata. Always
+        # safe to read — defaults to None when invoked the legacy way.
+        self.recipe: "Optional[Recipe]" = recipe
 
     # ── Abstract API ──────────────────────────────────────────────────────────
 
@@ -338,7 +363,22 @@ class BaseIngestor(ABC):
         self.db.commit()
 
     def _chunk(self, resource: SourceResource) -> list[ResourceChunk]:
-        splitter = _get_splitter()
+        # Recipe-driven chunk size / overlap takes precedence when set;
+        # falling back to the shared splitter (settings.CHUNK_SIZE) is
+        # still the default for every legacy ingestor.
+        if self.recipe is not None and (
+            self.recipe.chunk_size is not None
+            or self.recipe.chunk_overlap is not None
+        ):
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.recipe.chunk_size or settings.CHUNK_SIZE,
+                chunk_overlap=self.recipe.chunk_overlap
+                if self.recipe.chunk_overlap is not None
+                else settings.CHUNK_OVERLAP,
+                separators=["\n\n", "\n", ". ", " ", ""],
+            )
+        else:
+            splitter = _get_splitter()
         pieces = splitter.split_text(resource.text or "")
         chunks: list[ResourceChunk] = []
         for i, piece in enumerate(pieces):

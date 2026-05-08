@@ -575,27 +575,45 @@ def render_sidebar() -> SelectionState:
         # account that owns the union of all scopes:
         #   python -m app.ingestion.cli --source <src> --mode full --scope <key>
         with st.expander("⚙️ Ingest data"):
-            ing_source = st.selectbox(
-                "Source",
-                ["all", "jira", "confluence", "sql", "git", "email"],
-                key="ing_source",
-            )
-            ing_scope = st.text_input(
-                "Scope (project_key / space_key / db_name / branch / "
-                "'outlook' | 'gmail' | 'yahoo' / folder, or 'all')",
-                value="all",
-                key="ing_scope",
-            )
-            st.caption(
-                "Mode is **incremental** — only items changed since your last "
-                "successful run are re-embedded. For full rebuilds, use the "
-                "CLI from an admin account."
+            # Recipe-vs-legacy picker. Legacy is the default so existing
+            # users see no behaviour change; switching to "Recipe"
+            # surfaces the auto-discovered list from recipes/.
+            ing_kind = st.radio(
+                "Ingestion mode",
+                options=("Built-in source", "Recipe"),
+                horizontal=True,
+                key="ing_kind",
+                help=(
+                    "Built-in source = the original Jira/Confluence/SQL/"
+                    "Git/Email pipeline. Recipe = run a declarative "
+                    "ingestor defined under the recipes/ directory."
+                ),
             )
 
-            if st.button("Run ingestion", use_container_width=True):
-                _trigger_ingestion(
-                    user["id"], ing_source, "incremental", ing_scope
+            if ing_kind == "Recipe":
+                _render_recipe_ingestion(user["id"])
+            else:
+                ing_source = st.selectbox(
+                    "Source",
+                    ["all", "jira", "confluence", "sql", "git", "email"],
+                    key="ing_source",
                 )
+                ing_scope = st.text_input(
+                    "Scope (project_key / space_key / db_name / branch / "
+                    "'outlook' | 'gmail' | 'yahoo' / folder, or 'all')",
+                    value="all",
+                    key="ing_scope",
+                )
+                st.caption(
+                    "Mode is **incremental** — only items changed since your last "
+                    "successful run are re-embedded. For full rebuilds, use the "
+                    "CLI from an admin account."
+                )
+
+                if st.button("Run ingestion", use_container_width=True):
+                    _trigger_ingestion(
+                        user["id"], ing_source, "incremental", ing_scope
+                    )
 
             _render_recent_logs(user["id"])
 
@@ -647,6 +665,133 @@ def _render_mcp_status() -> None:
             f"🔴 MCP: not reachable at {info['base_url']} — "
             f"check the server / restart the app"
         )
+
+
+# Recipe-driven ingestion UI
+def _render_recipe_ingestion(user_id: str) -> None:
+    """
+    Renders the Recipe selector + scope input + Run button.
+
+    The list of recipes is auto-discovered from the ``recipes/``
+    directory each time the sidebar renders (Streamlit runs the whole
+    sidebar function on every interaction, so an edit-then-rerun cycle
+    picks up new YAML files for free).
+    """
+    try:
+        from recipes import list_recipes
+    except Exception as exc:  # noqa: BLE001 - never block the sidebar
+        st.error(
+            f"Could not load recipe registry: {exc}. "
+            f"Check the recipes/ directory for syntax errors."
+        )
+        return
+
+    recipes = list_recipes()
+    if not recipes:
+        st.info(
+            "No recipes found. Drop a `.yaml` file into the `recipes/` "
+            "directory (see README → 'Recipes System') and rerun."
+        )
+        return
+
+    labels = [r.display_label() for r in recipes]
+    name_by_label = {r.display_label(): r.name for r in recipes}
+
+    chosen_label = st.selectbox(
+        "Recipe",
+        options=labels,
+        key="ing_recipe",
+        help=(
+            "Recipes are declarative ingestion configs in the recipes/ "
+            "directory. See README → 'Recipes System' for the schema."
+        ),
+    )
+    chosen_name = name_by_label[chosen_label]
+    chosen_recipe = next(r for r in recipes if r.name == chosen_name)
+
+    scope_label = chosen_recipe.scope_label or (
+        f"Scope ({chosen_recipe.scope_field})"
+    )
+    ing_scope = st.text_input(
+        scope_label,
+        value="all",
+        key="ing_recipe_scope",
+        help=(
+            "The recipe's scope_field determines which column on "
+            "vector_chunks this filter targets. 'all' skips the filter."
+        ),
+    )
+
+    st.caption(
+        f"**parser:** `{chosen_recipe.parser}` · **source:** "
+        f"`{chosen_recipe.source}` · **credentials:** "
+        f"`{chosen_recipe.credential_key}`"
+    )
+    st.caption(
+        "Mode is **incremental** — only items changed since your last "
+        "successful run are re-embedded."
+    )
+
+    if st.button("Run recipe", use_container_width=True, key="run_recipe_btn"):
+        _trigger_recipe_ingestion(user_id, chosen_name, ing_scope)
+
+
+def _trigger_recipe_ingestion(
+    user_id: str, recipe_name: str, scope: str
+) -> None:
+    """Foreground recipe run with a status block (mirrors _trigger_ingestion)."""
+    from app.ingestion.recipe_runner import run_recipe
+    from app.utils import init_db
+
+    init_db()
+    label = f"Running recipe '{recipe_name}' (scope={scope})…"
+    with st.status(label, expanded=True) as status:
+        placeholder = st.empty()
+
+        def on_progress(snapshot: dict) -> None:
+            stage = snapshot.get("stage", "")
+            if stage == "starting":
+                placeholder.caption(f"Starting {snapshot['source']}…")
+            elif stage == "processing":
+                placeholder.caption(
+                    f"{snapshot['source']}: {snapshot['items_processed']} items, "
+                    f"{snapshot['vectors_upserted']} vectors — "
+                    f"latest: {snapshot['current_item'][:80]}"
+                )
+            elif stage == "done":
+                placeholder.caption(
+                    f"{snapshot['source']}: done — "
+                    f"{snapshot['items_processed']} items, "
+                    f"{snapshot['vectors_upserted']} vectors."
+                )
+
+        try:
+            with get_db() as db:
+                result = run_recipe(
+                    db,
+                    user_id,
+                    recipe_name,
+                    scope=scope,
+                    mode="incremental",
+                    on_progress=on_progress,
+                )
+            status.update(
+                label=(
+                    f"Recipe '{recipe_name}' complete ✓ — "
+                    f"{result.items_processed} items, "
+                    f"{result.vectors_upserted} vectors."
+                ),
+                state="complete",
+                expanded=False,
+            )
+        except Exception as exc:
+            logger.exception("Recipe '{}' failed", recipe_name)
+            status.write(f"❌ {exc}")
+            status.update(
+                label=f"Recipe '{recipe_name}' failed: {exc}",
+                state="error",
+                expanded=True,
+            )
 
 
 # Recent ingestion logs

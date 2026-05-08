@@ -11,6 +11,10 @@ Usage:
     python -m app.ingestion.cli --source email      --mode month --month 2025-03
     python -m app.ingestion.cli --source email      --mode full   --scope outlook
     python -m app.ingestion.cli --source all        --mode incremental
+
+Recipe-driven ingestion (additive — doesn't disturb the legacy --source flag):
+    python -m app.ingestion.cli --list-recipes
+    python -m app.ingestion.cli --recipe example_jira --scope PROJ --mode incremental
 """
 
 from __future__ import annotations
@@ -123,16 +127,98 @@ def run_ingestion(
             logger.exception("Failed to run ingestor for {}: {}", src, exc)
 
 
+def run_recipe_ingestion(
+    user_id: str,
+    recipe_name: str,
+    mode: str,
+    scope: str,
+) -> None:
+    """Run a single recipe by name. Mirrors :func:`run_ingestion` semantics."""
+    # Imported lazily so a broken recipes/ directory can't kill the
+    # legacy --source path.
+    from app.ingestion.recipe_runner import run_recipe
+
+    base_mode = mode if mode in {"full", "incremental"} else "incremental"
+    logger.info(
+        "Starting recipe '{}' / {} / scope={}", recipe_name, base_mode, scope
+    )
+    try:
+        with get_db() as db:
+            result = run_recipe(
+                db,
+                user_id,
+                recipe_name,
+                scope=scope,
+                mode=base_mode,
+            )
+        logger.info(
+            "Finished recipe '{}': items={} vectors={} last_updated={}",
+            recipe_name,
+            result.items_processed,
+            result.vectors_upserted,
+            result.last_item_updated_at,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to run recipe '{}': {}", recipe_name, exc
+        )
+
+
+def _print_recipe_list() -> None:
+    """Pretty-print every discovered recipe + exit."""
+    from recipes import list_recipes
+
+    recipes = list_recipes()
+    if not recipes:
+        print(
+            "No recipes found. Drop a .yaml file into the recipes/ "
+            "directory to register one."
+        )
+        return
+    print(f"Available recipes ({len(recipes)}):\n")
+    name_w = max(len(r.name) for r in recipes)
+    for r in recipes:
+        parser_label = "builtin" if r.is_builtin else r.parser
+        print(
+            f"  {r.name.ljust(name_w)}  "
+            f"source={r.source:<14}  parser={parser_label}"
+        )
+        if r.description:
+            print(f"  {' ' * name_w}    {r.description}")
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m app.ingestion.cli",
         description="CorporateRAG ingestion pipeline",
     )
+    # ── Discovery (no auth needed; can run before --email/--password). ──
+    parser.add_argument(
+        "--list-recipes",
+        action="store_true",
+        help=(
+            "Print every discovered recipe (declarative YAML + Python "
+            "files under recipes/) and exit. No authentication required."
+        ),
+    )
+
+    # ── Recipe / source dispatch (mutually exclusive but optional —
+    #    --list-recipes may be the only flag). ──
     parser.add_argument(
         "--source",
         choices=ALL_SOURCES + ["all"],
-        required=True,
-        help="Which source to ingest (use 'all' for every source).",
+        default=None,
+        help="Which legacy source to ingest (use 'all' for every source).",
+    )
+    parser.add_argument(
+        "--recipe",
+        default=None,
+        help=(
+            "Name of a recipe (see --list-recipes). Mutually exclusive "
+            "with --source. Recipes are discovered automatically from the "
+            "recipes/ directory."
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -157,14 +243,20 @@ def main() -> None:
         "--scope",
         default="all",
         help=(
-            "Scope within the source: Jira project key, Confluence space key, "
-            "SQL database name, Git branch, email provider "
+            "Scope within the source/recipe: Jira project key, Confluence "
+            "space key, SQL database name, Git branch, email provider "
             "(outlook | gmail | yahoo) or folder/label/IMAP-folder name, "
-            "or 'all'."
+            "or 'all'. For recipes, the meaning is defined by the recipe's "
+            "scope_field."
         ),
     )
     parser.add_argument(
-        "--email", required=True, help="Your CorporateRAG account email."
+        "--email",
+        default=None,
+        help=(
+            "Your CorporateRAG account email. Required for --source / "
+            "--recipe runs (not needed for --list-recipes)."
+        ),
     )
     parser.add_argument(
         "--password",
@@ -173,6 +265,24 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # ── Discovery shortcut ──
+    if args.list_recipes:
+        _print_recipe_list()
+        return
+
+    if args.source and args.recipe:
+        logger.error("--source and --recipe are mutually exclusive.")
+        sys.exit(2)
+    if not args.source and not args.recipe:
+        logger.error(
+            "One of --source, --recipe or --list-recipes is required. "
+            "Run with --help for full usage."
+        )
+        sys.exit(2)
+    if not args.email:
+        logger.error("--email is required for ingestion runs.")
+        sys.exit(2)
 
     init_db()
 
@@ -183,13 +293,21 @@ def main() -> None:
         logger.error("--mode month requires --month YYYY-MM")
         sys.exit(2)
 
-    run_ingestion(
-        user_id=user["id"],
-        source=args.source,
-        mode=args.mode,
-        scope=args.scope,
-        month=args.month,
-    )
+    if args.recipe:
+        run_recipe_ingestion(
+            user_id=user["id"],
+            recipe_name=args.recipe,
+            mode=args.mode,
+            scope=args.scope,
+        )
+    else:
+        run_ingestion(
+            user_id=user["id"],
+            source=args.source,
+            mode=args.mode,
+            scope=args.scope,
+            month=args.month,
+        )
 
 
 if __name__ == "__main__":
