@@ -300,7 +300,13 @@ class BuiltinRecipeIngestor(BaseIngestor):
                 f"http_json fetches."
             )
         method = (fetch.get("method") or "GET").upper()
-        items_field = fetch.get("items_field") or "items"
+        # `.get(..., "items")` (not `or "items"`) so a recipe can opt out
+        # of the envelope-key default by setting `items_field: ""` when
+        # the API returns a bare top-level array (e.g. GitHub's REST
+        # list endpoints) — an empty/falsy path makes `_resolve_path`
+        # return the payload unchanged, which `or "items"` would have
+        # masked by always falling back to the default.
+        items_field = fetch.get("items_field", "items")
         pagination = fetch.get("pagination") or {"type": "none"}
         ptype = (pagination.get("type") or "none").lower()
         page_size = int(pagination.get("page_size") or 50)
@@ -320,7 +326,6 @@ class BuiltinRecipeIngestor(BaseIngestor):
 
         next_page_token: Optional[str] = None
         page = int(pagination.get("start_page") or 1)
-        first_request = True
 
         while True:
             params: dict[str, Any] = dict(fetch.get("params") or {})
@@ -352,7 +357,11 @@ class BuiltinRecipeIngestor(BaseIngestor):
                     params[size_field] = page_size
 
             # ── Incremental "since" ──
-            if first_request and since is not None and incremental_param:
+            # Repeated on every page, not just the first — for
+            # page-number pagination each request is an independent,
+            # unfiltered-by-default query, so omitting this on later
+            # pages would silently walk past the incremental cutoff.
+            if since is not None and incremental_param:
                 params[incremental_param] = since.isoformat()
 
             try:
@@ -405,8 +414,6 @@ class BuiltinRecipeIngestor(BaseIngestor):
                 page += 1
             else:
                 break
-
-            first_request = False
 
     # ── Resource construction ─────────────────────────────────────────
 

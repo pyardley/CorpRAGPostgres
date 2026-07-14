@@ -131,6 +131,7 @@ scope.
 | Confluence | `confluence:page-{page_id}` — e.g. `confluence:page-9876`                               |
 | SQL Server | `sql:{server}.{db}.{schema}.{name}`                                                     |
 | Git        | `git:{owner}/{repo}@{branch}:commit:{sha}` or `git:{owner}/{repo}@{branch}:file:{path}` |
+| GitHub Issues (recipe) | `github_issue:{owner}/{repo}#{number}`                                     |
 
 A resource that produces N chunks is keyed `(resource_id, chunk_index)` for
 chunks 0..N-1. `INSERT ... ON CONFLICT DO UPDATE` makes re-ingestion an
@@ -770,6 +771,13 @@ config:
 chunk_size: 800
 chunk_overlap: 150
 ```
+
+The Notion example above is illustrative — for a real, working `parser:
+builtin` recipe you can actually run, see
+[`recipes/github_issues.yaml`](recipes/github_issues.yaml). It also
+demonstrates reusing an existing source's stored credential
+(`credential_key: git`) so a new source doesn't always need its own
+credential form.
 
 #### Field reference
 

@@ -142,6 +142,7 @@ _FILTER_COLUMNS_BY_SOURCE = {
     "sql": "db_name",
     "git": "git_scope",
     "email": "email_provider",
+    "github_issue": "object_name",
 }
 
 
@@ -528,13 +529,14 @@ def build_query_filter(
     accessible_databases: Optional[list[str]] = None,
     accessible_git_scopes: Optional[list[str]] = None,
     accessible_email_providers: Optional[list[str]] = None,
+    accessible_github_issue_repos: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """
     Translate (selected sources × accessible-resources rows) into a structured
     filter dict consumed by :func:`core.retriever.retrieve`.
 
     Per-source clauses are OR'd together so one query can span Jira +
-    Confluence + SQL + Git + Email.
+    Confluence + SQL + Git + Email + GitHub Issues.
 
     Example output::
 
@@ -559,6 +561,8 @@ def build_query_filter(
         by_source["git"] = list(accessible_git_scopes)
     if "email" in selected_sources and accessible_email_providers:
         by_source["email"] = list(accessible_email_providers)
+    if "github_issue" in selected_sources and accessible_github_issue_repos:
+        by_source["github_issue"] = list(accessible_github_issue_repos)
 
     return {"by_source": by_source}
 

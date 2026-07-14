@@ -1,0 +1,45 @@
+name: github_issues
+source: github_issue
+description: "GitHub Issues (REST API), per repository. Reuses the Git credential's PAT — no separate setup needed."
+credential_key: git
+scope_field: external_id
+scope_label: "GitHub repo (owner/repo)"
+config:
+  fetch:
+    type: http_json
+    url_template: "https://api.github.com/repos/{scope}/issues"
+    method: GET
+    auth: bearer
+    auth_token_field: access_token
+    headers:
+      Accept: "application/vnd.github+json"
+      X-GitHub-Api-Version: "2022-11-28"
+    params:
+      state: all
+      sort: updated
+      direction: desc
+    # GitHub's issues endpoint returns a bare JSON array, not an
+    # envelope object — "" tells the builtin parser to treat the whole
+    # response body as the items list instead of looking for a wrapper
+    # key (its default assumption is a key literally called "items").
+    items_field: ""
+    pagination:
+      type: page
+      page_field: page
+      size_field: per_page
+      page_size: 100
+  incremental_param: since
+  resource_id_template: "{scope}#{number}"
+  title_template: "{title}"
+  text_template: |
+    {title}
+
+    {body}
+  url_template: "{html_url}"
+  last_updated_field: "updated_at"
+  metadata_fields:
+    issue_number: "number"
+    issue_state: "state"
+    author: "user.login"
+chunk_size: 800
+chunk_overlap: 150

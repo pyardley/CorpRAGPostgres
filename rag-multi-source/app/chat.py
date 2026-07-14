@@ -53,6 +53,7 @@ def _build_filter(state: SelectionState) -> dict[str, Any]:
         accessible_databases=state.sql_databases,
         accessible_git_scopes=state.git_scopes,
         accessible_email_providers=state.email_providers,
+        accessible_github_issue_repos=state.github_issue_repos,
     )
 
 

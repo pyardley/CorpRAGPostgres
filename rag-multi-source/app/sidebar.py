@@ -67,6 +67,11 @@ class SelectionState:
     # and/or "yahoo", matching the `email_provider` column on
     # vector_chunks.
     email_providers: list[str] = field(default_factory=list)
+    # For GitHub Issues (recipes/github_issues.yaml), each entry is a
+    # "{owner}/{repo}" string, matching the `object_name` column on
+    # vector_chunks (the recipe's scope_field is "external_id", which
+    # promotes onto object_name rather than a dedicated column).
+    github_issue_repos: list[str] = field(default_factory=list)
     # When True, the chat layer will route through core.mcp_chain so the
     # LLM can call live SQL Server tools (read-only) on top of the RAG
     # context. Off by default — pure-RAG is the safe baseline.
@@ -563,6 +568,13 @@ def render_sidebar() -> SelectionState:
             with st.expander("🟣 Git scopes (repo@branch)", expanded=True):
                 state.git_scopes = _scope_picker(
                     "Repos+branches", "git", user["id"]
+                )
+
+        if st.checkbox("GitHub Issues", value=True, key="src_github_issue"):
+            state.sources.append("github_issue")
+            with st.expander("🟤 GitHub Issue repos (owner/repo)", expanded=True):
+                state.github_issue_repos = _scope_picker(
+                    "Repos", "github_issue", user["id"]
                 )
 
         if st.checkbox("Email", value=True, key="src_email"):
