@@ -251,15 +251,29 @@ def _render_git_repo_list(user_id: str) -> None:
             "reuse the primary token above. To remove a repository, clear "
             "its URL field and save."
         )
+
+        from app.ingestion.git_ingestor import _parse_repo_path
+
         for i in range(2, 2 + rows):
-            _credential_form(
-                "git",
-                [
-                    (f"url_{i}", f"Repository {i} URL", False),
-                    (f"access_token_{i}", "PAT (blank = reuse primary)", True),
-                ],
-                form_key=f"creds_git_{i}",
-            )
+            repo_url = existing.get(f"url_{i}", "")
+            if repo_url:
+                panel_label = f"Repository {i} — {_parse_repo_path(repo_url)}"
+            else:
+                panel_label = f"Repository {i} (not configured)"
+
+            # Collapsed by default once a repo is configured, so a long
+            # list doesn't force scrolling through every field just to
+            # find the one you want. A still-empty slot (e.g. one just
+            # added via the button below) stays expanded to fill in.
+            with st.expander(panel_label, expanded=not repo_url):
+                _credential_form(
+                    "git",
+                    [
+                        (f"url_{i}", f"Repository {i} URL", False),
+                        (f"access_token_{i}", "PAT (blank = reuse primary)", True),
+                    ],
+                    form_key=f"creds_git_{i}",
+                )
 
         col_add, col_remove = st.columns(2)
         with col_add:
