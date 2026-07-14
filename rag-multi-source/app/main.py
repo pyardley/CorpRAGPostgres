@@ -54,21 +54,25 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Tighten sidebar padding + widen so long credential captions
-       (e.g. "Full token.json") don't get clipped. Streamlit's default
-       sidebar is ~21rem; bump it to 26rem and let it stretch a bit
-       more on wide displays. */
+    /* Tighten sidebar padding. Width is intentionally NOT pinned here —
+       it's user-resizable via Streamlit's native drag handle, with the
+       chosen width restored/saved across sessions by
+       app.sidebar_resize.inject_sidebar_resize_persistence(). We only
+       bound the draggable range so it can't be dragged to something
+       unusably narrow or absurdly wide; long credential captions
+       (e.g. "Full token.json") are the reason the default lives at the
+       wider end of that range. */
     section[data-testid="stSidebar"] {
         padding-top: 1rem;
-        width: 26rem !important;
-        min-width: 26rem !important;
-        max-width: 32rem !important;
+        min-width: 18rem !important;
+        max-width: 75rem !important;
     }
-    /* The collapsed-state container also has a fixed width — keep them
-       aligned so the resize handle works as expected. */
+    /* The inner wrapper must always track the outer section's width —
+       forcing it to a fixed value here is what used to defeat the
+       resize handle. */
     section[data-testid="stSidebar"] > div:first-child {
-        width: 26rem !important;
-        min-width: 26rem !important;
+        width: 100% !important;
+        min-width: 100% !important;
     }
 
     /* Citation block subtle background */

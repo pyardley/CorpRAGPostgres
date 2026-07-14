@@ -31,6 +31,12 @@ import streamlit as st
 from loguru import logger
 
 from app.auth import current_user, logout_session
+from app.sidebar_resize import (
+    DEFAULT_WIDTH_PX as _SIDEBAR_DEFAULT_WIDTH_PX,
+    MAX_WIDTH_PX as _SIDEBAR_MAX_WIDTH_PX,
+    MIN_WIDTH_PX as _SIDEBAR_MIN_WIDTH_PX,
+    inject_sidebar_resize_persistence,
+)
 from app.utils import (
     delete_credential,
     get_db,
@@ -411,6 +417,11 @@ def _scope_picker(label: str, source: str, user_id: str) -> list[str]:
     )
 
 
+def _mark_sidebar_width_dirty() -> None:
+    """on_change callback for the sidebar-width slider — see render_sidebar()."""
+    st.session_state["_sidebar_width_dirty"] = True
+
+
 # Main renderer
 def render_sidebar() -> SelectionState:
     user = current_user()
@@ -457,6 +468,32 @@ def render_sidebar() -> SelectionState:
                 "prompts answered) at the bottom of the chat."
             ),
         )
+
+        # Sidebar width. Streamlit's own drag handle (the sidebar's right
+        # edge) already resizes it, but Streamlit hard-caps that interactive
+        # drag at ~600px in its frontend bundle — no CSS override can lift
+        # it. This slider sets the width directly instead, so wide content
+        # below (e.g. the Audit Log table) can get the room it needs.
+        # Persisted to the browser via localStorage (see sidebar_resize.py),
+        # not tied to the user account.
+        width_val = st.slider(
+            "↔ Sidebar width (px)",
+            min_value=_SIDEBAR_MIN_WIDTH_PX,
+            max_value=_SIDEBAR_MAX_WIDTH_PX,
+            step=8,
+            value=_SIDEBAR_DEFAULT_WIDTH_PX,
+            key="sidebar_width_px",
+            on_change=_mark_sidebar_width_dirty,
+            help=(
+                "The sidebar's drag handle only resizes up to ~600px "
+                "(a Streamlit limitation, not adjustable via CSS). Use "
+                "this slider to go wider."
+            ),
+        )
+        force_width = (
+            width_val if st.session_state.pop("_sidebar_width_dirty", False) else None
+        )
+        inject_sidebar_resize_persistence(force_width_px=force_width)
 
         # Search-tuning controls (FTS language, etc.) -- folded behind an
         # expander because most users won't need to touch them, but
