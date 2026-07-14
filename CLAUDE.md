@@ -63,20 +63,19 @@ Access is **granted at ingestion time**, not re-checked live. The `user_accessib
 | `core/mcp_chain.py` | Hybrid RAG + live SQL via bound MCP tools |
 | `app/config.py` | All settings (pydantic-settings); singleton `settings` imported everywhere |
 | `app/utils.py` | DB session (`get_db`), Fernet encryption, `StepTimer`, audit logging, session totals, status bar |
-| `models/migrations.py` | Idempotent schema bootstrap: pgvector extension, HNSW index, additive ALTERs, RLS policies |
+| `models/migrations.py` | Idempotent schema bootstrap: pgvector extension, HNSW index, additive ALTERs, RLS policies, `FTS_LANGUAGES` / `fts_column_name` |
 | `mcp_server/server.py` | FastAPI app exposing read-only SQL tools; auto-started by Streamlit on first auth load |
-| `core/runtime_config.py` | JSON-persisted overrides for settings that need to change without restart (e.g. `FTS_LANGUAGE`) |
 
 ### Schema landmarks
 
-- `vector_chunks`: `(resource_id, chunk_index)` unique key; `embedding VECTOR(1536)` with HNSW index; promoted scope columns (`project_key`, `space_key`, `db_name`, `git_scope`, `email_provider`); `content_fingerprint CHAR(64)`; generated `text_search tsvector` for FTS.
+- `vector_chunks`: `(resource_id, chunk_index)` unique key; `embedding VECTOR(1536)` with HNSW index; promoted scope columns (`project_key`, `space_key`, `db_name`, `git_scope`, `email_provider`); `content_fingerprint CHAR(64)`; generated `text_search_english` / `text_search_simple` tsvector columns (one per `models.migrations.FTS_LANGUAGES` entry) for FTS.
 - Stable resource ID format: `jira:PROJ-123`, `confluence:page-9876`, `sql:server.db.schema.name`, `git:owner/repo@branch:file:path`.
 
 ### Retrieval modes
 
 Controlled by `settings.RETRIEVAL_MODE` (default `"hybrid"`):
 - `"vector"`: pure cosine similarity over HNSW.
-- `"hybrid"`: vector + Postgres FTS via `websearch_to_tsquery`, fused with Reciprocal Rank Fusion. Requires the `text_search` generated column (provisioned automatically by migrations).
+- `"hybrid"`: vector + Postgres FTS via `websearch_to_tsquery`, fused with Reciprocal Rank Fusion. Both `english` and `simple` FTS configs are indexed permanently (provisioned automatically by migrations) — `core.retriever.retrieve(..., fts_language=...)` picks which one to query per request; the sidebar exposes this as a per-search "🔤 Search language" picker, not a global setting.
 
 `HNSW_EF_SEARCH` (default 200) controls recall vs. speed per-statement via `SET LOCAL`. `MAX_HITS_PER_SOURCE` (default 4) soft-caps how many chunks any single source contributes to the final top-K.
 
@@ -96,8 +95,7 @@ All settings are in `app/config.py` (pydantic-settings, reads from `.env`). Key 
 - `RETRIEVAL_MODE` — `"vector"` or `"hybrid"` (default `"hybrid"`)
 - `AUDIT_LOG_ENABLED` — set `false` for benchmarking (default `true`)
 - `AUDIT_PROMPT_MAX_CHARS` — truncation limit for stored prompt text
-
-Runtime-mutable overrides (survive restarts without `.env` changes) are stored in `.runtime_config.json` and managed via `core/runtime_config.py`. Currently only `FTS_LANGUAGE` is runtime-mutable.
+- `FTS_LANGUAGE` — default pre-selected in the sidebar's per-search "Search language" picker (default `english`); both `english` and `simple` are always indexed, so this is just a UI default, not a value that requires a restart or rebuild to change
 
 ## Code Conventions
 

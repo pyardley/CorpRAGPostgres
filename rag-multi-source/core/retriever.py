@@ -32,9 +32,11 @@ Retrieval modes
   rather than the literal token.
 
 Both modes share the per-source quota, the RLS bind, and the
-``hnsw.ef_search`` tuning. Hybrid mode requires the
-``vector_chunks.text_search`` generated column + GIN index that
-``models.migrations`` provisions automatically on first run.
+``hnsw.ef_search`` tuning. Hybrid mode requires the per-language
+``vector_chunks.text_search_<language>`` generated columns + GIN indexes
+that ``models.migrations`` provisions automatically on first run — both
+``english`` and ``simple`` are always indexed, and the caller picks which
+one to query via ``retrieve(..., fts_language=...)``.
 
 Per-source candidate fetching
 -----------------------------
@@ -68,12 +70,12 @@ from sqlalchemy import func, literal_column, select, text
 from app.config import settings
 from app.utils import get_db, set_current_user_for_rls
 from core.llm import get_embeddings
-from core.runtime_config import get_fts_language
 from core.vector_store import (
     build_query_filter,
     filter_to_where,
     filter_to_where_for_source,
 )
+from models.migrations import FTS_LANGUAGES, fts_column_name
 from models.vector_chunk import VectorChunk
 
 
@@ -141,12 +143,13 @@ def _run_vector_search(db, embedding, where_clause, score_threshold, limit):
     return db.execute(stmt).all()
 
 
-def _run_keyword_search(db, query_text, embedding, where_clause, limit):
+def _run_keyword_search(db, query_text, embedding, where_clause, limit, language):
     """
     Postgres FTS keyword search.
 
-    Uses the ``text_search`` generated column (managed by
-    ``models.migrations``) plus ``websearch_to_tsquery`` for permissive
+    Uses the ``text_search_<language>`` generated column (managed by
+    ``models.migrations`` — one per :data:`models.migrations.FTS_LANGUAGES`
+    entry, always present) plus ``websearch_to_tsquery`` for permissive
     user-input parsing — quoted phrases, OR-of-terms, and a leading
     ``-`` for negation all work without raising on weird syntax.
 
@@ -157,29 +160,27 @@ def _run_keyword_search(db, query_text, embedding, where_clause, limit):
     point of the hybrid path is to surface lexical matches the
     embedding missed (low cosine, high lexical relevance).
 
-    ``literal_column("text_search")`` references the generated column
-    by name without requiring it to be declared on the SQLAlchemy
-    model (the model stays focused on application-managed columns;
-    the generated column is the migration's responsibility).
+    ``literal_column(...)`` references the generated column by name
+    without requiring it to be declared on the SQLAlchemy model (the
+    model stays focused on application-managed columns; the generated
+    columns are the migration's responsibility).
     """
     similarity_expr = (
         1 - VectorChunk.embedding.cosine_distance(embedding)
     ).label("similarity")
-    text_search_col = literal_column("text_search")
+    text_search_col = literal_column(fts_column_name(language))
 
     # Postgres has two ``websearch_to_tsquery`` overloads — ``(text)`` and
     # ``(regconfig, text)`` — and *no* ``(text, text)`` form. SQLAlchemy
     # binds plain Python strings as text, so we have to disambiguate the
     # first argument explicitly. We do that by inlining the language as a
-    # ``::regconfig``-cast literal via ``literal_column``. The value comes
-    # from ``core.runtime_config`` (UI-toggleable, falls back to
-    # ``settings.FTS_LANGUAGE``) and is whitelisted to ``english`` /
-    # ``simple`` by ``set_fts_language`` before it ever reaches DDL, so
-    # injection-by-config would require an attacker who can already write
-    # to the runtime-config file — a non-threat. ``query_text`` *is* user
-    # input and stays a parameter binding, which is where the safety
-    # actually matters.
-    fts_regconfig = literal_column(f"'{get_fts_language()}'::regconfig")
+    # ``::regconfig``-cast literal via ``literal_column``. ``language`` is
+    # whitelisted against ``FTS_LANGUAGES`` by ``fts_column_name`` above
+    # before it ever reaches this string, so injection-by-config would
+    # require an attacker who can already control the caller's Python
+    # arguments — a non-threat. ``query_text`` *is* user input and stays a
+    # parameter binding, which is where the safety actually matters.
+    fts_regconfig = literal_column(f"'{language}'::regconfig")
     ts_query = func.websearch_to_tsquery(fts_regconfig, query_text)
     rank_expr = func.ts_rank_cd(text_search_col, ts_query).label("rank")
 
@@ -311,6 +312,7 @@ def retrieve(
     score_threshold: Optional[float] = None,
     *,
     user_id: Optional[str] = None,
+    fts_language: Optional[str] = None,
 ) -> list[RetrievedChunk]:
     """
     Run a similarity search constrained by ``filter_dict``.
@@ -330,13 +332,14 @@ def retrieve(
         ORDER BY embedding <=> :query_vec
         LIMIT :per_source_limit
 
-    Hybrid mode also issues a parallel FTS query per source::
+    Hybrid mode also issues a parallel FTS query per source, against
+    whichever language-specific generated column ``fts_language`` selects::
 
-        SELECT ..., ts_rank_cd(text_search, q) AS rank
+        SELECT ..., ts_rank_cd(text_search_<lang>, q) AS rank
         FROM vector_chunks
         WHERE source = :this_source
           AND <scope_col> = ANY(:this_source_scopes)
-          AND text_search @@ websearch_to_tsquery(:lang, :user_query)
+          AND text_search_<lang> @@ websearch_to_tsquery(:lang, :user_query)
         ORDER BY rank DESC
         LIMIT :per_source_limit
 
@@ -357,6 +360,11 @@ def retrieve(
         caller. Required when ``settings.ENABLE_RLS`` is True;
         without it the RLS policies will deny every row and the
         retriever will return an empty list. Optional otherwise.
+    fts_language
+        Which of :data:`models.migrations.FTS_LANGUAGES` to query against
+        in hybrid mode (both are always indexed — see ``models.migrations``).
+        Falls back to ``settings.FTS_LANGUAGE`` when omitted or invalid.
+        Unused in vector-only mode.
     """
     if not query.strip():
         return []
@@ -364,6 +372,9 @@ def retrieve(
     top_k = top_k or settings.TOP_K
     score_threshold = (
         settings.SCORE_THRESHOLD if score_threshold is None else score_threshold
+    )
+    fts_language = (
+        fts_language if fts_language in FTS_LANGUAGES else settings.FTS_LANGUAGE
     )
 
     by_source: dict[str, list[str]] = (filter_dict or {}).get("by_source") or {}
@@ -441,7 +452,7 @@ def retrieve(
 
             if mode == "hybrid":
                 k_rows = _run_keyword_search(
-                    db, query, embedding, src_where, per_source_limit
+                    db, query, embedding, src_where, per_source_limit, fts_language
                 )
                 all_keyword_rows.extend(k_rows)
                 counts["keyword"] = len(k_rows)

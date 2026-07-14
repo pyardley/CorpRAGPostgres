@@ -30,30 +30,42 @@ from typing import Iterable
 
 from loguru import logger
 from sqlalchemy import inspect, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from app.config import settings
-from core.runtime_config import get_fts_language, valid_fts_languages
 from models.base import Base
+
+# Both FTS languages are indexed permanently (one generated column + one
+# GIN index each) so any user can pick the best one per query -- no admin
+# rebuild involved. See ``fts_column_name`` and ``_additive_columns`` below.
+FTS_LANGUAGES: tuple[str, ...] = ("english", "simple")
+
+
+def fts_column_name(language: str) -> str:
+    """Generated-column name for a given FTS language, e.g. ``text_search_english``."""
+    if language not in FTS_LANGUAGES:
+        raise ValueError(
+            f"Unsupported FTS language {language!r}; must be one of {FTS_LANGUAGES}"
+        )
+    return f"text_search_{language}"
 
 
 def _text_search_column_ddl(language: str) -> str:
     """
-    Build the ``tsvector GENERATED ALWAYS AS (...) STORED`` DDL for the
-    ``vector_chunks.text_search`` column with the given Postgres FTS
-    language config.
+    Build the ``tsvector GENERATED ALWAYS AS (...) STORED`` DDL for a
+    ``text_search_<language>`` column.
 
-    The language must be one of :func:`core.runtime_config.valid_fts_languages`
-    because it's interpolated directly into the DDL string --
-    ``to_tsvector`` only counts as immutable (and is therefore allowed
-    in a generated column) when its first argument is a regconfig
-    literal, not a parameter binding. The whitelist is the safety
-    boundary against SQL injection here.
+    The language must be one of :data:`FTS_LANGUAGES` because it's
+    interpolated directly into the DDL string -- ``to_tsvector`` only
+    counts as immutable (and is therefore allowed in a generated column)
+    when its first argument is a regconfig literal, not a parameter
+    binding. The whitelist is the safety boundary against SQL injection
+    here.
     """
-    if language not in valid_fts_languages():
+    if language not in FTS_LANGUAGES:
         raise ValueError(
             f"Unsupported FTS language {language!r}; must be one of "
-            f"{valid_fts_languages()}"
+            f"{FTS_LANGUAGES}"
         )
     return (
         "tsvector GENERATED ALWAYS AS ("
@@ -65,10 +77,6 @@ def _text_search_column_ddl(language: str) -> str:
 
 # (table_name, column_name, column_ddl). Example:
 #   ("users", "is_admin", "BOOLEAN NOT NULL DEFAULT FALSE")
-#
-# NB: this is built lazily inside ``run_migrations`` so the
-# ``text_search`` column DDL picks up the current runtime FTS language
-# (overridable via the sidebar UI; falls back to ``settings.FTS_LANGUAGE``).
 def _additive_columns() -> tuple[tuple[str, str, str], ...]:
     return (
         # Email source -- added after the original 4-source schema was
@@ -79,26 +87,25 @@ def _additive_columns() -> tuple[tuple[str, str, str], ...]:
         # so existing rows are valid; the next re-ingest backfills them.
         # CHAR(64) is exact-fit for a SHA-256 hex digest.
         ("vector_chunks", "content_fingerprint", "CHAR(64) NULL"),
-        # Hybrid retrieval -- Postgres full-text search vector. Generated
-        # column kept in sync automatically by Postgres on every INSERT /
-        # UPDATE, so the application write path is unchanged. ``setweight``
-        # gives title matches a stronger weight ('A') than body matches
-        # ('B'); ``ts_rank_cd`` honours those weights at query time.
-        # ``coalesce`` keeps the expression total over NULL columns so the
-        # generated column is never NULL.
-        #
-        # The language config is interpolated from ``get_fts_language()`` --
-        # generated-column expressions must be immutable, and ``to_tsvector``
-        # is only treated as immutable when its first argument is a regconfig
-        # literal, so we substitute the language at DDL-build time. If the
-        # user changes the language via the UI, ``rebuild_text_search_column``
-        # drops + recreates this column (and its GIN index) with the new
-        # language so the on-disk tsvectors and the query-time
-        # ``websearch_to_tsquery`` agree.
+        # Hybrid retrieval -- one Postgres full-text search vector PER
+        # LANGUAGE, so a query can pick whichever is the better fit
+        # (english: stemming + stop-words, good for prose; simple: verbatim
+        # tokens, good for code/identifiers/error codes) without any admin
+        # rebuild. Generated columns are kept in sync automatically by
+        # Postgres on every INSERT/UPDATE, so the application write path is
+        # unchanged. ``setweight`` gives title matches a stronger weight
+        # ('A') than body matches ('B'); ``ts_rank_cd`` honours those
+        # weights at query time. ``coalesce`` keeps the expression total
+        # over NULL columns so the generated column is never NULL.
         (
             "vector_chunks",
-            "text_search",
-            _text_search_column_ddl(get_fts_language()),
+            fts_column_name("english"),
+            _text_search_column_ddl("english"),
+        ),
+        (
+            "vector_chunks",
+            fts_column_name("simple"),
+            _text_search_column_ddl("simple"),
         ),
     )
 
@@ -159,16 +166,23 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "WHERE content_fingerprint IS NOT NULL",
     ),
     # -- Hybrid retrieval (Postgres FTS) ------------------------------------
-    # GIN index over the generated ``text_search`` tsvector column drives
-    # the keyword side of hybrid retrieval (``core.retriever`` runs an
-    # FTS query in parallel with the vector search and fuses the results
-    # via Reciprocal Rank Fusion). GIN scales linearly with the corpus
-    # and is the standard pgsql FTS index -- no extension required.
+    # One GIN index per generated ``text_search_<language>`` tsvector
+    # column drives the keyword side of hybrid retrieval (``core.retriever``
+    # runs an FTS query -- in whichever language the caller picked -- in
+    # parallel with the vector search and fuses the results via Reciprocal
+    # Rank Fusion). GIN scales linearly with the corpus and is the standard
+    # pgsql FTS index -- no extension required.
     (
-        "ix_vector_chunks_text_search",
+        "ix_vector_chunks_text_search_english",
         "vector_chunks",
-        "CREATE INDEX IF NOT EXISTS ix_vector_chunks_text_search "
-        "ON vector_chunks USING GIN (text_search)",
+        "CREATE INDEX IF NOT EXISTS ix_vector_chunks_text_search_english "
+        "ON vector_chunks USING GIN (text_search_english)",
+    ),
+    (
+        "ix_vector_chunks_text_search_simple",
+        "vector_chunks",
+        "CREATE INDEX IF NOT EXISTS ix_vector_chunks_text_search_simple "
+        "ON vector_chunks USING GIN (text_search_simple)",
     ),
 )
 
@@ -318,8 +332,18 @@ _RLS_POLICY_NAMES: dict[str, str] = {
 }
 
 
-def _existing_columns(engine: Engine, table: str) -> set[str]:
-    inspector = inspect(engine)
+def _existing_columns(engine_or_conn: Engine | Connection, table: str) -> set[str]:
+    """
+    Accepts either an ``Engine`` or an open ``Connection``. Callers that
+    already hold an open transaction on ``table`` (e.g. mid-loop inside
+    ``run_migrations``' additive-columns step, right after an
+    ``ALTER TABLE ADD COLUMN`` on the same table) must pass that
+    ``Connection`` through rather than ``engine`` -- inspecting via a
+    *new* connection from the pool would need its own AccessShareLock on
+    ``table``, which blocks behind the still-uncommitted transaction's
+    AccessExclusiveLock and self-deadlocks the migration.
+    """
+    inspector = inspect(engine_or_conn)
     if table not in inspector.get_table_names():
         return set()
     return {col["name"] for col in inspector.get_columns(table)}
@@ -466,90 +490,6 @@ def drop_rls_policies(engine: Engine) -> None:
             )
 
 
-def detect_text_search_language(engine: Engine) -> str | None:
-    """
-    Best-effort introspection of the language baked into the existing
-    ``vector_chunks.text_search`` generated column.
-
-    Returns one of :func:`core.runtime_config.valid_fts_languages`, or
-    ``None`` if the column doesn't exist yet, isn't generated, or its
-    expression doesn't match the known shape (e.g. it was rebuilt by
-    hand). The UI uses this purely for display ("on disk: english") --
-    a missing answer just hides the indicator, never blocks a rebuild.
-    """
-    sql = text(
-        "SELECT pg_get_expr(adbin, adrelid) "
-        "FROM pg_attribute a "
-        "JOIN pg_attrdef d ON d.adrelid = a.attrelid "
-        "                 AND d.adnum = a.attnum "
-        "WHERE a.attrelid = 'vector_chunks'::regclass "
-        "  AND a.attname = 'text_search'"
-    )
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(sql).first()
-    except Exception:  # noqa: BLE001 -- column / table may not exist yet
-        return None
-    if not row or not row[0]:
-        return None
-    expr = str(row[0])
-    for lang in valid_fts_languages():
-        # Match the literal regconfig used by ``_text_search_column_ddl`` --
-        # ``to_tsvector('<lang>', ...)``.
-        if f"to_tsvector('{lang}'" in expr:
-            return lang
-    return None
-
-
-def rebuild_text_search_column(engine: Engine, language: str) -> None:
-    """
-    Drop and recreate vector_chunks.text_search (and its GIN index)
-    bound to the given Postgres FTS language config.
-
-    Called from the sidebar when an admin changes the FTS language so
-    the on-disk tsvectors are regenerated with the new language rules
-    (stemming + stop-words for english, lower-case-only for simple).
-    Postgres recomputes the generated column for every existing row
-    as part of ADD COLUMN, so this is a one-shot operation -- no data
-    loss, no application-side backfill needed.
-
-    The whole rebuild runs in a single transaction so a failure half
-    way through (out of disk, lock contention) leaves the database in
-    its previous coherent state -- either the old column + index
-    survives, or the new one is fully built. There is never a
-    transient state where queries can see a missing text_search column.
-    """
-    if language not in valid_fts_languages():
-        raise ValueError(
-            "Unsupported FTS language " + repr(language)
-            + "; must be one of " + repr(valid_fts_languages())
-        )
-
-    column_ddl = _text_search_column_ddl(language)
-    index_name = "ix_vector_chunks_text_search"
-    index_ddl = (
-        "CREATE INDEX IF NOT EXISTS " + index_name
-        + " ON vector_chunks USING GIN (text_search)"
-    )
-
-    logger.info(
-        "Rebuilding vector_chunks.text_search with FTS language={}", language
-    )
-    with engine.begin() as conn:
-        # Drop the old GIN index first; otherwise DROP COLUMN cascades to
-        # it implicitly but the catalog still keeps a dependency record
-        # that occasionally trips concurrent migrations.
-        conn.execute(text("DROP INDEX IF EXISTS " + index_name))
-        conn.execute(
-            text("ALTER TABLE vector_chunks DROP COLUMN IF EXISTS text_search")
-        )
-        conn.execute(
-            text("ALTER TABLE vector_chunks ADD COLUMN text_search " + column_ddl)
-        )
-        conn.execute(text(index_ddl))
-    logger.info("text_search rebuild complete (language={}).", language)
-
-
 def run_migrations(engine: Engine) -> None:
     """Ensure the schema (and pgvector) are up to date. Safe to re-run."""
 
@@ -586,7 +526,7 @@ def run_migrations(engine: Engine) -> None:
     # 4. Additive column changes.
     with engine.begin() as conn:
         for table, column, ddl in _additive_columns():
-            if column in _existing_columns(engine, table):
+            if column in _existing_columns(conn, table):
                 continue
             logger.info("Adding column {}.{}", table, column)
             conn.execute(

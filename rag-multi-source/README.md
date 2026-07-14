@@ -67,6 +67,26 @@ no second hop to a managed vector DB, no two-system consistency problem.
 - **HNSW indexing** (pgvector ≥ 0.5) gives sub-millisecond top-K cosine
   search up to several million rows on a small instance.
 
+### Hybrid search: pick a language per query
+
+Hybrid retrieval (`RETRIEVAL_MODE=hybrid`, the default) fuses vector
+similarity with Postgres full-text search via Reciprocal Rank Fusion. Both
+FTS configs are indexed **permanently and simultaneously** —
+`vector_chunks.text_search_english` and `vector_chunks.text_search_simple`,
+each with its own GIN index — so there's no admin toggle or rebuild step
+to switch between them.
+
+The sidebar's "🔤 Search language" picker lets any user choose, per
+question:
+
+- **english** — stemming + stop-word removal. Best for natural-language
+  prose (a query for "running" also matches "run").
+- **simple** — lower-cases only, no stemming. Best for code-heavy
+  corpora, identifiers, and error codes, where `OAuth2Client` or `XYZ999`
+  needs to match verbatim rather than being stemmed into something else.
+
+Switch any time — no reload, no reindex, no waiting.
+
 ### Multi-tenancy: store-once + dynamic filter
 
 Every resource (Jira ticket, Confluence page, SQL stored proc, Git

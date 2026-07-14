@@ -31,6 +31,7 @@ import streamlit as st
 from loguru import logger
 
 from app.auth import current_user, logout_session
+from app.config import settings
 from app.sidebar_resize import (
     DEFAULT_WIDTH_PX as _SIDEBAR_DEFAULT_WIDTH_PX,
     MAX_WIDTH_PX as _SIDEBAR_MAX_WIDTH_PX,
@@ -46,6 +47,7 @@ from app.utils import (
     revoke_access,
     save_credential,
 )
+from models.migrations import FTS_LANGUAGES
 
 
 # Selection state
@@ -69,6 +71,10 @@ class SelectionState:
     # LLM can call live SQL Server tools (read-only) on top of the RAG
     # context. Off by default — pure-RAG is the safe baseline.
     use_mcp_sql: bool = False
+    # Postgres FTS config used by hybrid retrieval's keyword side, for
+    # this query only. Both "english" and "simple" are always indexed
+    # (models.migrations) — this just picks which one to query.
+    fts_language: str = "english"
 
 
 # Credential form
@@ -495,11 +501,27 @@ def render_sidebar() -> SelectionState:
         )
         inject_sidebar_resize_persistence(force_width_px=force_width)
 
-        # Search-tuning controls (FTS language, etc.) -- folded behind an
-        # expander because most users won't need to touch them, but
-        # surfacing them in the UI lets a code-heavy team flip
-        # english -> simple without redeploying.
-        _render_search_settings()
+        # Search language. Both english and simple are always indexed
+        # (models.migrations), so this is a per-query choice, not an admin
+        # setting -- no rebuild involved either way.
+        state.fts_language = st.selectbox(
+            "🔤 Search language",
+            options=list(FTS_LANGUAGES),
+            index=(
+                list(FTS_LANGUAGES).index(settings.FTS_LANGUAGE)
+                if settings.FTS_LANGUAGE in FTS_LANGUAGES
+                else 0
+            ),
+            key="fts_language_choice",
+            help=(
+                "Postgres text-search configuration used by the hybrid "
+                "retriever's keyword side, for this search only. "
+                "**english** stems and removes stop-words (best for "
+                "prose). **simple** lower-cases only (best for code, "
+                "identifiers, error codes). Both are always indexed — "
+                "switch any time."
+            ),
+        )
 
         st.divider()
 
@@ -788,148 +810,6 @@ def render_sidebar() -> SelectionState:
             _render_audit_log(user["id"])
 
     return state
-
-
-# Search-settings UI
-def _render_search_settings() -> None:
-    """
-    Render the "Search settings" expander.
-
-    Currently exposes a single control: the Postgres FTS language used
-    by hybrid retrieval. english (the default) applies stemming and
-    stop-word removal -- best for natural-language prose. simple
-    lower-cases tokens but otherwise leaves them untouched -- best for
-    code-heavy corpora where 'running' should NOT match 'run' and
-    identifiers like 'OAuth2Client' should be searchable verbatim.
-
-    Changing the language is a system-wide operation: the
-    vector_chunks.text_search generated column has to be rebuilt so the
-    on-disk tsvectors match the language the retriever queries with.
-    We trigger that rebuild from the same button so the UI state and
-    the database state can never drift.
-    """
-    from sqlalchemy.exc import SQLAlchemyError
-
-    from app.utils import init_db
-    from core.runtime_config import (
-        get_fts_language,
-        set_fts_language,
-        valid_fts_languages,
-    )
-    from models.migrations import (
-        detect_text_search_language,
-        rebuild_text_search_column,
-    )
-
-    with st.expander("🔍 Search settings", expanded=False):
-        # One-shot status banner carried across the rerun that follows
-        # a successful rebuild -- st.rerun() otherwise wipes one-shot
-        # messages immediately.
-        pending = st.session_state.pop("_fts_rebuild_status", None)
-        if pending:
-            level, msg = pending
-            if level == "success":
-                st.success(msg)
-            elif level == "error":
-                st.error(msg)
-            elif level == "info":
-                st.info(msg)
-
-        languages = list(valid_fts_languages())
-        current = get_fts_language()
-        try:
-            current_index = languages.index(current)
-        except ValueError:
-            current_index = 0
-
-        # Try to read the language baked into the existing generated
-        # column so the operator can see whether the on-disk state
-        # already matches the runtime setting. Failure (e.g. the
-        # column doesn't exist yet) just hides the indicator.
-        on_disk_language = None
-        try:
-            from app.utils import engine as _engine
-            on_disk_language = detect_text_search_language(_engine)
-        except Exception:  # noqa: BLE001 -- diagnostic only
-            on_disk_language = None
-
-        chosen = st.selectbox(
-            "FTS language",
-            options=languages,
-            index=current_index,
-            key="fts_language_choice",
-            help=(
-                "Postgres text-search configuration used by the hybrid "
-                "retriever's keyword side. **english** stems and "
-                "removes stop-words (best for prose). **simple** "
-                "lower-cases only (best for code, identifiers, error "
-                "codes). Changing this rebuilds the FTS index -- fast "
-                "on small corpora, can take a minute on large ones."
-            ),
-        )
-
-        if on_disk_language and on_disk_language != current:
-            st.caption(
-                "Runtime setting is **" + str(current)
-                + "** but the index on disk was built with **"
-                + str(on_disk_language)
-                + "**. Click *Apply & rebuild* to bring them into sync."
-            )
-        elif on_disk_language:
-            st.caption("On disk: **" + str(on_disk_language) + "** (in sync)")
-
-        needs_rebuild = (
-            chosen != current
-            or (on_disk_language is not None and on_disk_language != chosen)
-        )
-
-        button_label = (
-            "Apply & rebuild FTS index"
-            if needs_rebuild
-            else "Already up to date"
-        )
-        if st.button(
-            button_label,
-            key="fts_apply_rebuild",
-            disabled=not needs_rebuild,
-            use_container_width=True,
-            help=(
-                "Persist the new FTS language and rebuild the "
-                "vector_chunks.text_search generated column + GIN "
-                "index so the on-disk tsvectors match the language "
-                "the retriever queries with."
-            ),
-        ):
-            try:
-                # 1. Persist the override so the retriever and any
-                #    future run_migrations call pick it up.
-                set_fts_language(chosen)
-                # 2. Rebuild the generated column + GIN index.
-                init_db()
-                from app.utils import engine as _engine
-
-                with st.spinner(
-                    "Rebuilding FTS index with language=" + str(chosen) + "..."
-                ):
-                    rebuild_text_search_column(_engine, chosen)
-                st.session_state["_fts_rebuild_status"] = (
-                    "success",
-                    "FTS language set to **" + str(chosen)
-                    + "** and index rebuilt.",
-                )
-            except (ValueError, SQLAlchemyError) as exc:
-                logger.exception("FTS rebuild failed")
-                st.session_state["_fts_rebuild_status"] = (
-                    "error",
-                    "FTS rebuild failed: " + str(exc),
-                )
-            except Exception as exc:  # noqa: BLE001 -- never crash the sidebar
-                logger.exception("FTS rebuild failed (unexpected)")
-                st.session_state["_fts_rebuild_status"] = (
-                    "error",
-                    "FTS rebuild failed unexpectedly: " + str(exc),
-                )
-            st.rerun()
 
 
 # MCP status badge

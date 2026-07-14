@@ -224,6 +224,7 @@ def render_chat(state: SelectionState) -> None:
                     "build_filter",
                     sources=list(state.sources),
                     use_mcp=used_mcp_path,
+                    fts_language=state.fts_language,
                 ) as t_filter:
                     filter_dict = _build_filter(state)
                     t_filter.extra["filter_keys"] = sorted(filter_dict.keys())
@@ -234,7 +235,12 @@ def render_chat(state: SelectionState) -> None:
                     # RLS policies on vector_chunks recognise the
                     # caller. The retriever no-ops the binding when
                     # RLS is disabled.
-                    hits = retrieve(prompt, filter_dict, user_id=user["id"])
+                    hits = retrieve(
+                        prompt,
+                        filter_dict,
+                        user_id=user["id"],
+                        fts_language=state.fts_language,
+                    )
                     t_retr.extra["retrieved_count"] = len(hits)
 
                 history = [
