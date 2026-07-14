@@ -568,6 +568,12 @@ def filter_to_where(filter_dict: dict[str, Any]):
     Turn a :func:`build_query_filter` result into a SQLAlchemy WHERE
     expression. Returns ``None`` when the filter would match nothing
     (caller should short-circuit with an empty result).
+
+    Used by callers that want a single SELECT spanning every enabled
+    source (e.g. analytics / debug paths). The retriever's hot path
+    no longer uses this — it issues one SELECT *per source* via
+    :func:`filter_to_where_for_source` so a dense neighbourhood in one
+    source can't push another source out of the candidate pool.
     """
     by_source: dict[str, list[str]] = (filter_dict or {}).get("by_source") or {}
     if not by_source:
@@ -586,3 +592,27 @@ def filter_to_where(filter_dict: dict[str, Any]):
     if not clauses:
         return None
     return or_(*clauses) if len(clauses) > 1 else clauses[0]
+
+
+def filter_to_where_for_source(filter_dict: dict[str, Any], source: str):
+    """
+    Build a WHERE clause restricted to a single source from a
+    :func:`build_query_filter` result.
+
+    The retriever calls this once per enabled source and runs an
+    independent vector + FTS search per source. That guarantees every
+    selected source contributes candidates regardless of how dense any
+    one source's cluster is near the query embedding — solving the
+    "noisy source X drowns out source Y" problem that ``ef_search``
+    tuning alone can't reliably fix.
+
+    Returns ``None`` when ``source`` is not enabled in ``filter_dict``
+    or has no scope values (caller should skip that source).
+    """
+    by_source: dict[str, list[str]] = (filter_dict or {}).get("by_source") or {}
+    scope_values = by_source.get(source)
+    col_name = _FILTER_COLUMNS_BY_SOURCE.get(source)
+    if not col_name or not scope_values:
+        return None
+    column = getattr(VectorChunk, col_name)
+    return (VectorChunk.source == source) & column.in_(scope_values)

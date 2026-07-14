@@ -45,3 +45,6 @@ token.json
 # MCP server runtime state — pid + auth token are regenerated on every boot
 .streamlit/mcp/
 
+
+# Runtime-mutable settings overrides written from the sidebar UI
+.runtime_config.json

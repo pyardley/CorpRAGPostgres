@@ -1221,4 +1221,215 @@ Operationally:
   to a snippet length (e.g. 200) or set it to `0` to skip the prompt
   entirely; the timing/cost columns remain useful on their own.
 * **Retention.** Both tables are append-only. A per-month estimate at
-  
+  ~1 KB per audit row + ~6 step rows × ~0.3 KB each gives roughly
+  3 KB per prompt. 10 000 prompts/month ≈ 30 MB. Add a nightly
+  `DELETE FROM query_audit_logs WHERE timestamp < NOW() - INTERVAL
+  '90 days'` (the FK on `query_step_timings` cascades) once the
+  archive policy is decided.
+* **Encryption at rest.** If your Postgres host doesn't already
+  encrypt at rest, the same `cryptography.Fernet` machinery used for
+  credentials in [`app/utils.py`](app/utils.py) can be applied to
+  `prompt_text` — keep the audit row queryable for cost/duration
+  metrics while keeping the prompt body opaque to a casual DB read.
+
+---
+
+## Hybrid RAG + MCP (Live SQL Server table data)
+
+CorporateRAG also ships a **Model-Context-Protocol-style server** that
+gives the chat agent safe, read-only, _live_ access to SQL Server table
+rows — on top of the existing RAG over schemas / stored-procedure code.
+
+```
+┌──────────── Streamlit chat ─────────────┐
+│  Q: "Show me the last 5 orders for      │
+│      customer 12345"                    │
+│  ┌─────────────────────────────────┐    │
+│  │ RAG retriever (pgvector)        │────┼──▶ schema/proc context
+│  │ + MCP tools (bound to LLM)      │────┼──▶ live row data
+│  └─────────────────────────────────┘    │
+│              │                          │
+│              ▼  bind_tools()            │
+│           OpenAI / Claude / Grok        │
+└─────────────────────────────────────────┘
+                │
+                ▼  HTTP+token (loopback)
+┌──────────── mcp_server (FastAPI) ───────┐
+│  POST /mcp/tools/sql_table_query        │
+│   • single-statement SELECT validator   │
+│   • TOP-N injection (≤ MCP_SQL_MAX_ROWS)│
+│   • per-user ODBC creds + USE [db]      │
+│   • per-statement timeout, full audit   │
+│  POST /mcp/tools/sql_list_databases     │
+└─────────────────────────────────────────┘
+```
+
+### What changed (code map)
+
+| Path                            | Purpose                                        |
+| ------------------------------- | ---------------------------------------------- |
+| `mcp_server/server.py`          | FastAPI app exposing MCP-style tool endpoints  |
+| `mcp_server/tools/sql_tools.py` | Read-only SELECT validator + executor          |
+| `mcp_server/config.py`          | `MCP_HOST` / `MCP_PORT` / row caps / token     |
+| `core/mcp_client.py`            | `httpx` client + LangChain `StructuredTool`s   |
+| `app/mcp_manager.py`            | Spawns/health-checks the MCP child process     |
+| `core/mcp_chain.py`             | Hybrid answerer: RAG context + bound MCP tools |
+| `app/sidebar.py`                | "⚡ Use Live SQL Table Data (MCP)" toggle      |
+| `app/chat.py`                   | Routes through `core.mcp_chain` when toggle on |
+| `app/main.py`                   | `ensure_mcp_running()` on first auth load      |
+
+### Safety guarantees (enforced server-side)
+
+- **Read-only.** Queries are tokenised with `sqlparse`; only a single
+  `SELECT` (or `WITH ... SELECT` CTE) is accepted. Any of
+  `INSERT/UPDATE/DELETE/MERGE/DROP/CREATE/ALTER/TRUNCATE/EXEC/EXECUTE/GRANT/REVOKE/BACKUP/RESTORE/sp_*/xp_*/fn_*/USE/GO/DBCC` rejects the request.
+- **Hard row cap.** `TOP (n)` is injected if missing, and the whole
+  query is wrapped in `SELECT TOP (n) * FROM (...)` to defeat
+  cleverness. `n ≤ MCP_SQL_MAX_ROWS` (default 100).
+- **Per-statement timeout.** `MCP_SQL_QUERY_TIMEOUT_SECONDS` (default 15s).
+- **Tenancy.** Every call requires `user_id`; the tool refuses to run
+  unless the user has a row for that database in
+  `user_accessible_resources` (i.e. they ran a SQL ingestion under
+  their account).
+- **Auditable.** Every call is logged via loguru with user, database,
+  query, row count and duration.
+- **Token-protected.** All `/mcp/*` endpoints require an `X-MCP-Token`
+  header. The Streamlit manager auto-generates one per process and
+  pins it to `.streamlit/mcp/token`.
+
+### Running the MCP server
+
+The Streamlit app starts it for you on first authenticated load. To run
+it standalone (e.g. for a separate microservice deployment):
+
+```bash
+# Set a stable token so other clients can connect
+export MCP_SHARED_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+
+# Start the server
+python -m mcp_server.server
+# or:
+uvicorn mcp_server.server:app --host 127.0.0.1 --port 8765
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8765/healthz
+```
+
+Tool discovery:
+
+```bash
+curl -H "X-MCP-Token: $MCP_SHARED_TOKEN" http://127.0.0.1:8765/mcp/tools
+```
+
+Manual table query:
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/mcp/tools/sql_table_query \
+    -H "X-MCP-Token: $MCP_SHARED_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{
+          "user_id": "<user-uuid>",
+          "db_name": "customerdb",
+          "query": "SELECT TOP 5 * FROM dbo.Orders ORDER BY OrderDate DESC",
+          "max_rows": 5
+        }' | jq
+```
+
+### Using it from the chat
+
+1. Sign in to Streamlit.
+2. Sidebar → **SQL Server** → tick **Use Live SQL Table Data (MCP)**.
+3. Confirm the green "🟢 MCP: connected …" status line.
+4. Ask a row-data question, e.g.
+   _"What were the last 10 errors in dbo.AuditLog?"_ — the agent will
+   call `sql_table_query`, you'll see a markdown result table inline,
+   and the Sources list will show a "⚡ SQL (live, MCP)" entry alongside
+   any RAG citations.
+
+The toggle is **off by default** so the existing pure-RAG behaviour is
+unchanged for everyone who doesn't opt in.
+
+### Configuration (`.env`)
+
+| Variable                        | Default       | Purpose                                     |
+| ------------------------------- | ------------- | ------------------------------------------- |
+| `MCP_HOST`                      | `127.0.0.1`   | Bind address                                |
+| `MCP_PORT`                      | `8765`        | Bind port                                   |
+| `MCP_SHARED_TOKEN`              | _(generated)_ | Stable token; if unset, auto per-process    |
+| `MCP_SQL_MAX_ROWS`              | `100`         | Hard row cap                                |
+| `MCP_SQL_DEFAULT_ROWS`          | `50`          | Default row cap when caller doesn't specify |
+| `MCP_SQL_QUERY_TIMEOUT_SECONDS` | `15`          | Per-statement timeout                       |
+| `MCP_LOG_LEVEL`                 | `INFO`        | loguru level for the MCP server             |
+
+### Future-proofing: adding MCP for Git / Confluence / Jira
+
+The package layout is deliberately source-pluggable. To add a new
+source:
+
+1. Create `mcp_server/tools/<source>_tools.py` exposing
+   `TOOL_SPECS` + handler functions (mirror `sql_tools.py`).
+2. Wire two endpoints into `mcp_server/server.py` —
+   `POST /mcp/tools/<source>_<tool>`.
+3. Add typed methods on `core.mcp_client.MCPClient` and corresponding
+   `StructuredTool` factories in `build_mcp_tools()`.
+4. Optional: add a sidebar toggle on the same pattern as the SQL one
+   (`SelectionState.use_mcp_<source>` + chat-layer switch).
+
+The on-the-wire format is already MCP-compatible (tools with
+`name` / `description` / `input_schema`), so swapping HTTP for
+`langchain-mcp-adapters` / Anthropic's stdio transport later is a
+transport change, not a redesign.
+
+---
+
+## Possible enhancements
+
+Things this codebase deliberately does not do today, listed in roughly
+ascending order of effort.
+
+### 1. Live source-system ACL re-validation at query time
+
+Today the access table is the only thing standing between users and
+resources. A natural hardening is to have the chat layer call back into
+each source on every query and intersect the live ACL with the granted
+scopes (Jira `/rest/api/3/permissions/project`, Confluence `space`
+permissions, SQL Server `HAS_DBACCESS`, GitHub `/repos/.../collaborators/.../permission`).
+Adds a per-query API hit (use a short-TTL session cache) but closes the
+"permissions changed at the source" gap.
+
+### 2. Per-chunk visibility (issue / page-level granularity)
+
+The current model is at _project / space / database / repo+branch_
+granularity. For chunk-level controls (e.g. a single Jira issue restricted
+inside an otherwise-public project), capture per-resource ACL during
+ingestion and AND it into the retriever filter.
+
+### 3. Background / scheduled ingestion
+
+A small scheduler (cron, Celery beat, GitHub Actions, the Cowork
+`schedule` skill) running
+`python -m app.ingestion.cli --source all --mode incremental` keeps the
+index fresh without anybody clicking buttons.
+
+### 4. Hybrid search (BM25 + cosine)
+
+Postgres makes this trivial: add a `tsvector` column on `vector_chunks`,
+GIN-index it, and combine `ts_rank` + `1 - (embedding <=> :q)` as the
+final score. Often a measurable improvement for keyword-heavy queries
+(error codes, IDs, exact phrases).
+
+### 5. Reranking with a cross-encoder
+
+A second-stage cross-encoder reranker (e.g. `bge-reranker-base`) over the
+top-50 from pgvector, returning the top-8 to the LLM. Tens of milliseconds
+of latency; meaningful accuracy bump on tricky retrievals.
+
+### 6. Streaming LLM responses
+
+`render_chat` currently calls `llm.invoke()` and renders the full answer
+once it returns. Switching to `llm.stream()` and `st.write_stream()`
+gives a typewriter-style response and noticeably improves perceived
+latency on long answers.

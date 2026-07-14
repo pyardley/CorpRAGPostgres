@@ -48,9 +48,10 @@ class UserCredential(Base):
 
     id = Column(String(36), primary_key=True, default=_new_uuid)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
-    # source: "jira" | "confluence" | "sql"
+    # source: "jira" | "confluence" | "sql" | "git" | "email"
     source = Column(String(50), nullable=False)
-    # credential_key: "url" | "email" | "api_token" | "conn_str" | "db_name"
+    # credential_key: "url" | "email" | "api_token" | "conn_str" | "db_name" |
+    # "access_token" | "url_2".."url_9" (multi-instance sources: git, confluence)
     credential_key = Column(String(100), nullable=False)
     encrypted_value = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

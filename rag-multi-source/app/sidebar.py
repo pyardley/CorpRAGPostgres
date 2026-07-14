@@ -171,13 +171,21 @@ def _credential_form(
             saved: list[str] = []
             cleared: list[str] = []
             with get_db() as db:
-                for field_key, _label, _is_secret in fields:
+                for field_key, _label, is_secret in fields:
                     val = values[field_key].strip()
                     if val:
                         # New value typed — overrides any "clear" tick.
                         save_credential(db, user["id"], source, field_key, val)
                         saved.append(field_key)
-                    elif clears.get(field_key):
+                    elif is_secret:
+                        if clears.get(field_key):
+                            if delete_credential(db, user["id"], source, field_key):
+                                cleared.append(field_key)
+                    else:
+                        # Non-secret fields are pre-filled with the existing
+                        # value, so a blank box here means the user
+                        # deliberately cleared it — treat that as removal
+                        # rather than a no-op.
                         if delete_credential(db, user["id"], source, field_key):
                             cleared.append(field_key)
             parts: list[str] = []
@@ -200,6 +208,88 @@ def _credential_form(
                     f"left blank. (Existing values preserved.)",
                 )
             st.rerun()
+
+
+# Additional Git repositories (dynamic list)
+_MAX_GIT_REPOS = 9  # matches GitIngestor._make_repos() suffix ceiling ("" + _2.._9)
+
+
+def _render_git_repo_list(user_id: str) -> None:
+    """
+    Render an expandable, add/remove-able list of additional Git repos.
+
+    The primary repo (``url``/``access_token``) is configured by the form
+    above this. Each additional repo reuses the same ``url_N``/
+    ``access_token_N`` credential-key convention that
+    ``GitIngestor._make_repos()`` already reads (N = 2..9) — this widget is
+    purely a UI convenience over that existing storage, no new schema.
+    """
+    with get_db() as db:
+        existing = load_all_credentials(db, user_id, "git")
+
+    # Show a row for every slot that already has a saved URL, plus one
+    # empty row to add the next repo — so previously configured repos
+    # (e.g. set up before this UI existed, or via the CLI) are never
+    # hidden on load.
+    highest_configured = 1
+    for i in range(2, _MAX_GIT_REPOS + 1):
+        if existing.get(f"url_{i}"):
+            highest_configured = i
+    default_rows = max(highest_configured - 1, 1)
+
+    rows_key = "git_extra_repo_rows"
+    if rows_key not in st.session_state:
+        st.session_state[rows_key] = default_rows
+    rows = min(st.session_state[rows_key], _MAX_GIT_REPOS - 1)
+
+    with st.expander(
+        f"Additional Git repositories ({rows} slot{'s' if rows != 1 else ''})",
+        expanded=rows > 0,
+    ):
+        st.caption(
+            "Each row is a separate repository. Leave the PAT blank to "
+            "reuse the primary token above. To remove a repository, clear "
+            "its URL field and save."
+        )
+        for i in range(2, 2 + rows):
+            _credential_form(
+                "git",
+                [
+                    (f"url_{i}", f"Repository {i} URL", False),
+                    (f"access_token_{i}", "PAT (blank = reuse primary)", True),
+                ],
+                form_key=f"creds_git_{i}",
+            )
+
+        col_add, col_remove = st.columns(2)
+        with col_add:
+            if st.button(
+                "➕ Add another repository",
+                disabled=rows >= _MAX_GIT_REPOS - 1,
+                use_container_width=True,
+                key="git_add_repo_row",
+            ):
+                st.session_state[rows_key] = min(rows + 1, _MAX_GIT_REPOS - 1)
+                st.rerun()
+        with col_remove:
+            if st.button(
+                "➖ Remove last slot",
+                disabled=rows <= 1,
+                use_container_width=True,
+                key="git_remove_repo_row",
+            ):
+                last_idx = 1 + rows
+                with get_db() as db:
+                    delete_credential(db, user_id, "git", f"url_{last_idx}")
+                    delete_credential(db, user_id, "git", f"access_token_{last_idx}")
+                st.session_state[rows_key] = max(rows - 1, 1)
+                st.rerun()
+
+        if rows >= _MAX_GIT_REPOS - 1:
+            st.caption(
+                f"Maximum of {_MAX_GIT_REPOS} repositories total "
+                f"(1 primary + {_MAX_GIT_REPOS - 1} additional)."
+            )
 
 
 # Ingestion trigger (synchronous, with live progress via st.status)
@@ -354,6 +444,12 @@ def render_sidebar() -> SelectionState:
             ),
         )
 
+        # Search-tuning controls (FTS language, etc.) -- folded behind an
+        # expander because most users won't need to touch them, but
+        # surfacing them in the UI lets a code-heavy team flip
+        # english -> simple without redeploying.
+        _render_search_settings()
+
         st.divider()
 
         # Source toggles + scope pickers
@@ -462,14 +558,19 @@ def render_sidebar() -> SelectionState:
 
             with tab_g:
                 st.caption(
-                    "Connect a GitHub repository. For private repos create a "
-                    "Personal Access Token with **repo** scope at "
-                    "github.com - Settings - Developer settings."
+                    "Connect one or more GitHub repositories. For private "
+                    "repos create a Personal Access Token with **repo** "
+                    "scope at github.com - Settings - Developer settings."
                 )
                 _credential_form(
                     "git",
                     [
-                        ("url", "Repository URL (https://github.com/owner/repo)", False),
+                        (
+                            "url",
+                            "Primary repository URL "
+                            "(https://github.com/owner/repo)",
+                            False,
+                        ),
                         ("access_token", "Personal Access Token", True),
                         (
                             "file_extensions",
@@ -480,15 +581,7 @@ def render_sidebar() -> SelectionState:
                         ("max_commits", "Max commits per branch (default 200)", False),
                     ],
                 )
-                with st.expander("Additional Git repository (optional)"):
-                    _credential_form(
-                        "git",
-                        [
-                            ("url_2", "Second repo URL", False),
-                            ("access_token_2", "PAT (blank = reuse primary)", True),
-                        ],
-                        form_key="creds_git_2",
-                    )
+                _render_git_repo_list(user["id"])
 
             with tab_e:
                 st.caption(
@@ -644,6 +737,148 @@ def render_sidebar() -> SelectionState:
             _render_audit_log(user["id"])
 
     return state
+
+
+# Search-settings UI
+def _render_search_settings() -> None:
+    """
+    Render the "Search settings" expander.
+
+    Currently exposes a single control: the Postgres FTS language used
+    by hybrid retrieval. english (the default) applies stemming and
+    stop-word removal -- best for natural-language prose. simple
+    lower-cases tokens but otherwise leaves them untouched -- best for
+    code-heavy corpora where 'running' should NOT match 'run' and
+    identifiers like 'OAuth2Client' should be searchable verbatim.
+
+    Changing the language is a system-wide operation: the
+    vector_chunks.text_search generated column has to be rebuilt so the
+    on-disk tsvectors match the language the retriever queries with.
+    We trigger that rebuild from the same button so the UI state and
+    the database state can never drift.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.utils import init_db
+    from core.runtime_config import (
+        get_fts_language,
+        set_fts_language,
+        valid_fts_languages,
+    )
+    from models.migrations import (
+        detect_text_search_language,
+        rebuild_text_search_column,
+    )
+
+    with st.expander("🔍 Search settings", expanded=False):
+        # One-shot status banner carried across the rerun that follows
+        # a successful rebuild -- st.rerun() otherwise wipes one-shot
+        # messages immediately.
+        pending = st.session_state.pop("_fts_rebuild_status", None)
+        if pending:
+            level, msg = pending
+            if level == "success":
+                st.success(msg)
+            elif level == "error":
+                st.error(msg)
+            elif level == "info":
+                st.info(msg)
+
+        languages = list(valid_fts_languages())
+        current = get_fts_language()
+        try:
+            current_index = languages.index(current)
+        except ValueError:
+            current_index = 0
+
+        # Try to read the language baked into the existing generated
+        # column so the operator can see whether the on-disk state
+        # already matches the runtime setting. Failure (e.g. the
+        # column doesn't exist yet) just hides the indicator.
+        on_disk_language = None
+        try:
+            from app.utils import engine as _engine
+            on_disk_language = detect_text_search_language(_engine)
+        except Exception:  # noqa: BLE001 -- diagnostic only
+            on_disk_language = None
+
+        chosen = st.selectbox(
+            "FTS language",
+            options=languages,
+            index=current_index,
+            key="fts_language_choice",
+            help=(
+                "Postgres text-search configuration used by the hybrid "
+                "retriever's keyword side. **english** stems and "
+                "removes stop-words (best for prose). **simple** "
+                "lower-cases only (best for code, identifiers, error "
+                "codes). Changing this rebuilds the FTS index -- fast "
+                "on small corpora, can take a minute on large ones."
+            ),
+        )
+
+        if on_disk_language and on_disk_language != current:
+            st.caption(
+                "Runtime setting is **" + str(current)
+                + "** but the index on disk was built with **"
+                + str(on_disk_language)
+                + "**. Click *Apply & rebuild* to bring them into sync."
+            )
+        elif on_disk_language:
+            st.caption("On disk: **" + str(on_disk_language) + "** (in sync)")
+
+        needs_rebuild = (
+            chosen != current
+            or (on_disk_language is not None and on_disk_language != chosen)
+        )
+
+        button_label = (
+            "Apply & rebuild FTS index"
+            if needs_rebuild
+            else "Already up to date"
+        )
+        if st.button(
+            button_label,
+            key="fts_apply_rebuild",
+            disabled=not needs_rebuild,
+            use_container_width=True,
+            help=(
+                "Persist the new FTS language and rebuild the "
+                "vector_chunks.text_search generated column + GIN "
+                "index so the on-disk tsvectors match the language "
+                "the retriever queries with."
+            ),
+        ):
+            try:
+                # 1. Persist the override so the retriever and any
+                #    future run_migrations call pick it up.
+                set_fts_language(chosen)
+                # 2. Rebuild the generated column + GIN index.
+                init_db()
+                from app.utils import engine as _engine
+
+                with st.spinner(
+                    "Rebuilding FTS index with language=" + str(chosen) + "..."
+                ):
+                    rebuild_text_search_column(_engine, chosen)
+                st.session_state["_fts_rebuild_status"] = (
+                    "success",
+                    "FTS language set to **" + str(chosen)
+                    + "** and index rebuilt.",
+                )
+            except (ValueError, SQLAlchemyError) as exc:
+                logger.exception("FTS rebuild failed")
+                st.session_state["_fts_rebuild_status"] = (
+                    "error",
+                    "FTS rebuild failed: " + str(exc),
+                )
+            except Exception as exc:  # noqa: BLE001 -- never crash the sidebar
+                logger.exception("FTS rebuild failed (unexpected)")
+                st.session_state["_fts_rebuild_status"] = (
+                    "error",
+                    "FTS rebuild failed unexpectedly: " + str(exc),
+                )
+            st.rerun()
 
 
 # MCP status badge

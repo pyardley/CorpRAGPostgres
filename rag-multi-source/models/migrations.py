@@ -11,12 +11,12 @@ Exposes `run_migrations(engine)` which:
   4. Applies any additive ``ALTER TABLE`` column changes listed in
      ``_ADDITIVE_COLUMNS`` (still best-effort, no down-migration support).
   5. Creates additive indexes (composite / partial) listed in
-     ``_ADDITIVE_INDEXES`` — used for query-shape-specific tuning that
+     ``_ADDITIVE_INDEXES`` -- used for query-shape-specific tuning that
      SQLAlchemy's column-decl indexes don't cover.
   6. Optionally applies Row-Level Security policies on ``vector_chunks``
      and ``user_accessible_resources`` (gated on ``settings.ENABLE_RLS``).
      Policies key on the per-session GUC ``app.current_user_id`` set by
-     :func:`app.utils.set_current_user_for_rls` — see the
+     :func:`app.utils.set_current_user_for_rls` -- see the
      ``_apply_rls_policies`` block below for the full SQL.
 
 Called from ``app.utils.init_db()`` on every Streamlit / CLI startup, so a
@@ -33,44 +33,77 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 from app.config import settings
+from core.runtime_config import get_fts_language, valid_fts_languages
 from models.base import Base
+
+
+def _text_search_column_ddl(language: str) -> str:
+    """
+    Build the ``tsvector GENERATED ALWAYS AS (...) STORED`` DDL for the
+    ``vector_chunks.text_search`` column with the given Postgres FTS
+    language config.
+
+    The language must be one of :func:`core.runtime_config.valid_fts_languages`
+    because it's interpolated directly into the DDL string --
+    ``to_tsvector`` only counts as immutable (and is therefore allowed
+    in a generated column) when its first argument is a regconfig
+    literal, not a parameter binding. The whitelist is the safety
+    boundary against SQL injection here.
+    """
+    if language not in valid_fts_languages():
+        raise ValueError(
+            f"Unsupported FTS language {language!r}; must be one of "
+            f"{valid_fts_languages()}"
+        )
+    return (
+        "tsvector GENERATED ALWAYS AS ("
+        f"setweight(to_tsvector('{language}', coalesce(title, '')), 'A') || "
+        f"setweight(to_tsvector('{language}', coalesce(text, '')), 'B')"
+        ") STORED"
+    )
 
 
 # (table_name, column_name, column_ddl). Example:
 #   ("users", "is_admin", "BOOLEAN NOT NULL DEFAULT FALSE")
-_ADDITIVE_COLUMNS: Iterable[tuple[str, str, str]] = (
-    # Email source — added after the original 4-source schema was deployed.
-    # Nullable so existing rows (jira/confluence/sql/git) stay valid.
-    ("vector_chunks", "email_provider", "VARCHAR(32) NULL"),
-    # Content fingerprint (SHA-256 hex) — OB1-inspired dedup. Nullable
-    # so existing rows are valid; the next re-ingest backfills them.
-    # CHAR(64) is exact-fit for a SHA-256 hex digest.
-    ("vector_chunks", "content_fingerprint", "CHAR(64) NULL"),
-    # Hybrid retrieval — Postgres full-text search vector. Generated
-    # column kept in sync automatically by Postgres on every INSERT /
-    # UPDATE, so the application write path is unchanged. ``setweight``
-    # gives title matches a stronger weight ('A') than body matches
-    # ('B'); ``ts_rank_cd`` honours those weights at query time.
-    # ``coalesce`` keeps the expression total over NULL columns so the
-    # generated column is never NULL.
-    #
-    # NB: the language config is hard-coded to ``english`` here because
-    # generated-column expressions must be immutable, and ``to_tsvector``
-    # is only treated as immutable when its first argument is a regclass
-    # literal. If you change ``FTS_LANGUAGE`` in settings you must also
-    # rebuild this column with the matching language — drop it, change
-    # this DDL, and re-run migrations.
-    (
-        "vector_chunks",
-        "text_search",
-        "tsvector GENERATED ALWAYS AS ("
-        "setweight(to_tsvector('english', coalesce(title, '')), 'A') || "
-        "setweight(to_tsvector('english', coalesce(text, '')), 'B')"
-        ") STORED",
-    ),
-)
+#
+# NB: this is built lazily inside ``run_migrations`` so the
+# ``text_search`` column DDL picks up the current runtime FTS language
+# (overridable via the sidebar UI; falls back to ``settings.FTS_LANGUAGE``).
+def _additive_columns() -> tuple[tuple[str, str, str], ...]:
+    return (
+        # Email source -- added after the original 4-source schema was
+        # deployed. Nullable so existing rows (jira/confluence/sql/git)
+        # stay valid.
+        ("vector_chunks", "email_provider", "VARCHAR(32) NULL"),
+        # Content fingerprint (SHA-256 hex) -- OB1-inspired dedup. Nullable
+        # so existing rows are valid; the next re-ingest backfills them.
+        # CHAR(64) is exact-fit for a SHA-256 hex digest.
+        ("vector_chunks", "content_fingerprint", "CHAR(64) NULL"),
+        # Hybrid retrieval -- Postgres full-text search vector. Generated
+        # column kept in sync automatically by Postgres on every INSERT /
+        # UPDATE, so the application write path is unchanged. ``setweight``
+        # gives title matches a stronger weight ('A') than body matches
+        # ('B'); ``ts_rank_cd`` honours those weights at query time.
+        # ``coalesce`` keeps the expression total over NULL columns so the
+        # generated column is never NULL.
+        #
+        # The language config is interpolated from ``get_fts_language()`` --
+        # generated-column expressions must be immutable, and ``to_tsvector``
+        # is only treated as immutable when its first argument is a regconfig
+        # literal, so we substitute the language at DDL-build time. If the
+        # user changes the language via the UI, ``rebuild_text_search_column``
+        # drops + recreates this column (and its GIN index) with the new
+        # language so the on-disk tsvectors and the query-time
+        # ``websearch_to_tsquery`` agree.
+        (
+            "vector_chunks",
+            "text_search",
+            _text_search_column_ddl(get_fts_language()),
+        ),
+    )
 
-# (index_name, table_name, ddl). Idempotent — checked via _index_exists.
+
+# (index_name, table_name, ddl). Idempotent -- checked via _index_exists.
 _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
     (
         "ix_vector_chunks_email_provider",
@@ -79,7 +112,7 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "ON vector_chunks (email_provider) "
         "WHERE email_provider IS NOT NULL",
     ),
-    # ── Audit logging indexes ───────────────────────────────────────────
+    # -- Audit logging indexes ----------------------------------------------
     # SQLAlchemy already declares these via Index(...) in the model
     # files, but listing them here as well keeps the migration robust
     # against models being imported in a different order or being
@@ -114,7 +147,7 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "CREATE INDEX IF NOT EXISTS ix_query_step_timings_step_duration "
         "ON query_step_timings (step_name, duration_ms)",
     ),
-    # ── Content fingerprint dedup (OB1-inspired) ────────────────────────
+    # -- Content fingerprint dedup (OB1-inspired) ---------------------------
     # Equality lookup on the SHA-256 hex; partial so the index only
     # carries rows that have been processed by the new fingerprint code
     # path (fresh ingests + any row touched after the migration).
@@ -125,12 +158,12 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "ON vector_chunks (content_fingerprint) "
         "WHERE content_fingerprint IS NOT NULL",
     ),
-    # ── Hybrid retrieval (Postgres FTS) ─────────────────────────────────
+    # -- Hybrid retrieval (Postgres FTS) ------------------------------------
     # GIN index over the generated ``text_search`` tsvector column drives
     # the keyword side of hybrid retrieval (``core.retriever`` runs an
     # FTS query in parallel with the vector search and fuses the results
     # via Reciprocal Rank Fusion). GIN scales linearly with the corpus
-    # and is the standard pgsql FTS index — no extension required.
+    # and is the standard pgsql FTS index -- no extension required.
     (
         "ix_vector_chunks_text_search",
         "vector_chunks",
@@ -140,7 +173,7 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
 )
 
 
-# ── Row-Level Security (defence-in-depth) ─────────────────────────────────
+# -- Row-Level Security (defence-in-depth) ---------------------------------
 #
 # The application-layer ``WHERE`` clause built from
 # ``user_accessible_resources`` is still the primary tenancy boundary.
@@ -149,7 +182,7 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
 # ``filter_to_where`` or a naked ``SELECT * FROM vector_chunks`` from a
 # misbehaving script can't leak chunks across tenants.
 #
-# Each policy reads ``current_setting('app.current_user_id', true)`` —
+# Each policy reads ``current_setting('app.current_user_id', true)`` --
 # the trailing ``true`` makes the GUC missing-safe (returns NULL rather
 # than raising) so admin tooling that hasn't called
 # ``set_current_user_for_rls`` simply sees no rows. The app's
@@ -157,7 +190,7 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
 # scoped to the active transaction and never leaks across pooled
 # connections.
 #
-# ``BYPASSRLS`` is intentionally NOT granted — superuser-only by default.
+# ``BYPASSRLS`` is intentionally NOT granted -- superuser-only by default.
 # An operator who needs to run admin SQL ad-hoc should either bypass
 # via psql as the DB owner (default behaviour) or set the GUC manually.
 
@@ -171,7 +204,7 @@ _RLS_STATEMENTS: tuple[tuple[str, str], ...] = (
         "user_accessible_resources_enable_rls",
         "ALTER TABLE user_accessible_resources ENABLE ROW LEVEL SECURITY",
     ),
-    # 2. SELECT policy on vector_chunks — only allow rows whose
+    # 2. SELECT policy on vector_chunks -- only allow rows whose
     #    (source, per-source identifier) appears in the current user's
     #    user_accessible_resources rows. The COALESCE picks the one
     #    populated identifier column for the row (project_key /
@@ -199,7 +232,7 @@ _RLS_STATEMENTS: tuple[tuple[str, str], ...] = (
         )
         """,
     ),
-    # 3. Write policies on vector_chunks — ingestion runs under the
+    # 3. Write policies on vector_chunks -- ingestion runs under the
     #    same DB role as the chat layer, so we let any authenticated
     #    user (i.e. one with the GUC set) write. Tenancy of writes is
     #    enforced at app-level by BaseIngestor.run() / grant_access()
@@ -232,7 +265,7 @@ _RLS_STATEMENTS: tuple[tuple[str, str], ...] = (
         USING (current_setting('app.current_user_id', true) IS NOT NULL)
         """,
     ),
-    # 4. user_accessible_resources — a user only sees / mutates their
+    # 4. user_accessible_resources -- a user only sees / mutates their
     #    own grant rows. Same GUC-driven pattern.
     (
         "uar_select_policy",
@@ -270,7 +303,7 @@ _RLS_STATEMENTS: tuple[tuple[str, str], ...] = (
 )
 
 
-# Names of the policies created above — used so we can detect "already
+# Names of the policies created above -- used so we can detect "already
 # applied" and avoid the noisy ``DuplicateObject`` errors that would
 # otherwise fire on every restart. Maps policy name -> table name.
 _RLS_POLICY_NAMES: dict[str, str] = {
@@ -310,7 +343,7 @@ def _index_exists(engine: Engine, table: str, index_name: str) -> bool:
     uniqueness on.
 
     Note: the ``table`` parameter is retained for signature stability
-    but no longer used in the lookup — index names are unique per
+    but no longer used in the lookup -- index names are unique per
     schema, not per table, which is exactly the constraint we're
     trying to honour.
     """
@@ -361,7 +394,7 @@ def _rls_enabled(engine: Engine, table: str) -> bool:
 def _apply_rls_policies(engine: Engine) -> None:
     """
     Enable RLS + create the tenancy policies on ``vector_chunks`` and
-    ``user_accessible_resources``. Idempotent — skips ENABLE if already
+    ``user_accessible_resources``. Idempotent -- skips ENABLE if already
     on, and skips CREATE POLICY for any policy already present in
     ``pg_policies``.
 
@@ -376,7 +409,7 @@ def _apply_rls_policies(engine: Engine) -> None:
     table_names = set(inspector.get_table_names())
     if "vector_chunks" not in table_names or "user_accessible_resources" not in table_names:
         logger.warning(
-            "RLS skipped — required tables not yet present "
+            "RLS skipped -- required tables not yet present "
             "(this is expected on the very first bootstrap call)."
         )
         return
@@ -401,7 +434,7 @@ def _apply_rls_policies(engine: Engine) -> None:
                 table = _RLS_POLICY_NAMES.get(policy_name)
                 if table is None:
                     logger.warning(
-                        "Unknown RLS policy {} — applying without idempotency check",
+                        "Unknown RLS policy {} -- applying without idempotency check",
                         policy_name,
                     )
                 elif _policy_exists(engine, table, policy_name):
@@ -417,7 +450,7 @@ def drop_rls_policies(engine: Engine) -> None:
     Tear down every policy this module installs and disable RLS on the
     affected tables. Useful for tests, for backing out the feature on a
     single deployment, or for an admin who needs ad-hoc bypass without
-    setting the GUC. Not called by ``run_migrations`` — invoke manually
+    setting the GUC. Not called by ``run_migrations`` -- invoke manually
     from a one-off script when needed.
     """
     with engine.begin() as conn:
@@ -431,6 +464,90 @@ def drop_rls_policies(engine: Engine) -> None:
             conn.execute(
                 text(f'ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY')
             )
+
+
+def detect_text_search_language(engine: Engine) -> str | None:
+    """
+    Best-effort introspection of the language baked into the existing
+    ``vector_chunks.text_search`` generated column.
+
+    Returns one of :func:`core.runtime_config.valid_fts_languages`, or
+    ``None`` if the column doesn't exist yet, isn't generated, or its
+    expression doesn't match the known shape (e.g. it was rebuilt by
+    hand). The UI uses this purely for display ("on disk: english") --
+    a missing answer just hides the indicator, never blocks a rebuild.
+    """
+    sql = text(
+        "SELECT pg_get_expr(adbin, adrelid) "
+        "FROM pg_attribute a "
+        "JOIN pg_attrdef d ON d.adrelid = a.attrelid "
+        "                 AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'vector_chunks'::regclass "
+        "  AND a.attname = 'text_search'"
+    )
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(sql).first()
+    except Exception:  # noqa: BLE001 -- column / table may not exist yet
+        return None
+    if not row or not row[0]:
+        return None
+    expr = str(row[0])
+    for lang in valid_fts_languages():
+        # Match the literal regconfig used by ``_text_search_column_ddl`` --
+        # ``to_tsvector('<lang>', ...)``.
+        if f"to_tsvector('{lang}'" in expr:
+            return lang
+    return None
+
+
+def rebuild_text_search_column(engine: Engine, language: str) -> None:
+    """
+    Drop and recreate vector_chunks.text_search (and its GIN index)
+    bound to the given Postgres FTS language config.
+
+    Called from the sidebar when an admin changes the FTS language so
+    the on-disk tsvectors are regenerated with the new language rules
+    (stemming + stop-words for english, lower-case-only for simple).
+    Postgres recomputes the generated column for every existing row
+    as part of ADD COLUMN, so this is a one-shot operation -- no data
+    loss, no application-side backfill needed.
+
+    The whole rebuild runs in a single transaction so a failure half
+    way through (out of disk, lock contention) leaves the database in
+    its previous coherent state -- either the old column + index
+    survives, or the new one is fully built. There is never a
+    transient state where queries can see a missing text_search column.
+    """
+    if language not in valid_fts_languages():
+        raise ValueError(
+            "Unsupported FTS language " + repr(language)
+            + "; must be one of " + repr(valid_fts_languages())
+        )
+
+    column_ddl = _text_search_column_ddl(language)
+    index_name = "ix_vector_chunks_text_search"
+    index_ddl = (
+        "CREATE INDEX IF NOT EXISTS " + index_name
+        + " ON vector_chunks USING GIN (text_search)"
+    )
+
+    logger.info(
+        "Rebuilding vector_chunks.text_search with FTS language={}", language
+    )
+    with engine.begin() as conn:
+        # Drop the old GIN index first; otherwise DROP COLUMN cascades to
+        # it implicitly but the catalog still keeps a dependency record
+        # that occasionally trips concurrent migrations.
+        conn.execute(text("DROP INDEX IF EXISTS " + index_name))
+        conn.execute(
+            text("ALTER TABLE vector_chunks DROP COLUMN IF EXISTS text_search")
+        )
+        conn.execute(
+            text("ALTER TABLE vector_chunks ADD COLUMN text_search " + column_ddl)
+        )
+        conn.execute(text(index_ddl))
+    logger.info("text_search rebuild complete (language={}).", language)
 
 
 def run_migrations(engine: Engine) -> None:
@@ -448,16 +565,15 @@ def run_migrations(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
 
-    # 2. Tables. ``create_all`` is idempotent — existing tables are skipped.
+    # 2. Tables. create_all is idempotent -- existing tables are skipped.
     Base.metadata.create_all(bind=engine)
 
     # 3. HNSW vector index. Created post-table because SQLAlchemy doesn't
     #    have first-class support for `USING hnsw` + opclass at column-decl
-    #    time. m=16 / ef_construction=64 are pgvector's defaults — fine for
-    #    most corpora; tune higher if recall isn't satisfactory.
+    #    time. m=16 / ef_construction=64 are pgvector's defaults.
     with engine.begin() as conn:
         if not _index_exists(engine, "vector_chunks", "ix_vector_chunks_hnsw"):
-            logger.info("Creating HNSW index on vector_chunks.embedding…")
+            logger.info("Creating HNSW index on vector_chunks.embedding...")
             conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_vector_chunks_hnsw "
@@ -469,21 +585,15 @@ def run_migrations(engine: Engine) -> None:
 
     # 4. Additive column changes.
     with engine.begin() as conn:
-        for table, column, ddl in _ADDITIVE_COLUMNS:
+        for table, column, ddl in _additive_columns():
             if column in _existing_columns(engine, table):
                 continue
             logger.info("Adding column {}.{}", table, column)
             conn.execute(
-                text(f'ALTER TABLE "{table}" ADD COLUMN {column} {ddl}')
+                text('ALTER TABLE "' + table + '" ADD COLUMN ' + column + ' ' + ddl)
             )
 
-    # 5. Additive indexes. Each index is created in its OWN transaction
-    #    so a failure on one (e.g. a stale catalog entry from a partial
-    #    earlier run) doesn't poison the rest of the migration. We
-    #    skip when ``_index_exists`` already says the name is taken,
-    #    and otherwise tolerate a UniqueViolation on relname — that
-    #    means the catalog already has an index with this name, which
-    #    is exactly the outcome we wanted anyway.
+    # 5. Additive indexes. Each index is created in its OWN transaction.
     from sqlalchemy.exc import IntegrityError
 
     for index_name, table, ddl in _ADDITIVE_INDEXES:
@@ -494,22 +604,15 @@ def run_migrations(engine: Engine) -> None:
             with engine.begin() as conn:
                 conn.execute(text(ddl))
         except IntegrityError as exc:
-            # ``CREATE INDEX IF NOT EXISTS`` should normally swallow this,
-            # but specific catalog states (invalid-index leftovers from
-            # an aborted earlier run, etc.) can still trip the
-            # ``pg_class_relname_nsp_index`` unique constraint. The end
-            # state we care about — "an index with this name exists" —
-            # is now true regardless, so we log and move on.
             if "pg_class_relname_nsp_index" in str(exc.orig):
                 logger.warning(
-                    "Index {} already present in catalog — skipping create.",
+                    "Index {} already present in catalog -- skipping create.",
                     index_name,
                 )
             else:
                 raise
 
-    # 6. Row-Level Security (defence-in-depth). Gated on
-    #    settings.ENABLE_RLS so existing deployments can opt out.
+    # 6. Row-Level Security (defence-in-depth). Gated on settings.ENABLE_RLS.
     _apply_rls_policies(engine)
 
     logger.info("Schema migrations complete.")

@@ -35,6 +35,26 @@ Both modes share the per-source quota, the RLS bind, and the
 ``hnsw.ef_search`` tuning. Hybrid mode requires the
 ``vector_chunks.text_search`` generated column + GIN index that
 ``models.migrations`` provisions automatically on first run.
+
+Per-source candidate fetching
+-----------------------------
+The retriever does **not** issue one giant SELECT spanning every
+enabled source. Instead it runs the vector (and, in hybrid mode,
+FTS) search **once per enabled source**, each with its own
+``WHERE source = X AND <scope_col> IN (…)`` clause and its own
+``LIMIT``. The per-source result sets are then pooled, RRF-fused,
+and passed through the per-source quota.
+
+Why: with a single global SELECT, a source whose vectors form a
+dense neighbourhood near the query embedding (e.g. tens of
+thousands of similar marketing emails) can completely fill the
+HNSW candidate pool, leaving no room for a higher-scoring chunk
+from another source. Bumping ``hnsw.ef_search`` and the candidate
+multiplier helps but never *guarantees* fairness — at sufficient
+imbalance the dense source still wins. Per-source fetching makes
+the guarantee structural: every selected source gets its own
+candidate budget, so SQL Server schema chunks (or any other
+sparser source) can't be evicted by sheer email volume.
 """
 
 from __future__ import annotations
@@ -48,7 +68,12 @@ from sqlalchemy import func, literal_column, select, text
 from app.config import settings
 from app.utils import get_db, set_current_user_for_rls
 from core.llm import get_embeddings
-from core.vector_store import build_query_filter, filter_to_where
+from core.runtime_config import get_fts_language
+from core.vector_store import (
+    build_query_filter,
+    filter_to_where,
+    filter_to_where_for_source,
+)
 from models.vector_chunk import VectorChunk
 
 
@@ -147,12 +172,14 @@ def _run_keyword_search(db, query_text, embedding, where_clause, limit):
     # binds plain Python strings as text, so we have to disambiguate the
     # first argument explicitly. We do that by inlining the language as a
     # ``::regconfig``-cast literal via ``literal_column``. The value comes
-    # from settings (not user input) and is restricted to a string by
-    # pydantic, so injection-by-config would require an attacker who can
-    # already write to .env — a non-threat. ``query_text`` *is* user
+    # from ``core.runtime_config`` (UI-toggleable, falls back to
+    # ``settings.FTS_LANGUAGE``) and is whitelisted to ``english`` /
+    # ``simple`` by ``set_fts_language`` before it ever reaches DDL, so
+    # injection-by-config would require an attacker who can already write
+    # to the runtime-config file — a non-threat. ``query_text`` *is* user
     # input and stays a parameter binding, which is where the safety
     # actually matters.
-    fts_regconfig = literal_column(f"'{settings.FTS_LANGUAGE}'::regconfig")
+    fts_regconfig = literal_column(f"'{get_fts_language()}'::regconfig")
     ts_query = func.websearch_to_tsquery(fts_regconfig, query_text)
     rank_expr = func.ts_rank_cd(text_search_col, ts_query).label("rank")
 
@@ -288,7 +315,8 @@ def retrieve(
     """
     Run a similarity search constrained by ``filter_dict``.
 
-    Vector mode emits roughly::
+    For each enabled source in ``filter_dict["by_source"]``, vector
+    mode emits roughly::
 
         SELECT
             id, resource_id, source, chunk_index, text,
@@ -296,21 +324,25 @@ def retrieve(
             object_name, last_updated, metadata,
             1 - (embedding <=> :query_vec) AS similarity
         FROM vector_chunks
-        WHERE <filter clauses derived from filter_dict>
+        WHERE source = :this_source
+          AND <scope_col> = ANY(:this_source_scopes)
           AND 1 - (embedding <=> :query_vec) >= :threshold
         ORDER BY embedding <=> :query_vec
-        LIMIT :candidate_limit
+        LIMIT :per_source_limit
 
-    Hybrid mode runs the same SELECT plus a parallel FTS query::
+    Hybrid mode also issues a parallel FTS query per source::
 
         SELECT ..., ts_rank_cd(text_search, q) AS rank
         FROM vector_chunks
-        WHERE <filter clauses>
+        WHERE source = :this_source
+          AND <scope_col> = ANY(:this_source_scopes)
           AND text_search @@ websearch_to_tsquery(:lang, :user_query)
         ORDER BY rank DESC
-        LIMIT :candidate_limit
+        LIMIT :per_source_limit
 
-    and fuses the two ranked lists with Reciprocal Rank Fusion.
+    The per-source result sets are pooled, re-sorted by their global
+    scoring metric, RRF-fused, and finally passed through the
+    per-source quota for the TOP_K cut.
 
     `<=>` is pgvector's cosine-distance operator (1 - similarity); ordering
     by it directly uses the HNSW index for sub-millisecond top-K on tens of
@@ -334,37 +366,50 @@ def retrieve(
         settings.SCORE_THRESHOLD if score_threshold is None else score_threshold
     )
 
-    where_clause = filter_to_where(filter_dict)
-    if where_clause is None:
+    by_source: dict[str, list[str]] = (filter_dict or {}).get("by_source") or {}
+    if not by_source:
         # No accessible scopes for any selected source — nothing to search.
         logger.debug("Empty filter; returning no hits.")
         return []
 
     embedding = get_embeddings().embed_query(query)
 
-    # Fetch a wider candidate pool than ``top_k`` so the per-source quota
-    # (applied below) and RRF fusion have something to work with. Without
-    # this, capping any source would just hand the top-K back short.
     fetch_multiplier = max(1, int(settings.RETRIEVAL_FETCH_MULTIPLIER))
-    candidate_limit = top_k * fetch_multiplier
+    max_per_source = max(1, int(settings.MAX_HITS_PER_SOURCE))
+
+    # Per-source candidate budget.
+    #
+    # Each enabled source gets its own SELECT with its own LIMIT, so the
+    # budget here is per source — not the old ``top_k * multiplier``
+    # global pool. We want enough headroom that the per-source quota
+    # (and its overflow backfill, when other sources are sparse) has
+    # plenty to draw from.
+    #
+    # ``max_per_source * fetch_multiplier`` covers the quota's primary
+    # slots with multiplier-fold headroom for backfill. We also floor at
+    # ``top_k`` so a single-source query (only one source enabled) still
+    # gets enough rows to fill TOP_K from one source's overflow.
+    #
+    # Defaults (top_k=8, max_per_source=4, fetch_multiplier=4) give a
+    # per-source limit of 16 — comfortably above the 4-cap and TOP_K=8
+    # backfill ceiling.
+    per_source_limit = max(top_k, max_per_source * fetch_multiplier)
 
     mode = settings.RETRIEVAL_MODE
 
     with get_db() as db:
         # Defence-in-depth: bind the user_id so the RLS policies can
-        # double-check the rows the WHERE clause is about to filter.
-        # No-op when ENABLE_RLS=False or user_id is missing.
+        # double-check the rows the WHERE clauses below filter. No-op
+        # when ENABLE_RLS=False or user_id is missing.
         set_current_user_for_rls(db, user_id)
 
-        # Raise HNSW recall for this statement only. The pgvector default
-        # ``hnsw.ef_search=40`` causes the graph traversal to converge in
-        # whichever cluster it enters first — when one source has a dense
-        # neighbourhood near the query embedding (e.g. many similar
-        # marketing emails) it crowds out a higher-scoring chunk in
-        # another source even though that chunk would rank above the
-        # cluster globally. ``SET LOCAL`` scopes the change to the current
-        # transaction so it never leaks to other sessions on the pool.
-        # See ``settings.HNSW_EF_SEARCH`` for tuning rationale.
+        # Raise HNSW recall for every SELECT in this transaction. With
+        # per-source fetching the recall pressure on any single SELECT is
+        # already much lower (each query searches a single source's
+        # subset, not the whole index) — but a higher ef_search is still
+        # cheap insurance against intra-source dense clusters. ``SET
+        # LOCAL`` scopes the change to this transaction so it never
+        # leaks to other sessions on the pool.
         #
         # NB: Postgres ``SET`` doesn't accept bind parameters, so we
         # inline the integer literal. ``int(...)`` neutralises any
@@ -372,43 +417,86 @@ def retrieve(
         ef_search = int(settings.HNSW_EF_SEARCH)
         db.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
 
-        vector_rows = _run_vector_search(
-            db, embedding, where_clause, score_threshold, candidate_limit
+        # ── Per-source candidate fetching ────────────────────────────
+        # One vector SELECT (and, in hybrid mode, one FTS SELECT) per
+        # enabled source. Each runs in its own subset of the index, so
+        # the result is N independent ranked lists — no source can
+        # crowd another out of its candidate slots.
+        all_vector_rows: list[Any] = []
+        all_keyword_rows: list[Any] = []
+        per_source_counts: dict[str, dict[str, int]] = {}
+
+        for source in by_source.keys():
+            src_where = filter_to_where_for_source(filter_dict, source)
+            if src_where is None:
+                # Unknown source key or empty scope list — skip cleanly.
+                continue
+
+            v_rows = _run_vector_search(
+                db, embedding, src_where, score_threshold, per_source_limit
+            )
+            all_vector_rows.extend(v_rows)
+            counts = per_source_counts.setdefault(source, {"vector": 0, "keyword": 0})
+            counts["vector"] = len(v_rows)
+
+            if mode == "hybrid":
+                k_rows = _run_keyword_search(
+                    db, query, embedding, src_where, per_source_limit
+                )
+                all_keyword_rows.extend(k_rows)
+                counts["keyword"] = len(k_rows)
+
+        # Pool the per-source results into a single global ranking.
+        # Each per-source SELECT returned rows already ordered by its
+        # local distance / FTS rank, but those orderings are local —
+        # we re-sort the pooled lists by the absolute scoring metric
+        # (cosine similarity for vector, ts_rank_cd for FTS) so the
+        # ranks fed into RRF reflect global standing across sources.
+        all_vector_rows.sort(
+            key=lambda r: float(r._mapping["similarity"]), reverse=True
         )
 
         if mode == "hybrid":
-            keyword_rows = _run_keyword_search(
-                db, query, embedding, where_clause, candidate_limit
+            all_keyword_rows.sort(
+                key=lambda r: float(r._mapping["rank"]), reverse=True
             )
             fused_rows = _rrf_fuse(
-                vector_rows, keyword_rows, k=int(settings.RRF_K)
+                all_vector_rows, all_keyword_rows, k=int(settings.RRF_K)
             )
             logger.debug(
-                "[hybrid] vector={} keyword={} fused={}",
-                len(vector_rows),
-                len(keyword_rows),
+                "[hybrid per-source] sources={} vector={} keyword={} fused={} per_source={}",
+                list(by_source.keys()),
+                len(all_vector_rows),
+                len(all_keyword_rows),
                 len(fused_rows),
+                per_source_counts,
             )
         else:
-            fused_rows = vector_rows
+            fused_rows = all_vector_rows
+            logger.debug(
+                "[vector per-source] sources={} vector={} per_source={}",
+                list(by_source.keys()),
+                len(all_vector_rows),
+                per_source_counts,
+            )
 
     # ── Per-source diversity quota ──────────────────────────────────────
     # ``fused_rows`` is already in score order — vector mode by cosine
-    # similarity, hybrid mode by RRF score. Capping per source preserves
-    # diversity when a single source has a dense cluster near the query;
-    # the backfill from overflow guarantees single-source queries still
-    # return TOP_K results. Disabled when MAX_HITS_PER_SOURCE >= TOP_K.
-    max_per_source = max(1, int(settings.MAX_HITS_PER_SOURCE))
+    # similarity, hybrid mode by RRF score. Per-source fetching means
+    # every selected source has had a fair shot at the candidate pool;
+    # the quota's job here is the final TOP_K selection with its
+    # MAX_HITS_PER_SOURCE soft cap and overflow backfill.
     rows = _apply_source_quota(fused_rows, top_k, max_per_source)
 
     hits = _rows_to_chunks(rows)
 
     logger.info(
-        "Retrieved {} chunks (mode={}, threshold {}, top_k {})",
+        "Retrieved {} chunks (mode={}, threshold {}, top_k {}, sources {})",
         len(hits),
         mode,
         score_threshold,
         top_k,
+        list(by_source.keys()),
     )
     return hits
 

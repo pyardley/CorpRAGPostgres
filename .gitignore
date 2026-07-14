@@ -39,3 +39,8 @@ logs/
 
 # Docker volumes / data
 data/
+
+# Cowork-mode commit-message handoff file (created by the Linux sandbox
+# when piping a multi-line commit message back to the Windows-side git
+# process; harmless if it sticks around but pointless to track).
+COWORK_COMMIT_MSG.txt
