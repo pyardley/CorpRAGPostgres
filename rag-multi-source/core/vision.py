@@ -20,10 +20,19 @@ from langchain_core.messages import HumanMessage
 from core.llm import get_vision_llm
 
 _CAPTION_PROMPT = (
-    "Describe this image for a corporate knowledge-base search index. "
-    "Focus on any text, diagrams, error messages, architecture, or data "
-    "visible in the image. Be concise but specific — this caption is the "
-    "only representation of the image that will be searchable."
+    "Describe this image for a corporate knowledge-base search index. This "
+    "caption is the ONLY representation of the image that will be "
+    "searchable — nobody will ever see the image itself, only your text.\n\n"
+    "If the image contains a table, log output, code, or any other "
+    "structured/tabular data: transcribe it VERBATIM, in full — every row, "
+    "every column value, every timestamp and number exactly as shown. Do "
+    "not summarize or describe the columns instead of giving the values; a "
+    "reader must be able to find a specific cell's exact value from your "
+    "transcription alone. Use a markdown table or code block for this part.\n\n"
+    "If the image is a diagram, screenshot, or architecture drawing "
+    "without tabular data, describe it concisely instead — components, "
+    "labels, error messages, and relationships shown.\n\n"
+    "Do both if the image has both."
 )
 
 

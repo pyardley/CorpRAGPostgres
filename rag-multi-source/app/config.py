@@ -45,6 +45,15 @@ class Settings(BaseSettings):
     GROK_BASE_URL: str = "https://api.x.ai/v1"
     GROK_MODEL: str = "grok-2-1212"
 
+    # Per-request timeout for every chat-model call (chat, MCP tool-loop,
+    # and image captioning). Without this the underlying SDK defaults apply
+    # (the OpenAI SDK's default is 600s) — a single stalled request during
+    # ingestion-time image captioning can otherwise hang far longer than
+    # any interactive caller would tolerate before the fail-open handler
+    # in `app.ingestion.base._caption_image_chunks` ever gets a chance to
+    # log it and move on.
+    LLM_REQUEST_TIMEOUT_SECONDS: float = 60.0
+
     # ── Multi-modal ingestion (image captioning) ──────────────────────────────
     #
     # Images embedded in Confluence pages or attached to Jira tickets are

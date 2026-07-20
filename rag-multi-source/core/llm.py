@@ -48,6 +48,7 @@ def get_llm() -> BaseChatModel:
             model=settings.OPENAI_CHAT_MODEL,
             temperature=0.1,
             openai_api_key=settings.OPENAI_API_KEY,
+            request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if provider == "anthropic":
@@ -60,6 +61,7 @@ def get_llm() -> BaseChatModel:
             model=settings.ANTHROPIC_MODEL,
             temperature=0.1,
             anthropic_api_key=settings.ANTHROPIC_API_KEY,
+            default_request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if provider == "grok":
@@ -74,6 +76,7 @@ def get_llm() -> BaseChatModel:
             temperature=0.1,
             openai_api_key=settings.GROK_API_KEY,
             openai_api_base=settings.GROK_BASE_URL,
+            request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
@@ -112,6 +115,7 @@ def get_vision_llm() -> BaseChatModel:
             model=settings.VISION_MODEL,
             temperature=0.1,
             openai_api_key=settings.OPENAI_API_KEY,
+            request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if provider == "anthropic":
@@ -124,6 +128,7 @@ def get_vision_llm() -> BaseChatModel:
             model=settings.VISION_MODEL,
             temperature=0.1,
             anthropic_api_key=settings.ANTHROPIC_API_KEY,
+            default_request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     if provider == "grok":
@@ -137,6 +142,7 @@ def get_vision_llm() -> BaseChatModel:
             temperature=0.1,
             openai_api_key=settings.GROK_API_KEY,
             openai_api_base=settings.GROK_BASE_URL,
+            request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
     raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
