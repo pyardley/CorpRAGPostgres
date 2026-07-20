@@ -100,6 +100,13 @@ class QueryAuditLog(Base):
     # "rag" | "hybrid" | "mcp_only" — see module docstring.
     source_type = Column(String(16), nullable=False, default="rag")
 
+    # "english" | "simple" — the Postgres FTS config the sidebar's
+    # per-query "Search language" picker was set to for this turn (see
+    # app.sidebar.SelectionState.fts_language). Nullable so pre-existing
+    # rows from before this column existed display as unknown rather
+    # than a misleading default.
+    fts_language = Column(String(16), nullable=True)
+
     user = relationship("User")
     step_timings = relationship(
         "QueryStepTiming",

@@ -1147,6 +1147,7 @@ def _load_audit_rows(
                         "provider": audit.llm_provider or "",
                         "model": audit.llm_model or "",
                         "error_message": audit.error_message or "",
+                        "fts_language": audit.fts_language or "",
                     }
                 )
     except Exception:  # noqa: BLE001
@@ -1289,6 +1290,7 @@ def _render_audit_log(self_user_id: str) -> None:
                 ) if r["timestamp"] else "",
                 "User": r["user_email"],
                 "Source": r["source_type"],
+                "Language": r["fts_language"] or "—",
                 "Duration": _format_duration_ms(r["duration_ms"]),
                 "Tokens": r["tokens_total"],
                 "Cost": _format_cost_usd(r["cost_usd"]),
@@ -1361,6 +1363,7 @@ def _render_audit_log(self_user_id: str) -> None:
         st.markdown(
             f"**User:** {chosen_row['user_email']}  \n"
             f"**Source path:** {chosen_row['source_type']}  \n"
+            f"**Search language:** {chosen_row['fts_language'] or '—'}  \n"
             f"**Provider/model:** "
             f"{(chosen_row['provider'] or '—')}/"
             f"{(chosen_row['model'] or '—')}  \n"

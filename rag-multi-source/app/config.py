@@ -155,6 +155,34 @@ class Settings(BaseSettings):
     # disable only for benchmarking the cost of unconditional re-embeds.
     ENABLE_CONTENT_FINGERPRINT_DEDUP: bool = True
 
+    # ── Live ACL re-validation ────────────────────────────────────────────────
+    #
+    # ``user_accessible_resources`` is populated at ingestion time and never
+    # re-checked — if a user loses Jira/Confluence/SQL/GitHub access after
+    # ingestion, they keep querying that data until the next re-ingestion.
+    # When enabled, ``core.live_acl.revalidate`` calls back into the source
+    # system itself on every chat turn and intersects the live permission
+    # with the granted scope, closing that gap. Adds a per-query API round
+    # trip per distinct scope (bounded by ``LIVE_ACL_CACHE_TTL_SECONDS``), so
+    # this defaults to off — opt in once the source systems' rate limits are
+    # understood for your deployment.
+    #
+    # Fails CLOSED: any checker error (timeout, network, unknown credential)
+    # excludes that scope from the turn's results rather than falling back
+    # to the ingestion-time grant.
+    LIVE_ACL_REVALIDATION_ENABLED: bool = False
+
+    # How long a live "allowed"/"denied" verdict is cached per
+    # (user, source, resource_identifier), in seconds. Short enough to
+    # reflect access changes promptly, long enough that a multi-turn chat
+    # session doesn't re-hit the source API on every message.
+    LIVE_ACL_CACHE_TTL_SECONDS: int = 300
+
+    # Per-request timeout for outbound live-ACL HTTP calls (Jira,
+    # Confluence, GitHub). A slow/hanging source system must not stall
+    # chat — it fails closed for that scope instead.
+    LIVE_ACL_HTTP_TIMEOUT_SECONDS: float = 5.0
+
     # ── Audit & cost accounting ──────────────────────────────────────────────
     #
     # The chat layer always writes a row to ``query_audit_logs`` per user

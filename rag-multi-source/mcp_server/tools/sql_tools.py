@@ -40,6 +40,7 @@ from sqlalchemy import event, text
 from sqlalchemy.engine import URL, Engine, create_engine
 
 from app.utils import get_db, list_accessible, load_credential
+from core.live_acl import revalidate
 from mcp_server.config import mcp_settings
 
 
@@ -354,7 +355,7 @@ def _to_markdown_table(columns: list[str], rows: list[list[Any]]) -> str:
 def list_databases(user_id: str) -> ToolResult:
     """Return the SQL databases this user has access to."""
     with get_db() as db:
-        dbs = sorted(list_accessible(db, user_id, "sql"))
+        dbs = sorted(revalidate(db, user_id, "sql", list_accessible(db, user_id, "sql")))
     md = (
         "| Database |\n| --- |\n" + "\n".join(f"| {d} |" for d in dbs)
         if dbs
@@ -389,7 +390,7 @@ def table_query(
 
     # 1. Tenancy gate.
     with get_db() as db:
-        accessible = set(list_accessible(db, user_id, "sql"))
+        accessible = set(revalidate(db, user_id, "sql", list_accessible(db, user_id, "sql")))
     if db_name not in accessible:
         msg = (
             f"Access denied: user has no granted access to database "

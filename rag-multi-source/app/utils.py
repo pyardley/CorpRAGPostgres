@@ -624,6 +624,7 @@ def log_query_audit(
     success: bool,
     error_message: str | None = None,
     steps: Iterable[dict[str, Any]] | None = None,
+    fts_language: str | None = None,
 ) -> str | None:
     """
     Persist one ``query_audit_logs`` row + all of its ``query_step_timings``
@@ -665,6 +666,9 @@ def log_query_audit(
         ``{"step_name": str, "duration_ms": int, "metadata": dict}``.
         Typically built up via ``StepTimer`` / ``record_step_timing``
         as the chain runs.
+    fts_language
+        ``"english"`` | ``"simple"`` — the sidebar's per-query "Search
+        language" picker value for this turn (``SelectionState.fts_language``).
     """
     if not settings.AUDIT_LOG_ENABLED:
         return None
@@ -692,6 +696,7 @@ def log_query_audit(
                 success=bool(success),
                 error_message=truncated_error,
                 source_type=source_type or "rag",
+                fts_language=fts_language or None,
             )
             db.add(row)
             db.flush()  # populate row.id

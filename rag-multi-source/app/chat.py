@@ -33,12 +33,14 @@ from app.auth import current_user
 from app.sidebar import SelectionState
 from app.utils import (
     StepTimer,
+    get_db,
     init_session_totals,
     log_query_audit,
     record_step_timing,
     render_status_bar,
     update_session_totals,
 )
+from core.live_acl import revalidate
 from core.rag_chain import RAGAnswer, answer_question
 from core.retriever import RetrievedChunk, retrieve
 from core.vector_store import build_query_filter
@@ -55,6 +57,25 @@ def _build_filter(state: SelectionState) -> dict[str, Any]:
         accessible_email_providers=state.email_providers,
         accessible_github_issue_repos=state.github_issue_repos,
     )
+
+
+def _revalidate_filter(user_id: str, filter_dict: dict[str, Any]) -> dict[str, Any]:
+    """
+    Intersect every source's candidate scopes in `filter_dict["by_source"]`
+    with a live permission check (see `core.live_acl`). No-ops when
+    `settings.LIVE_ACL_REVALIDATION_ENABLED` is False. Sources that end up
+    with no confirmed scopes are dropped entirely.
+    """
+    by_source: dict[str, list[str]] = filter_dict.get("by_source") or {}
+    if not by_source:
+        return filter_dict
+
+    with get_db() as db:
+        revalidated = {
+            source: revalidate(db, user_id, source, scopes)
+            for source, scopes in by_source.items()
+        }
+    return {**filter_dict, "by_source": {s: v for s, v in revalidated.items() if v}}
 
 
 def _resolve_source_type(state: SelectionState, used_mcp: bool) -> str:
@@ -231,6 +252,14 @@ def render_chat(state: SelectionState) -> None:
                     t_filter.extra["filter_keys"] = sorted(filter_dict.keys())
                 logger.debug("Chat filter: {}", filter_dict)
 
+                with StepTimer(chat_steps, "live_acl_check") as t_acl:
+                    # No-ops (single dict lookup) unless
+                    # LIVE_ACL_REVALIDATION_ENABLED is set — see
+                    # core.live_acl for the source-system permission checks.
+                    filter_dict = _revalidate_filter(user["id"], filter_dict)
+                    t_acl.extra["filter_keys"] = sorted(filter_dict.keys())
+                logger.debug("Chat filter after live ACL check: {}", filter_dict)
+
                 with StepTimer(chat_steps, "vector_retrieval") as t_retr:
                     # user_id is required when ENABLE_RLS=True so the
                     # RLS policies on vector_chunks recognise the
@@ -312,6 +341,7 @@ def render_chat(state: SelectionState) -> None:
         success=success,
         error_message=error_message,
         steps=all_steps,
+        fts_language=state.fts_language,
     )
 
     st.session_state.messages.append(

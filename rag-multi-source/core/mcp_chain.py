@@ -58,6 +58,7 @@ from app.utils import (
     list_accessible,
     record_step_timing,
 )
+from core.live_acl import revalidate
 from core.llm import get_llm
 from core.mcp_client import build_mcp_tools, get_mcp_client
 from core.rag_chain import RAGAnswer, _format_context  # type: ignore[attr-defined]
@@ -144,7 +145,9 @@ def _resolve_direct_db(
             return db, stripped
 
     with get_db() as db_session:
-        accessible = sorted(list_accessible(db_session, user_id, "sql"))
+        accessible = sorted(
+            revalidate(db_session, user_id, "sql", list_accessible(db_session, user_id, "sql"))
+        )
     if len(accessible) == 1:
         return accessible[0], query
     if accessible:
@@ -353,7 +356,9 @@ def answer_question_with_mcp(
     # Tell the LLM exactly which DBs it can target so it doesn't have to
     # guess (and to make refusal-to-call obviously wrong in its own logs).
     with get_db() as db_session:
-        accessible_dbs = sorted(list_accessible(db_session, user_id, "sql"))
+        accessible_dbs = sorted(
+            revalidate(db_session, user_id, "sql", list_accessible(db_session, user_id, "sql"))
+        )
     db_hint = (
         "Accessible SQL databases: "
         + (", ".join(f"`{d}`" for d in accessible_dbs) or "(none)")

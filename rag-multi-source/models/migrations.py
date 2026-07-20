@@ -107,6 +107,11 @@ def _additive_columns() -> tuple[tuple[str, str, str], ...]:
             fts_column_name("simple"),
             _text_search_column_ddl("simple"),
         ),
+        # Which FTS language the sidebar's per-query "Search language"
+        # picker was set to for this turn (see app.utils.log_query_audit).
+        # Nullable so rows logged before this column existed just show
+        # as unknown rather than a misleading default.
+        ("query_audit_logs", "fts_language", "VARCHAR(16) NULL"),
     )
 
 
