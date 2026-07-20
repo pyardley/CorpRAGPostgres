@@ -77,3 +77,11 @@ def get_llm() -> BaseChatModel:
         )
 
     raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
+
+
+@lru_cache(maxsize=1)
+def get_reranker():
+    from sentence_transformers import CrossEncoder
+
+    logger.info("Loading cross-encoder reranker: {}", settings.RERANK_MODEL)
+    return CrossEncoder(settings.RERANK_MODEL)

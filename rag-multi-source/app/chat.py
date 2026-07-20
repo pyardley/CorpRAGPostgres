@@ -30,6 +30,7 @@ import streamlit as st
 from loguru import logger
 
 from app.auth import current_user
+from app.config import settings
 from app.sidebar import SelectionState
 from app.utils import (
     StepTimer,
@@ -42,6 +43,7 @@ from app.utils import (
 )
 from core.live_acl import revalidate
 from core.rag_chain import RAGAnswer, answer_question
+from core.reranker import rerank
 from core.retriever import RetrievedChunk, retrieve
 from core.vector_store import build_query_filter
 
@@ -264,14 +266,25 @@ def render_chat(state: SelectionState) -> None:
                     # user_id is required when ENABLE_RLS=True so the
                     # RLS policies on vector_chunks recognise the
                     # caller. The retriever no-ops the binding when
-                    # RLS is disabled.
+                    # RLS is disabled. When reranking is enabled we ask
+                    # for a wider candidate pool (RERANK_CANDIDATE_K)
+                    # than the usual TOP_K so there's something for the
+                    # cross-encoder to actually rerank.
                     hits = retrieve(
                         prompt,
                         filter_dict,
+                        top_k=settings.RERANK_CANDIDATE_K if settings.RERANK_ENABLED else None,
                         user_id=user["id"],
                         fts_language=state.fts_language,
                     )
                     t_retr.extra["retrieved_count"] = len(hits)
+
+                with StepTimer(chat_steps, "rerank") as t_rerank:
+                    # No-ops (single slice) unless RERANK_ENABLED is set —
+                    # see core.reranker for the cross-encoder pass.
+                    t_rerank.extra["candidate_count"] = len(hits)
+                    hits = rerank(prompt, hits, top_n=settings.TOP_K)
+                    t_rerank.extra["reranked_count"] = len(hits)
 
                 history = [
                     (m["role"], m["content"])

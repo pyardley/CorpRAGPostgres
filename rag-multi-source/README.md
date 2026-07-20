@@ -87,6 +87,44 @@ question:
 
 Switch any time — no reload, no reindex, no waiting.
 
+### Reranking with a cross-encoder
+
+Vector/RRF scoring never actually reads a candidate chunk's text against
+the query — it's a bi-encoder similarity computed independently per
+source. When `RERANK_ENABLED=true` (the default), the chat layer adds a
+second retrieval stage: it asks `core.retriever.retrieve` for
+`RERANK_CANDIDATE_K` candidates (default 50, instead of the usual
+`TOP_K`), then `core/reranker.py` runs a local cross-encoder
+(`sentence_transformers.CrossEncoder`, model `RERANK_MODEL` — default
+`BAAI/bge-reranker-base`) that jointly encodes `(query, chunk_text)` for
+every candidate, re-scores and re-sorts them, and keeps the top `TOP_K`.
+This is typically far more accurate than cosine similarity alone at
+picking the genuinely relevant chunk, especially on "tricky" queries
+where the right answer isn't the top vector hit.
+
+```ini
+# .env
+RERANK_ENABLED=true                  # default — set false to skip the second stage
+RERANK_MODEL=BAAI/bge-reranker-base  # any sentence-transformers CrossEncoder repo id
+RERANK_CANDIDATE_K=50                # candidates fetched before reranking
+```
+
+- **No new dependency.** `sentence-transformers` is already required for
+  the HuggingFace embeddings fallback; the reranker reuses it and runs on
+  CPU in-process, cached as a singleton (`core.llm.get_reranker`) after
+  first use.
+- **First-run download.** The first query after enabling downloads the
+  model weights from the HuggingFace Hub (a few hundred MB for the
+  default model) — expect a one-time delay on the first turn.
+- **Fails open.** Unlike the live-ACL check below, this is a ranking
+  quality knob, not an authorization boundary — any reranker error
+  (model load failure, missing torch, OOM) is logged and chat falls back
+  to the un-reranked candidate order instead of failing the turn.
+- **Visible in the audit trail.** Adds a `rerank` step to
+  `query_step_timings` with `metadata.candidate_count` /
+  `metadata.reranked_count` — see
+  [Audit & Performance Logging](#audit--performance-logging).
+
 ### Multi-tenancy: store-once + dynamic filter
 
 Every resource (Jira ticket, Confluence page, SQL stored proc, Git
@@ -1212,6 +1250,7 @@ layer. Steps emitted on a typical RAG turn:
 build_filter         -- translate sidebar selection into the metadata filter
 live_acl_check       -- (opt-in) intersect with a live source-system permission check
 vector_retrieval     -- pgvector top-K cosine + de-dup
+rerank               -- (opt-out) cross-encoder second pass over the candidates
 build_context        -- group hits by resource, build numbered LLM context
 llm_invocation       -- single llm.invoke(messages)
 post_processing      -- extract text + assemble the audit record
@@ -1221,7 +1260,9 @@ total                -- mirror of total_duration_ms (no JOIN required)
 `live_acl_check` is a single dict lookup (sub-millisecond) unless
 `LIVE_ACL_REVALIDATION_ENABLED=true` — see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation)
-below.
+below. `rerank` runs the cross-encoder by default — see
+[Reranking with a cross-encoder](#reranking-with-a-cross-encoder) above;
+set `RERANK_ENABLED=false` to make it a no-op slice instead.
 
 The hybrid (MCP) path additionally emits one `llm_invocation` per hop
 (with `metadata.hop = N`) and one `mcp_tool_call:<tool_name>` per
@@ -1489,8 +1530,9 @@ transport change, not a redesign.
 
 Things this codebase deliberately does not do today, listed in roughly
 ascending order of effort. (Live source-system ACL re-validation at
-query time — formerly listed here — now ships as an opt-in flag; see
-[Live source-system ACL re-validation](#3-live-source-system-acl-re-validation).)
+query time and cross-encoder reranking — formerly listed here — now
+ship as flags; see [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation)
+and [Reranking with a cross-encoder](#reranking-with-a-cross-encoder).)
 
 ### 1. Per-chunk visibility (issue / page-level granularity)
 
@@ -1506,15 +1548,106 @@ A small scheduler (cron, Celery beat, GitHub Actions, the Cowork
 `python -m app.ingestion.cli --source all --mode incremental` keeps the
 index fresh without anybody clicking buttons.
 
-### 3. Reranking with a cross-encoder
-
-A second-stage cross-encoder reranker (e.g. `bge-reranker-base`) over the
-top-50 from pgvector, returning the top-8 to the LLM. Tens of milliseconds
-of latency; meaningful accuracy bump on tricky retrievals.
-
-### 4. Streaming LLM responses
+### 3. Streaming LLM responses
 
 `render_chat` currently calls `llm.invoke()` and renders the full answer
 once it returns. Switching to `llm.stream()` and `st.write_stream()`
 gives a typewriter-style response and noticeably improves perceived
 latency on long answers.
+
+### 4. Query rewriting before retrieval (HyDE / decomposition)
+
+The chat layer sends the user's raw question straight to
+`core.retriever.retrieve`. LlamaIndex's HyDE transform and sub-question
+query engines, and Perplexity's query expansion, instead have the LLM
+rewrite the question first — either into a hypothetical answer passage
+(whose embedding often matches real chunks better than a short question
+does) or into several sub-questions run in parallel and merged. A new
+`query_rewrite` `StepTimer` step ahead of `vector_retrieval` would fit
+the existing per-turn step-timing pattern (`build_filter` →
+`live_acl_check` → `vector_retrieval` → `rerank` → …) with no retriever
+changes.
+
+### 5. Corrective retrieval — admit when nothing matches
+
+Today the LLM always answers from whatever `core.retriever.retrieve`
+returns, even when every candidate is a weak match. Self-RAG and
+Corrective RAG (CRAG) add a grading step: if the top results
+(post-rerank, using the cross-encoder scores `core/reranker.py` already
+computes) fall below a confidence threshold, skip generation and tell
+the user no good match was found — or broaden the search — instead of
+quietly answering from marginal context and risking a
+plausible-sounding hallucination.
+
+### 6. Semantic response cache, in the same Postgres database
+
+Repeated or near-duplicate questions (a whole team asking "how do I get
+a Jira API token" over a week) currently re-run retrieval and pay for a
+full LLM call every time. Tools like GPTCache and Redis semantic caching
+solve this with an embedding-similarity cache in front of the LLM; this
+project could do the same without adding infrastructure — a
+`response_cache` table with its own `VECTOR(1536)` column, checked
+before `core.rag_chain.answer_question` runs, consistent with the "one
+database for everything" philosophy already called out under
+[Why PostgreSQL + pgvector?](#why-postgresql--pgvector).
+
+### 7. Citation-level relevance feedback
+
+Enterprise search products (Glean's promote/demote, Copilot's 👍/👎)
+close the loop between what users actually found useful and what
+retrieval surfaces next time. Add a thumbs up/down per citation in
+`_render_citations` (`app/chat.py`), persist it against the existing
+`query_audit_logs` row, and fold accumulated feedback into
+`core.retriever`'s scoring as a small per-`(query pattern, resource_id)`
+boost/penalty — turning the audit trail this project already logs into
+a genuine learning-to-rank signal instead of a read-only log.
+
+### 8. Ingestion-time secret / PII scanning
+
+Jira comments, Confluence pages, and email bodies routinely contain
+pasted API keys, connection strings, or customer PII — today they're
+embedded and stored verbatim like any other text. GitHub's push
+secret-scanning and enterprise DLP features (Microsoft Purview, Glean)
+scan content before it's indexed; running chunk text through a
+regex/entropy check (or the `detect-secrets` library) inside
+`BaseIngestor._chunk()` before it reaches `upsert_chunks` would let the
+system redact or quarantine a match instead of silently vectorizing a
+leaked credential — relevant given this same codebase already treats
+*its own* stored credentials as sensitive enough to Fernet-encrypt.
+
+### 9. Offline retrieval/answer-quality eval harness
+
+Tuning knobs like `HNSW_EF_SEARCH`, `RRF_K`, `RERANK_CANDIDATE_K`, and
+`MAX_HITS_PER_SOURCE` are currently tuned by eyeballing results. RAGAS,
+TruLens, and Langfuse popularized scoring RAG pipelines against a fixed
+golden question set — retrieval precision/recall@K, answer
+faithfulness, citation accuracy. A `scripts/eval_harness.py`, following
+the same shape as the existing `scripts/vector_store_admin.py`, running
+a curated `(question, expected resource_id)` set through `retrieve()`
+and `answer_question()` and tracking the scores over time, would turn
+retrieval tuning into something measurable instead of anecdotal.
+
+### 10. Lightweight entity graph (GraphRAG-inspired)
+
+Pure chunk similarity can't answer relationship questions — "who else
+has touched tickets related to this outage?", "which repos does this
+Confluence page's author maintain?". Microsoft's GraphRAG and Neo4j's
+GraphRAG pattern solve this by extracting entities and relationships at
+ingestion time into a graph layer. This doesn't need a separate graph
+database — a lightweight `entity_edges` table (`subject`, `predicate`,
+`object`, `source_resource_id`) populated during ingestion and joined
+against `user_accessible_resources` for the same tenancy guarantees
+already enforced on `vector_chunks` would cover the common cases.
+
+### 11. Multi-modal ingestion (diagrams, screenshots, attachments)
+
+Images embedded in Confluence pages or attached to Jira tickets —
+architecture diagrams, error screenshots — are invisible to the indexer
+today. Vision-capable LLM RAG (GPT-4V-style pipelines, LlamaIndex's
+multi-modal indices) caption images at ingestion time so the caption
+text becomes a normal searchable chunk. Since `BaseIngestor` already
+funnels every source through one chunking/embedding path, this would be
+one new pre-processing step — fetch the image, get a caption via
+`core.llm.get_llm()` (already available, no new provider needed), store
+it as a chunk with `metadata={"type": "image_caption", ...}` — rather
+than a parallel pipeline.

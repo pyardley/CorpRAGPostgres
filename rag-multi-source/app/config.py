@@ -127,6 +127,30 @@ class Settings(BaseSettings):
     RRF_K: int = 60
     FTS_LANGUAGE: str = "english"
 
+    # ── Reranking (cross-encoder second stage) ───────────────────────────────
+    #
+    # Vector/RRF scoring never actually reads a candidate chunk's text
+    # against the query — it's a bi-encoder similarity computed independently
+    # per source. A cross-encoder jointly encodes (query, chunk_text) and is
+    # typically far more accurate at picking the genuinely relevant chunk,
+    # especially on "tricky" queries where the best answer isn't the top
+    # cosine hit. The chat layer fetches ``RERANK_CANDIDATE_K`` candidates
+    # from ``core.retriever.retrieve`` instead of the usual ``TOP_K``, reranks
+    # them with ``core.reranker.rerank``, and keeps the top ``TOP_K`` — so
+    # disabling this reverts to exactly the pre-reranking candidate count and
+    # ordering.
+    #
+    # On by default. Runs a local ``sentence-transformers`` CrossEncoder in
+    # -process (CPU) — no new dependency, no API key, no per-query cost. The
+    # first query after enabling downloads the model weights from the
+    # HuggingFace Hub (a few hundred MB for the default model). Any reranker
+    # error (model load failure, missing torch, OOM) fails OPEN — logged, and
+    # the un-reranked candidate order is used — this is a quality knob, not
+    # an authorization boundary.
+    RERANK_ENABLED: bool = True
+    RERANK_MODEL: str = "BAAI/bge-reranker-base"
+    RERANK_CANDIDATE_K: int = 50
+
     # ── Vector store ops ─────────────────────────────────────────────────────
     # Rows per upsert batch. We still chunk for memory + WAL pressure.
     VECTOR_UPSERT_BATCH_SIZE: int = 250
