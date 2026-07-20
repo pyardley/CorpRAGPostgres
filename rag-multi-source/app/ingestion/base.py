@@ -69,6 +69,25 @@ from models.ingestion_log import IngestionLog
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
+class ImageRef:
+    """
+    An image discovered on a resource (Confluence attachment, Jira
+    attachment, …), not yet fetched.
+
+    `fetch_bytes` is a closure supplied by the ingestor that discovered
+    the image — it already has whatever client/session/instance context
+    is needed to authenticate the download (e.g. which Confluence
+    instance, for multi-instance setups), so `BaseIngestor` never needs
+    source-specific fetch logic. Returns `None` on failure.
+    """
+
+    filename: str
+    alt_text: str
+    mime_type: str
+    fetch_bytes: Callable[[], Optional[bytes]]
+
+
+@dataclass
 class SourceResource:
     """A logical document fetched from a source, before chunking."""
 
@@ -78,6 +97,7 @@ class SourceResource:
     url: str
     last_updated: str  # ISO-8601 string
     metadata: dict[str, Any] = field(default_factory=dict)
+    image_refs: list[ImageRef] = field(default_factory=list)
 
 
 @dataclass
@@ -150,6 +170,11 @@ class BaseIngestor(ABC):
         # Available to subclasses that opt into recipe metadata. Always
         # safe to read — defaults to None when invoked the legacy way.
         self.recipe: "Optional[Recipe]" = recipe
+        # Hard cap on vision-LLM calls across this ingestor instance's
+        # whole run (see settings.MAX_IMAGES_PER_INGESTION_RUN) — a
+        # per-resource cap alone doesn't bound a `--mode full` re-ingest
+        # of an entire space/project.
+        self._images_captioned = 0
 
     # ── Abstract API ──────────────────────────────────────────────────────────
 
@@ -315,7 +340,11 @@ class BaseIngestor(ABC):
     def _process_resource(
         self, resource: SourceResource, result: IngestionResult
     ) -> None:
-        chunks = self._chunk(resource)
+        text_chunks = self._chunk(resource)
+        image_chunks = self._caption_image_chunks(
+            resource, next_index=len(text_chunks)
+        )
+        chunks = text_chunks + image_chunks
         if not chunks:
             logger.debug("Resource {} produced 0 chunks; skipping.", resource.resource_id)
             return
@@ -401,6 +430,76 @@ class BaseIngestor(ABC):
                     text=piece,
                     metadata=md,
                     content_fingerprint=fingerprint,
+                )
+            )
+        return chunks
+
+    def _caption_image_chunks(
+        self, resource: SourceResource, next_index: int
+    ) -> list[ResourceChunk]:
+        """
+        Caption each of `resource.image_refs` with a vision-capable LLM
+        and turn it into one extra `ResourceChunk`, appended after the
+        text chunks so it's searchable like any other chunk.
+
+        No-ops (returns `[]`) unless `settings.ENABLE_MULTIMODAL_INGESTION`
+        is set. Fails OPEN per image — a caption failure (bad model,
+        oversized/corrupt image, network error) is logged and that image
+        is skipped; it never fails the resource or the ingestion run.
+        `MAX_IMAGES_PER_INGESTION_RUN` is a hard stop across the whole
+        run so a `--mode full` re-ingest of a huge space/project can't
+        run up an unbounded vision-LLM bill.
+        """
+        if not settings.ENABLE_MULTIMODAL_INGESTION or not resource.image_refs:
+            return []
+
+        from core.vision import caption_image
+
+        chunks: list[ResourceChunk] = []
+        for i, ref in enumerate(resource.image_refs[: settings.MAX_IMAGES_PER_RESOURCE]):
+            if self._images_captioned >= settings.MAX_IMAGES_PER_INGESTION_RUN:
+                logger.warning(
+                    "[{}] MAX_IMAGES_PER_INGESTION_RUN reached — skipping "
+                    "remaining images for {}",
+                    self.source,
+                    resource.resource_id,
+                )
+                break
+            try:
+                image_bytes = ref.fetch_bytes()
+                if not image_bytes or len(image_bytes) > settings.MAX_IMAGE_BYTES:
+                    continue
+                caption = caption_image(
+                    image_bytes, ref.mime_type, alt_text=ref.alt_text
+                )
+                if not caption.strip():
+                    continue
+            except Exception:
+                logger.warning(
+                    "[{}] image caption failed for {!r} on {}",
+                    self.source,
+                    ref.filename,
+                    resource.resource_id,
+                )
+                continue
+
+            self._images_captioned += 1
+            text = f"[Image: {ref.filename}]\n{caption}"
+            chunks.append(
+                ResourceChunk(
+                    resource_id=resource.resource_id,
+                    source=self.source,
+                    chunk_index=next_index + i,
+                    text=text,
+                    metadata={
+                        "title": resource.title,
+                        "url": resource.url,
+                        "last_updated": resource.last_updated,
+                        **resource.metadata,
+                        "type": "image_caption",
+                        "image_filename": ref.filename,
+                    },
+                    content_fingerprint=compute_content_fingerprint(text),
                 )
             )
         return chunks

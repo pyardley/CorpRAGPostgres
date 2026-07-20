@@ -45,6 +45,32 @@ class Settings(BaseSettings):
     GROK_BASE_URL: str = "https://api.x.ai/v1"
     GROK_MODEL: str = "grok-2-1212"
 
+    # ── Multi-modal ingestion (image captioning) ──────────────────────────────
+    #
+    # Images embedded in Confluence pages or attached to Jira tickets are
+    # invisible to the indexer by default — this fetches each image and
+    # captions it with a vision-capable LLM so the caption becomes a normal
+    # searchable chunk. Off by default: this is the same shape of feature
+    # (download binary attachment content, pay for an LLM call per item)
+    # that `app.ingestion.email_ingestor` deliberately declined for email
+    # attachments ("too costly + risky") — opt in once the cost for your
+    # own ingestion volume (images per resource x vision-LLM pricing) is
+    # understood.
+    ENABLE_MULTIMODAL_INGESTION: bool = False
+
+    # Model used to caption images. Falls back to the provider's normal
+    # chat model (`OPENAI_CHAT_MODEL` / `ANTHROPIC_MODEL`) when unset —
+    # both current defaults are already vision-capable. Only needed as an
+    # override when `LLM_PROVIDER=grok`, since the default Grok model
+    # isn't vision-capable.
+    VISION_MODEL: Optional[str] = None
+
+    # Cost/safety caps. Per-resource bounds a single huge page/issue;
+    # per-run bounds a `--mode full` re-ingest of an entire space/project.
+    MAX_IMAGES_PER_RESOURCE: int = 5
+    MAX_IMAGE_BYTES: int = 5_000_000
+    MAX_IMAGES_PER_INGESTION_RUN: int = 200
+
     # ── Chunking ─────────────────────────────────────────────────────────────
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200

@@ -18,7 +18,8 @@ from typing import Any, Iterable, Optional
 import requests
 from loguru import logger
 
-from app.ingestion.base import BaseIngestor, SourceResource
+from app.config import settings
+from app.ingestion.base import BaseIngestor, ImageRef, SourceResource
 
 
 class JiraIngestor(BaseIngestor):
@@ -81,6 +82,8 @@ class JiraIngestor(BaseIngestor):
             # /rest/api/3/issue/{key}/comment.
             "comment",
         ]
+        if settings.ENABLE_MULTIMODAL_INGESTION:
+            fields.append("attachment")
 
         next_page_token: Optional[str] = None
         while True:
@@ -132,6 +135,7 @@ class JiraIngestor(BaseIngestor):
 
         comments_block = self._format_comments(key, fields, session)
         comment_count = comments_block.count("\n--- comment ")
+        image_refs = self._image_refs(fields, session)
 
         text = (
             f"# {key}: {summary}\n\n"
@@ -157,7 +161,45 @@ class JiraIngestor(BaseIngestor):
                 "status": status,
                 "comment_count": comment_count,
             },
+            image_refs=image_refs,
         )
+
+    # Images
+    def _image_refs(
+        self, fields: dict[str, Any], session: requests.Session
+    ) -> list[ImageRef]:
+        """Build lazy `ImageRef`s for an issue's image attachments."""
+        if not settings.ENABLE_MULTIMODAL_INGESTION:
+            return []
+
+        refs: list[ImageRef] = []
+        for att in fields.get("attachment") or []:
+            mime_type = att.get("mimeType") or ""
+            if not mime_type.startswith("image/"):
+                continue
+            content_url = att.get("content")
+            filename = att.get("filename") or "attachment"
+            if not content_url:
+                continue
+
+            def _fetch(url: str = content_url) -> Optional[bytes]:
+                try:
+                    resp = session.get(url, timeout=30)
+                    resp.raise_for_status()
+                    return resp.content
+                except Exception as exc:
+                    logger.warning("[jira] attachment fetch failed for {}: {}", url, exc)
+                    return None
+
+            refs.append(
+                ImageRef(
+                    filename=filename,
+                    alt_text=filename,
+                    mime_type=mime_type,
+                    fetch_bytes=_fetch,
+                )
+            )
+        return refs
 
     # Comments
     def _format_comments(

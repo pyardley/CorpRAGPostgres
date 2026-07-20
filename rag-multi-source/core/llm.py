@@ -85,3 +85,58 @@ def get_reranker():
 
     logger.info("Loading cross-encoder reranker: {}", settings.RERANK_MODEL)
     return CrossEncoder(settings.RERANK_MODEL)
+
+
+@lru_cache(maxsize=1)
+def get_vision_llm() -> BaseChatModel:
+    """
+    Chat model used for image captioning (see `core.vision`).
+
+    Falls back to `get_llm()` when `VISION_MODEL` is unset — the default
+    OpenAI/Anthropic chat models are already vision-capable. Only needed
+    as an override for providers (e.g. Grok) whose configured chat model
+    isn't vision-capable.
+    """
+    if not settings.VISION_MODEL:
+        return get_llm()
+
+    provider = settings.LLM_PROVIDER
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        if not settings.OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+        logger.info("Using OpenAI vision LLM: {}", settings.VISION_MODEL)
+        return ChatOpenAI(
+            model=settings.VISION_MODEL,
+            temperature=0.1,
+            openai_api_key=settings.OPENAI_API_KEY,
+        )
+
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        if not settings.ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+        logger.info("Using Anthropic vision LLM: {}", settings.VISION_MODEL)
+        return ChatAnthropic(
+            model=settings.VISION_MODEL,
+            temperature=0.1,
+            anthropic_api_key=settings.ANTHROPIC_API_KEY,
+        )
+
+    if provider == "grok":
+        from langchain_openai import ChatOpenAI
+
+        if not settings.GROK_API_KEY:
+            raise RuntimeError("GROK_API_KEY is not set.")
+        logger.info("Using Grok vision LLM: {}", settings.VISION_MODEL)
+        return ChatOpenAI(
+            model=settings.VISION_MODEL,
+            temperature=0.1,
+            openai_api_key=settings.GROK_API_KEY,
+            openai_api_base=settings.GROK_BASE_URL,
+        )
+
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")

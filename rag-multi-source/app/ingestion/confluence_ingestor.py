@@ -19,7 +19,8 @@ from typing import Any, Iterable, Optional
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.ingestion.base import BaseIngestor, SourceResource
+from app.config import settings
+from app.ingestion.base import BaseIngestor, ImageRef, SourceResource
 
 
 def _html_to_text(html: str) -> str:
@@ -236,6 +237,7 @@ class ConfluenceIngestor(BaseIngestor):
         text = (
             f"Confluence Page: {title}\nSpace: {actual_space_key}\n\n{plain_text}"
         )
+        image_refs = self._image_refs(page_id, client)
 
         return SourceResource(
             resource_id=f"confluence:page-{page_id}",
@@ -248,4 +250,51 @@ class ConfluenceIngestor(BaseIngestor):
                 "page_id": page_id,
                 "object_name": title,
             },
+            image_refs=image_refs,
         )
+
+    # ── Images ───────────────────────────────────────────────────────────────
+
+    def _image_refs(self, page_id: str, client) -> list[ImageRef]:
+        """Build lazy `ImageRef`s for a page's image attachments."""
+        if not settings.ENABLE_MULTIMODAL_INGESTION:
+            return []
+
+        try:
+            attachments = client.get_attachments_from_content(
+                page_id, media_type=None
+            ).get("results", [])
+        except Exception as exc:
+            logger.warning(
+                "[confluence] attachment list failed for page {}: {}", page_id, exc
+            )
+            return []
+
+        refs: list[ImageRef] = []
+        for att in attachments:
+            mime_type = (att.get("metadata") or {}).get("mediaType") or ""
+            if not mime_type.startswith("image/"):
+                continue
+            download_path = (att.get("_links") or {}).get("download")
+            filename = att.get("title") or "attachment"
+            if not download_path:
+                continue
+
+            def _fetch(path: str = download_path) -> Optional[bytes]:
+                try:
+                    return client.get(path, not_json_response=True)
+                except Exception as exc:
+                    logger.warning(
+                        "[confluence] attachment fetch failed for {}: {}", path, exc
+                    )
+                    return None
+
+            refs.append(
+                ImageRef(
+                    filename=filename,
+                    alt_text=filename,
+                    mime_type=mime_type,
+                    fetch_bytes=_fetch,
+                )
+            )
+        return refs

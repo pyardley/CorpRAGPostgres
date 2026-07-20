@@ -371,6 +371,45 @@ from the CLI on an admin account that owns the union of all scopes.
 
 ---
 
+### Multi-modal ingestion (image captioning)
+
+Images embedded in Confluence pages or attached to Jira tickets —
+architecture diagrams, error screenshots — are invisible to the indexer
+by default. When `ENABLE_MULTIMODAL_INGESTION=true`, each ingestor
+discovers image attachments (Confluence: `get_attachments_from_content`;
+Jira: the issue `attachment` field), captions them with a vision-capable
+LLM (`core/vision.py`, `core.llm.get_vision_llm()`), and stores the
+caption as one extra searchable chunk per image
+(`metadata={"type": "image_caption", ...}`) — alongside the page/issue's
+normal text chunks, not in a parallel pipeline.
+
+```ini
+# .env
+ENABLE_MULTIMODAL_INGESTION=false   # default off — see below
+VISION_MODEL=                       # optional override; falls back to the provider's normal chat model
+MAX_IMAGES_PER_RESOURCE=5           # cap per Confluence page / Jira issue
+MAX_IMAGE_BYTES=5000000             # ~5MB; larger images are skipped, not truncated
+MAX_IMAGES_PER_INGESTION_RUN=200    # hard cap on vision-LLM calls per CLI invocation
+```
+
+- **Off by default, deliberately.** `app/ingestion/email_ingestor.py`
+  already made this call for email attachments — it collects filenames
+  but never downloads the bytes, with the comment "too costly + risky."
+  Image captioning is the same shape of feature (fetch binary content,
+  pay for a vision-LLM call per item) applied to Confluence/Jira instead;
+  the same caution applies. Opt in once the cost for your own ingestion
+  volume — images per resource × vision-LLM pricing — is understood.
+- **Fails open per image**, never per resource or per run. A caption
+  failure (bad model, oversized/corrupt image, network error) is logged
+  and that one image is skipped; the resource's text chunks still ingest
+  normally.
+- **Two independent cost caps.** `MAX_IMAGES_PER_RESOURCE` bounds a
+  single huge page/issue; `MAX_IMAGES_PER_INGESTION_RUN` bounds an
+  entire `--mode full` re-ingest of a whole space/project.
+- **No new dependency.** `VISION_MODEL` only needs to be set when
+  `LLM_PROVIDER=grok`, since the default Grok model isn't vision-capable
+  — the default OpenAI/Anthropic chat models already are.
+
 ### Email source — obtaining credentials
 
 The email ingestor supports three providers in a single run: **Outlook /
@@ -1530,9 +1569,11 @@ transport change, not a redesign.
 
 Things this codebase deliberately does not do today, listed in roughly
 ascending order of effort. (Live source-system ACL re-validation at
-query time and cross-encoder reranking — formerly listed here — now
-ship as flags; see [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation)
-and [Reranking with a cross-encoder](#reranking-with-a-cross-encoder).)
+query time, cross-encoder reranking, and multi-modal image captioning —
+formerly listed here — now ship as flags; see
+[Live source-system ACL re-validation](#3-live-source-system-acl-re-validation),
+[Reranking with a cross-encoder](#reranking-with-a-cross-encoder), and
+[Multi-modal ingestion (image captioning)](#multi-modal-ingestion-image-captioning).)
 
 ### 1. Per-chunk visibility (issue / page-level granularity)
 
@@ -1638,16 +1679,3 @@ database — a lightweight `entity_edges` table (`subject`, `predicate`,
 `object`, `source_resource_id`) populated during ingestion and joined
 against `user_accessible_resources` for the same tenancy guarantees
 already enforced on `vector_chunks` would cover the common cases.
-
-### 11. Multi-modal ingestion (diagrams, screenshots, attachments)
-
-Images embedded in Confluence pages or attached to Jira tickets —
-architecture diagrams, error screenshots — are invisible to the indexer
-today. Vision-capable LLM RAG (GPT-4V-style pipelines, LlamaIndex's
-multi-modal indices) caption images at ingestion time so the caption
-text becomes a normal searchable chunk. Since `BaseIngestor` already
-funnels every source through one chunking/embedding path, this would be
-one new pre-processing step — fetch the image, get a caption via
-`core.llm.get_llm()` (already available, no new provider needed), store
-it as a chunk with `metadata={"type": "image_caption", ...}` — rather
-than a parallel pipeline.
