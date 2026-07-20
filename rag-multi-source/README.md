@@ -959,12 +959,16 @@ against the source system**. Concretely:
   an ingestion themselves cannot query the data — there's no
   `user_accessible_resources` row for the retriever to use.
 
+This is still the default behaviour. An opt-in hardening layer —
+[live source-system ACL re-validation](#3-live-source-system-acl-re-validation) —
+closes the "permissions changed at the source" half of this gap by
+calling back into Jira/Confluence/SQL Server/GitHub on every query.
+
 ---
 
 ## Security & Deduplication Enhancements
 
-Two OB1 (Open Brain)-inspired upgrades sit on top of the original
-multi-tenancy model:
+Three upgrades sit on top of the original multi-tenancy model:
 
 1. **Content fingerprint deduplication** — every chunk carries a
    SHA-256 hex digest of its normalised body. The upsert path uses
@@ -979,6 +983,12 @@ multi-tenancy model:
    a regression in `filter_to_where`, an admin running a naked
    `SELECT *` from psql against the wrong role, or a future MCP tool
    that forgets to apply the access table all fail closed.
+
+3. **Live source-system ACL re-validation** (opt-in) — on every chat
+   turn, intersect the granted scopes with a live permission check
+   against Jira, Confluence, SQL Server, or GitHub, closing the
+   "permissions changed at the source but `user_accessible_resources`
+   wasn't re-synced" gap that (1) and (2) don't address.
 
 ### 1. Content fingerprint deduplication
 
@@ -1122,6 +1132,57 @@ SELECT COUNT(*) FROM vector_chunks;
   *_update / *_delete` so `SELECT * FROM pg_policies` gives an
   auditor a one-screen view of what's enforced.
 
+### 3. Live source-system ACL re-validation
+
+`user_accessible_resources` is granted once at ingestion time and never
+re-checked (see [Access model — current behaviour](#access-model--current-behaviour)).
+When `LIVE_ACL_REVALIDATION_ENABLED=true`, `core/live_acl.py` closes that
+gap by calling back into the source system itself on every chat turn and
+intersecting the live permission with the granted scope:
+
+| Source | Live check |
+|---|---|
+| Jira | `POST /rest/api/3/permissions/project` (`BROWSE_PROJECTS`) |
+| Confluence | `GET /wiki/rest/api/space/{spaceKey}` against each configured instance |
+| SQL Server | `SELECT HAS_DBACCESS(:db_name)` |
+| Git / GitHub Issues | `GET /repos/{owner}/{repo}/collaborators/{login}/permission` |
+
+Wired into two call sites:
+
+- **Chat retrieval** — `app/chat.py`'s `live_acl_check` step prunes
+  `filter_dict["by_source"]` after `build_filter`, before the vector
+  search runs.
+- **Live SQL via MCP** — `mcp_server/tools/sql_tools.py`'s `table_query`
+  and `list_databases` re-validate before executing or advertising a
+  database, since a stale grant there means live query execution
+  against a real database, not just stale indexed chunks.
+
+Properties:
+
+- **Fails closed.** Any checker error (timeout, network, unreachable
+  host, incomplete/revoked credential) excludes that scope from the
+  turn's results rather than falling back to the ingestion-time grant.
+  A slow or unreachable source system shrinks that source's results
+  instead of blocking chat.
+- **Cached.** Verdicts are cached in-process per
+  `(user_id, source, resource_identifier)` for
+  `LIVE_ACL_CACHE_TTL_SECONDS` (default 300s) so a multi-turn chat
+  session doesn't re-hit the source API on every message.
+- **Off by default.** This adds a per-query API round trip per distinct
+  scope not already cached — opt in once the source systems' rate
+  limits are understood for your deployment:
+
+  ```ini
+  # .env
+  LIVE_ACL_REVALIDATION_ENABLED=true
+  LIVE_ACL_CACHE_TTL_SECONDS=300
+  LIVE_ACL_HTTP_TIMEOUT_SECONDS=5.0
+  ```
+
+- **No checker, no-op.** Sources without a registered checker (e.g.
+  `email`) pass through unchanged — the feature only ever narrows
+  results for sources it knows how to verify.
+
 ---
 
 ## Audit & Performance Logging
@@ -1132,7 +1193,10 @@ Every chat prompt produces two pieces of durable telemetry:
    `id`, `user_id`, `timestamp`, `prompt_text` (truncated), `total_duration_ms`,
    `tokens_prompt`, `tokens_completion`, `estimated_cost_usd`, `llm_provider`,
    `llm_model`, `success`, `error_message`, `source_type`
-   (`"rag"` | `"hybrid"` | `"mcp_only"`).
+   (`"rag"` | `"hybrid"` | `"mcp_only"`), `fts_language` (`"english"` |
+   `"simple"` | `NULL` — whichever the sidebar's "🔤 Search language" picker
+   was set to for that turn; `NULL` for rows logged before this column
+   existed).
 
 2. **`query_step_timings`** — N child rows per audit entry, one per measured
    step in the answer pipeline. Each row carries `step_name`, `duration_ms`,
@@ -1146,12 +1210,18 @@ layer. Steps emitted on a typical RAG turn:
 
 ```
 build_filter         -- translate sidebar selection into the metadata filter
+live_acl_check       -- (opt-in) intersect with a live source-system permission check
 vector_retrieval     -- pgvector top-K cosine + de-dup
 build_context        -- group hits by resource, build numbered LLM context
 llm_invocation       -- single llm.invoke(messages)
 post_processing      -- extract text + assemble the audit record
 total                -- mirror of total_duration_ms (no JOIN required)
 ```
+
+`live_acl_check` is a single dict lookup (sub-millisecond) unless
+`LIVE_ACL_REVALIDATION_ENABLED=true` — see
+[Live source-system ACL re-validation](#3-live-source-system-acl-re-validation)
+below.
 
 The hybrid (MCP) path additionally emits one `llm_invocation` per hop
 (with `metadata.hop = N`) and one `mcp_tool_call:<tool_name>` per
@@ -1201,9 +1271,11 @@ the audit data without a SQL client:
   Limit (50 / 100 / 250).
 * **Summary metrics** — total prompts, failed prompts, total cost,
   total tokens, average duration across the active filter.
-* **Sortable table** — Timestamp · User · Source · Duration · Tokens ·
-  Cost · Model · Prompt-snippet, with a status icon (✅ rag /
-  ⚡ hybrid / 🟠 mcp-only / ❌ failed).
+* **Sortable table** — Timestamp · User · Source · Language · Duration ·
+  Tokens · Cost · Model · Prompt-snippet, with a status icon (✅ rag /
+  ⚡ hybrid / 🟠 mcp-only / ❌ failed). Language is the FTS config
+  (`english` / `simple`) the query used, or `—` for rows logged before
+  that column existed.
 * **Detail view** — pick any row from the dropdown below the table
   and the page expands a panel with the full prompt, the audit
   metadata, the error (if any), and a **step-by-step timing table**
@@ -1416,46 +1488,31 @@ transport change, not a redesign.
 ## Possible enhancements
 
 Things this codebase deliberately does not do today, listed in roughly
-ascending order of effort.
+ascending order of effort. (Live source-system ACL re-validation at
+query time — formerly listed here — now ships as an opt-in flag; see
+[Live source-system ACL re-validation](#3-live-source-system-acl-re-validation).)
 
-### 1. Live source-system ACL re-validation at query time
-
-Today the access table is the only thing standing between users and
-resources. A natural hardening is to have the chat layer call back into
-each source on every query and intersect the live ACL with the granted
-scopes (Jira `/rest/api/3/permissions/project`, Confluence `space`
-permissions, SQL Server `HAS_DBACCESS`, GitHub `/repos/.../collaborators/.../permission`).
-Adds a per-query API hit (use a short-TTL session cache) but closes the
-"permissions changed at the source" gap.
-
-### 2. Per-chunk visibility (issue / page-level granularity)
+### 1. Per-chunk visibility (issue / page-level granularity)
 
 The current model is at _project / space / database / repo+branch_
 granularity. For chunk-level controls (e.g. a single Jira issue restricted
 inside an otherwise-public project), capture per-resource ACL during
 ingestion and AND it into the retriever filter.
 
-### 3. Background / scheduled ingestion
+### 2. Background / scheduled ingestion
 
 A small scheduler (cron, Celery beat, GitHub Actions, the Cowork
 `schedule` skill) running
 `python -m app.ingestion.cli --source all --mode incremental` keeps the
 index fresh without anybody clicking buttons.
 
-### 4. Hybrid search (BM25 + cosine)
-
-Postgres makes this trivial: add a `tsvector` column on `vector_chunks`,
-GIN-index it, and combine `ts_rank` + `1 - (embedding <=> :q)` as the
-final score. Often a measurable improvement for keyword-heavy queries
-(error codes, IDs, exact phrases).
-
-### 5. Reranking with a cross-encoder
+### 3. Reranking with a cross-encoder
 
 A second-stage cross-encoder reranker (e.g. `bge-reranker-base`) over the
 top-50 from pgvector, returning the top-8 to the LLM. Tens of milliseconds
 of latency; meaningful accuracy bump on tricky retrievals.
 
-### 6. Streaming LLM responses
+### 4. Streaming LLM responses
 
 `render_chat` currently calls `llm.invoke()` and renders the full answer
 once it returns. Switching to `llm.stream()` and `st.write_stream()`
