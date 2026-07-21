@@ -46,6 +46,7 @@ from core.live_acl import revalidate
 from core.query_rewrite import rewrite_query
 from core.rag_chain import RAGAnswer, answer_question
 from core.reranker import rerank
+from core.response_cache import check_response_cache, store_response_cache
 from core.retriever import RetrievedChunk, retrieve
 from core.vector_store import build_query_filter
 
@@ -271,81 +272,109 @@ def render_chat(state: SelectionState) -> None:
                     t_acl.extra["filter_keys"] = sorted(filter_dict.keys())
                 logger.debug("Chat filter after live ACL check: {}", filter_dict)
 
-                with StepTimer(chat_steps, "query_rewrite") as t_rewrite:
-                    # No-ops (returns [prompt]) unless QUERY_REWRITE_ENABLED
-                    # is set — see core.query_rewrite for the decomposition
-                    # LLM call.
-                    sub_queries = rewrite_query(prompt)
-                    t_rewrite.extra["sub_query_count"] = len(sub_queries)
-
-                with StepTimer(chat_steps, "vector_retrieval") as t_retr:
-                    # user_id is required when ENABLE_RLS=True so the
-                    # RLS policies on vector_chunks recognise the
-                    # caller. The retriever no-ops the binding when
-                    # RLS is disabled. When reranking is enabled we ask
-                    # for a wider candidate pool (RERANK_CANDIDATE_K)
-                    # than the usual TOP_K so there's something for the
-                    # cross-encoder to actually rerank.
-                    #
-                    # One retrieve() call per sub-query (usually just one —
-                    # query rewriting is off by default), run concurrently
-                    # so N sub-queries cost close to one round trip of
-                    # wall-clock time rather than N. Each retrieve() call
-                    # opens its own DB session internally, so concurrent
-                    # calls are safe. Pooled by (resource_id, chunk_index),
-                    # keeping the higher score on overlap — lighter-weight
-                    # than deduplicate_by_resource, which collapses to one
-                    # chunk *per resource* and would be too aggressive here,
-                    # before rerank even runs.
-                    top_k = settings.RERANK_CANDIDATE_K if settings.RERANK_ENABLED else None
-                    pooled: dict[tuple[str, int], RetrievedChunk] = {}
-                    with ThreadPoolExecutor(max_workers=len(sub_queries)) as pool:
-                        futures = [
-                            pool.submit(
-                                retrieve,
-                                q,
-                                filter_dict,
-                                top_k=top_k,
-                                user_id=user["id"],
-                                fts_language=state.fts_language,
-                            )
-                            for q in sub_queries
-                        ]
-                        for future in futures:
-                            for hit in future.result():
-                                key = (hit.resource_id, hit.chunk_index)
-                                existing = pooled.get(key)
-                                if existing is None or hit.score > existing.score:
-                                    pooled[key] = hit
-                    hits = list(pooled.values())
-                    t_retr.extra["sub_query_count"] = len(sub_queries)
-                    t_retr.extra["retrieved_count"] = len(hits)
-
-                with StepTimer(chat_steps, "rerank") as t_rerank:
-                    # No-ops (single slice) unless RERANK_ENABLED is set —
-                    # see core.reranker for the cross-encoder pass.
-                    t_rerank.extra["candidate_count"] = len(hits)
-                    hits = rerank(prompt, hits, top_n=settings.TOP_K)
-                    t_rerank.extra["reranked_count"] = len(hits)
-
-                history = [
-                    (m["role"], m["content"])
-                    for m in st.session_state.messages
-                    if m["role"] in {"user", "assistant"}
-                ][:-1]
-
-                if used_mcp_path:
-                    # Hybrid path: RAG context + bound SQL MCP tools.
-                    from core.mcp_chain import answer_question_with_mcp
-
-                    result = answer_question_with_mcp(
-                        user_id=user["id"],
-                        question=prompt,
-                        hits=hits,
-                        history=history,
+                with StepTimer(chat_steps, "response_cache_check") as t_cache:
+                    # No-ops (returns None) unless RESPONSE_CACHE_ENABLED is
+                    # set, and never checked on the MCP/hybrid path — live
+                    # SQL data must never be served from a cache. See
+                    # core.response_cache: a hit skips query rewriting,
+                    # retrieval, and reranking entirely, not just the LLM
+                    # call, since the cache key (a fingerprint of the
+                    # *resolved* accessible scopes, not user_id) is already
+                    # known before any of those steps run.
+                    cached = (
+                        None
+                        if used_mcp_path
+                        else check_response_cache(
+                            user["id"], prompt, filter_dict, state.fts_language
+                        )
                     )
+                    t_cache.extra["hit"] = cached is not None
+
+                if cached is not None:
+                    result = cached
                 else:
-                    result = answer_question(prompt, hits, history)
+                    with StepTimer(chat_steps, "query_rewrite") as t_rewrite:
+                        # No-ops (returns [prompt]) unless QUERY_REWRITE_ENABLED
+                        # is set — see core.query_rewrite for the decomposition
+                        # LLM call.
+                        sub_queries = rewrite_query(prompt)
+                        t_rewrite.extra["sub_query_count"] = len(sub_queries)
+
+                    with StepTimer(chat_steps, "vector_retrieval") as t_retr:
+                        # user_id is required when ENABLE_RLS=True so the
+                        # RLS policies on vector_chunks recognise the
+                        # caller. The retriever no-ops the binding when
+                        # RLS is disabled. When reranking is enabled we ask
+                        # for a wider candidate pool (RERANK_CANDIDATE_K)
+                        # than the usual TOP_K so there's something for the
+                        # cross-encoder to actually rerank.
+                        #
+                        # One retrieve() call per sub-query (usually just one —
+                        # query rewriting is off by default), run concurrently
+                        # so N sub-queries cost close to one round trip of
+                        # wall-clock time rather than N. Each retrieve() call
+                        # opens its own DB session internally, so concurrent
+                        # calls are safe. Pooled by (resource_id, chunk_index),
+                        # keeping the higher score on overlap — lighter-weight
+                        # than deduplicate_by_resource, which collapses to one
+                        # chunk *per resource* and would be too aggressive here,
+                        # before rerank even runs.
+                        top_k = settings.RERANK_CANDIDATE_K if settings.RERANK_ENABLED else None
+                        pooled: dict[tuple[str, int], RetrievedChunk] = {}
+                        with ThreadPoolExecutor(max_workers=len(sub_queries)) as pool:
+                            futures = [
+                                pool.submit(
+                                    retrieve,
+                                    q,
+                                    filter_dict,
+                                    top_k=top_k,
+                                    user_id=user["id"],
+                                    fts_language=state.fts_language,
+                                )
+                                for q in sub_queries
+                            ]
+                            for future in futures:
+                                for hit in future.result():
+                                    key = (hit.resource_id, hit.chunk_index)
+                                    existing = pooled.get(key)
+                                    if existing is None or hit.score > existing.score:
+                                        pooled[key] = hit
+                        hits = list(pooled.values())
+                        t_retr.extra["sub_query_count"] = len(sub_queries)
+                        t_retr.extra["retrieved_count"] = len(hits)
+
+                    with StepTimer(chat_steps, "rerank") as t_rerank:
+                        # No-ops (single slice) unless RERANK_ENABLED is set —
+                        # see core.reranker for the cross-encoder pass.
+                        t_rerank.extra["candidate_count"] = len(hits)
+                        hits = rerank(prompt, hits, top_n=settings.TOP_K)
+                        t_rerank.extra["reranked_count"] = len(hits)
+
+                    history = [
+                        (m["role"], m["content"])
+                        for m in st.session_state.messages
+                        if m["role"] in {"user", "assistant"}
+                    ][:-1]
+
+                    if used_mcp_path:
+                        # Hybrid path: RAG context + bound SQL MCP tools.
+                        from core.mcp_chain import answer_question_with_mcp
+
+                        result = answer_question_with_mcp(
+                            user_id=user["id"],
+                            question=prompt,
+                            hits=hits,
+                            history=history,
+                        )
+                    else:
+                        result = answer_question(prompt, hits, history)
+                        # Only the plain RAG path is cached — see the
+                        # core.response_cache module docstring for why the
+                        # MCP/hybrid path is excluded (live data must never
+                        # be served from a cache).
+                        store_response_cache(
+                            user["id"], prompt, filter_dict, state.fts_language, result
+                        )
 
                 audit_record = dict(result.usage or {})
             except Exception as exc:

@@ -369,6 +369,51 @@ _RLS_STATEMENTS: tuple[tuple[str, str], ...] = (
         USING (current_setting('app.current_user_id', true) IS NOT NULL)
         """,
     ),
+    # 6. response_cache -- deliberately GUC-presence-only, not owner- or
+    #    scope-column-scoped. The real access-control boundary is the
+    #    application-layer `scope_fingerprint` match performed by
+    #    core.response_cache (two users only ever share a cache hit when
+    #    their *resolved* accessible scopes are byte-identical) -- RLS
+    #    here just keeps an unauthenticated session from reading/writing
+    #    the table at all, the same role it plays for vector_chunks'
+    #    write policies.
+    (
+        "response_cache_enable_rls",
+        "ALTER TABLE response_cache ENABLE ROW LEVEL SECURITY",
+    ),
+    (
+        "response_cache_select_policy",
+        """
+        CREATE POLICY response_cache_authenticated_select ON response_cache
+        FOR SELECT
+        USING (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
+    (
+        "response_cache_insert_policy",
+        """
+        CREATE POLICY response_cache_authenticated_insert ON response_cache
+        FOR INSERT
+        WITH CHECK (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
+    (
+        "response_cache_update_policy",
+        """
+        CREATE POLICY response_cache_authenticated_update ON response_cache
+        FOR UPDATE
+        USING (current_setting('app.current_user_id', true) IS NOT NULL)
+        WITH CHECK (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
+    (
+        "response_cache_delete_policy",
+        """
+        CREATE POLICY response_cache_authenticated_delete ON response_cache
+        FOR DELETE
+        USING (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
 )
 
 
@@ -388,6 +433,10 @@ _RLS_POLICY_NAMES: dict[str, str] = {
     "entity_edges_tenant_insert": "entity_edges",
     "entity_edges_tenant_update": "entity_edges",
     "entity_edges_tenant_delete": "entity_edges",
+    "response_cache_authenticated_select": "response_cache",
+    "response_cache_authenticated_insert": "response_cache",
+    "response_cache_authenticated_update": "response_cache",
+    "response_cache_authenticated_delete": "response_cache",
 }
 
 
@@ -477,7 +526,9 @@ def _rls_enabled(engine: Engine, table: str) -> bool:
 def _apply_rls_policies(engine: Engine) -> None:
     """
     Enable RLS + create the tenancy policies on ``vector_chunks``,
-    ``user_accessible_resources``, and ``entity_edges``. Idempotent --
+    ``user_accessible_resources``, ``entity_edges``, and
+    ``response_cache`` (the last is GUC-presence-only, not owner- or
+    scope-scoped -- see ``models.response_cache``). Idempotent --
     skips ENABLE if already on, and skips CREATE POLICY for any policy
     already present in ``pg_policies``.
 
@@ -542,7 +593,7 @@ def drop_rls_policies(engine: Engine) -> None:
             conn.execute(
                 text(f'DROP POLICY IF EXISTS "{policy_name}" ON "{table}"')
             )
-        for table in {"vector_chunks", "user_accessible_resources", "entity_edges"}:
+        for table in {"vector_chunks", "user_accessible_resources", "entity_edges", "response_cache"}:
             logger.info("Disabling RLS on {}", table)
             conn.execute(
                 text(f'ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY')
@@ -560,6 +611,7 @@ def run_migrations(engine: Engine) -> None:
     import models.query_audit_log  # noqa: F401
     import models.query_step_timing  # noqa: F401
     import models.entity_edge  # noqa: F401
+    import models.response_cache  # noqa: F401
 
     # 1. pgvector extension must exist before vector_chunks can be created.
     with engine.begin() as conn:
@@ -568,7 +620,7 @@ def run_migrations(engine: Engine) -> None:
     # 2. Tables. create_all is idempotent -- existing tables are skipped.
     Base.metadata.create_all(bind=engine)
 
-    # 3. HNSW vector index. Created post-table because SQLAlchemy doesn't
+    # 3. HNSW vector indexes. Created post-table because SQLAlchemy doesn't
     #    have first-class support for `USING hnsw` + opclass at column-decl
     #    time. m=16 / ef_construction=64 are pgvector's defaults.
     with engine.begin() as conn:
@@ -579,6 +631,16 @@ def run_migrations(engine: Engine) -> None:
                     "CREATE INDEX IF NOT EXISTS ix_vector_chunks_hnsw "
                     "ON vector_chunks USING hnsw "
                     "(embedding vector_cosine_ops) "
+                    "WITH (m = 16, ef_construction = 64)"
+                )
+            )
+        if not _index_exists(engine, "response_cache", "ix_response_cache_hnsw"):
+            logger.info("Creating HNSW index on response_cache.question_embedding...")
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_response_cache_hnsw "
+                    "ON response_cache USING hnsw "
+                    "(question_embedding vector_cosine_ops) "
                     "WITH (m = 16, ef_construction = 64)"
                 )
             )

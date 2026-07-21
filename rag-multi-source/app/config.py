@@ -112,6 +112,33 @@ class Settings(BaseSettings):
     # issue, or one per Git commit).
     ENTITY_EXTRACTION_MAX_EDGES: int = 10
 
+    # ── Semantic response cache ───────────────────────────────────────────────
+    #
+    # Repeated or near-duplicate questions currently re-run the full
+    # retrieval pipeline and pay for a full LLM call every time. When
+    # enabled, the chat layer checks `response_cache` (embedding
+    # similarity + a fingerprint of the *resolved* accessible scopes,
+    # not user_id -- see `core.response_cache`) before query rewriting /
+    # vector retrieval / reranking even run. A hit skips all of that and
+    # the LLM call. Two users only ever share a hit when their accessible
+    # data is identical, so this is safe to share across a team, not just
+    # cached per-user.
+    #
+    # Off by default. Never applies to the MCP/hybrid (live SQL) path --
+    # live data must never be served from a cache.
+    RESPONSE_CACHE_ENABLED: bool = False
+
+    # Much stricter than SCORE_THRESHOLD (0.10): a false positive here
+    # serves a wrong cached ANSWER outright, not just a weak retrieval
+    # candidate that reranking can still filter out.
+    RESPONSE_CACHE_SIMILARITY_THRESHOLD: float = 0.97
+
+    # How long a cache entry is servable. Enforced lazily (a `WHERE
+    # created_at > ...` at lookup time) -- there's no background sweep,
+    # consistent with this being a lightweight addition, not a new piece
+    # of job-scheduling infrastructure.
+    RESPONSE_CACHE_TTL_SECONDS: int = 3600
+
     # ── Chunking ─────────────────────────────────────────────────────────────
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200

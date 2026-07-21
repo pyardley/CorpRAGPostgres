@@ -202,6 +202,65 @@ The lists come from the user's rows in `user_accessible_resources`, which
 the ingestion pipeline populates whenever a user successfully ingests a
 scope.
 
+### Semantic response cache
+
+Repeated or near-duplicate questions currently re-run the full
+retrieval pipeline and pay for a full LLM call every time. When
+`RESPONSE_CACHE_ENABLED=true`, `app/chat.py` checks a `response_cache`
+table (`models/response_cache.py`) right after `live_acl_check` —
+before query rewriting, vector retrieval, or reranking even run. A hit
+skips all of that *and* the LLM call; only `core.llm.get_embeddings()`
+is called (to embed the incoming question for the similarity lookup).
+
+The interesting part is the cache key. It is **not** `user_id` — it's
+`scope_fingerprint`, a SHA-256 hash of the *resolved* accessible scopes
+actually used for retrieval (`filter_dict["by_source"]`, the same dict
+built in [Multi-tenancy: store-once + dynamic filter](#multi-tenancy-store-once--dynamic-filter)
+above, plus `fts_language`). Two users only ever share a cache hit when
+their resolved scopes are byte-identical — which, by construction,
+means they have access to exactly the same underlying data, so sharing
+the answer is provably safe. This is what actually delivers the
+scenario the feature is for ("a whole team asking the same question
+over a week") rather than a cache that's only ever useful to the one
+user who asked first. `user_id` is still stored on each row as an audit
+trail, but it plays no role in matching.
+
+Because the access boundary is the fingerprint match, not row
+ownership, RLS on `response_cache` is deliberately **GUC-presence-only**
+— `current_setting('app.current_user_id', true) IS NOT NULL` — the same
+shape as `vector_chunks`' write policies, not the owner-scoped
+`user_id = current_setting(...)` pattern used by
+`user_accessible_resources`. A session still needs to be authenticated
+to read or write the table at all; which authenticated user doesn't
+change which rows a lookup matches.
+
+```ini
+# .env
+RESPONSE_CACHE_ENABLED=false             # default — off
+RESPONSE_CACHE_SIMILARITY_THRESHOLD=0.97 # much stricter than SCORE_THRESHOLD (0.10) —
+                                          # a false positive here serves a WRONG answer outright
+RESPONSE_CACHE_TTL_SECONDS=3600
+```
+
+- **Never applies to the MCP/hybrid (live SQL) path.** Live data must
+  never be served from a cache — a cache check is skipped entirely
+  whenever `used_mcp_path` is true.
+- **Strict similarity threshold, deliberately.** `SCORE_THRESHOLD`
+  (0.10) governs which chunks are *candidates* for reranking — a false
+  positive there just means a weak candidate gets considered.
+  `RESPONSE_CACHE_SIMILARITY_THRESHOLD` (0.97) governs whether an
+  entire cached *answer* gets served verbatim — a false positive there
+  is a wrong answer. In testing, two genuinely different phrasings of
+  the same underlying question ("what is the meaning of life" vs. "what
+  is the answer to life") scored ~0.77 — comfortably below the
+  threshold, confirming it isn't so loose that paraphrases collide.
+- **Lazy TTL, no background sweep.** Expiry is a `WHERE created_at >
+  ...` at lookup time, not a scheduled job — consistent with nothing
+  else in this codebase running a job scheduler.
+- **Fails open.** Any error (embedding failure, DB issue, serialization
+  problem) is logged and skipped — a broken cache degrades to a normal
+  retrieval+LLM turn, never a broken chat turn.
+
 ### Lightweight entity graph (GraphRAG-inspired)
 
 Pure chunk similarity can't answer relationship questions — "who else
@@ -1375,22 +1434,28 @@ The pipeline is timed end-to-end with `time.perf_counter()` from the chat
 layer. Steps emitted on a typical RAG turn:
 
 ```
-build_filter         -- translate sidebar selection into the metadata filter
-live_acl_check       -- (opt-in) intersect with a live source-system permission check
-query_rewrite        -- (opt-in) decompose the question into sub-queries
-vector_retrieval     -- pgvector top-K cosine + de-dup (one call per sub-query, pooled)
-rerank               -- (opt-out) cross-encoder second pass over the candidates
-build_context        -- group hits by resource, build numbered LLM context
-llm_invocation       -- single llm.invoke(messages)
-post_processing      -- extract text + assemble the audit record
-total                -- mirror of total_duration_ms (no JOIN required)
+build_filter          -- translate sidebar selection into the metadata filter
+live_acl_check        -- (opt-in) intersect with a live source-system permission check
+response_cache_check  -- (opt-in) check for a cached answer; a hit skips every step below
+query_rewrite         -- (opt-in) decompose the question into sub-queries
+vector_retrieval      -- pgvector top-K cosine + de-dup (one call per sub-query, pooled)
+rerank                -- (opt-out) cross-encoder second pass over the candidates
+build_context         -- group hits by resource, build numbered LLM context
+llm_invocation        -- single llm.invoke(messages)
+post_processing       -- extract text + assemble the audit record
+total                 -- mirror of total_duration_ms (no JOIN required)
 ```
 
 `live_acl_check` is a single dict lookup (sub-millisecond) unless
 `LIVE_ACL_REVALIDATION_ENABLED=true` — see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation)
-below. `query_rewrite` is a single-item list return (sub-millisecond)
-unless `QUERY_REWRITE_ENABLED=true` — see
+below. `response_cache_check` is a no-op unless
+`RESPONSE_CACHE_ENABLED=true` — see
+[Semantic response cache](#semantic-response-cache) above; on a hit,
+`query_rewrite` / `vector_retrieval` / `rerank` don't run at all (they
+simply won't appear in that turn's step list), and the audit row shows
+`cost_usd = 0`. `query_rewrite` is a single-item list return
+(sub-millisecond) unless `QUERY_REWRITE_ENABLED=true` — see
 [Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition)
 above. `rerank` runs the cross-encoder by default — see
 [Reranking with a cross-encoder](#reranking-with-a-cross-encoder) above;
@@ -1670,13 +1735,15 @@ transport change, not a redesign.
 Things this codebase deliberately does not do today, listed in roughly
 ascending order of effort. (Live source-system ACL re-validation at
 query time, cross-encoder reranking, multi-modal image captioning,
-query rewriting via multi-query decomposition, and a lightweight entity
-graph — formerly listed here — now ship as flags; see
+query rewriting via multi-query decomposition, a lightweight entity
+graph, and a semantic response cache — formerly listed here — now ship
+as flags; see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation),
 [Reranking with a cross-encoder](#reranking-with-a-cross-encoder),
 [Multi-modal ingestion (image captioning)](#multi-modal-ingestion-image-captioning),
 [Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition),
-and [Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired).
+[Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired),
+and [Semantic response cache](#semantic-response-cache).
 HyDE — the other technique named in the query-rewriting entry — was
 considered and not built; see that section for why.)
 
@@ -1712,19 +1779,7 @@ the user no good match was found — or broaden the search — instead of
 quietly answering from marginal context and risking a
 plausible-sounding hallucination.
 
-### 5. Semantic response cache, in the same Postgres database
-
-Repeated or near-duplicate questions (a whole team asking "how do I get
-a Jira API token" over a week) currently re-run retrieval and pay for a
-full LLM call every time. Tools like GPTCache and Redis semantic caching
-solve this with an embedding-similarity cache in front of the LLM; this
-project could do the same without adding infrastructure — a
-`response_cache` table with its own `VECTOR(1536)` column, checked
-before `core.rag_chain.answer_question` runs, consistent with the "one
-database for everything" philosophy already called out under
-[Why PostgreSQL + pgvector?](#why-postgresql--pgvector).
-
-### 6. Citation-level relevance feedback
+### 5. Citation-level relevance feedback
 
 Enterprise search products (Glean's promote/demote, Copilot's 👍/👎)
 close the loop between what users actually found useful and what
@@ -1735,7 +1790,7 @@ retrieval surfaces next time. Add a thumbs up/down per citation in
 boost/penalty — turning the audit trail this project already logs into
 a genuine learning-to-rank signal instead of a read-only log.
 
-### 7. Ingestion-time secret / PII scanning
+### 6. Ingestion-time secret / PII scanning
 
 Jira comments, Confluence pages, and email bodies routinely contain
 pasted API keys, connection strings, or customer PII — today they're
@@ -1748,7 +1803,7 @@ system redact or quarantine a match instead of silently vectorizing a
 leaked credential — relevant given this same codebase already treats
 *its own* stored credentials as sensitive enough to Fernet-encrypt.
 
-### 8. Offline retrieval/answer-quality eval harness
+### 7. Offline retrieval/answer-quality eval harness
 
 Tuning knobs like `HNSW_EF_SEARCH`, `RRF_K`, `RERANK_CANDIDATE_K`, and
 `MAX_HITS_PER_SOURCE` are currently tuned by eyeballing results. RAGAS,
