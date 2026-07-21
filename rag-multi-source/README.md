@@ -166,6 +166,44 @@ RERANK_CANDIDATE_K=50                # candidates fetched before reranking
   `metadata.reranked_count` — see
   [Audit & Performance Logging](#audit--performance-logging).
 
+### Corrective retrieval — admit when nothing matches
+
+`core.rag_chain.answer_question` already skips the LLM call outright when
+retrieval returns zero hits. When `CORRECTIVE_RETRIEVAL_ENABLED=true`,
+that same short-circuit extends to the case where retrieval *did* return
+hits, but none of them are a good match: if the best (post-rerank)
+candidate's cross-encoder score falls below
+`CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD`, the chat layer declines to answer
+— telling the user honestly that nothing confident was found and
+suggesting they rephrase, widen their source selection, or re-ingest —
+instead of quietly generating from marginal context and risking a
+plausible-sounding hallucination. This is the "grading" step from Self-RAG
+/ Corrective RAG (CRAG).
+
+```ini
+# .env
+CORRECTIVE_RETRIEVAL_ENABLED=false        # off by default — opt in
+CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD=0.3  # on the reranker's [0, 1] scale
+```
+
+- **Depends on reranking.** The default reranker (`BAAI/bge-reranker-base`)
+  applies a sigmoid to its output, so `hit.score` is a `[0, 1]` relevance
+  score comparable across queries — unlike raw cosine similarity or an RRF
+  fusion rank, neither of which is on a fixed scale. This check is
+  therefore a no-op whenever `RERANK_ENABLED=false`, regardless of this
+  flag. `CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD` is a different scale from
+  `SCORE_THRESHOLD` (a cosine-similarity floor applied at retrieval time)
+  — don't confuse the two.
+- **Off by default.** Like query rewriting and the response cache, this
+  changes user-visible behaviour — an answer can be silently replaced by a
+  decline — so it's opt-in until the default threshold is tuned against
+  real traffic.
+- **Scoped to the plain-RAG path.** The MCP/hybrid path
+  (`answer_question_with_mcp`) is untouched — live SQL data can still be
+  useful even when the RAG citations are weak.
+- **Fails open.** Same posture as reranking: a retrieval-quality knob, not
+  an authorization boundary.
+
 ### Multi-tenancy: store-once + dynamic filter
 
 Every resource (Jira ticket, Confluence page, SQL stored proc, Git
@@ -1736,14 +1774,15 @@ Things this codebase deliberately does not do today, listed in roughly
 ascending order of effort. (Live source-system ACL re-validation at
 query time, cross-encoder reranking, multi-modal image captioning,
 query rewriting via multi-query decomposition, a lightweight entity
-graph, and a semantic response cache — formerly listed here — now ship
-as flags; see
+graph, a semantic response cache, and corrective retrieval — formerly
+listed here — now ship as flags; see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation),
 [Reranking with a cross-encoder](#reranking-with-a-cross-encoder),
 [Multi-modal ingestion (image captioning)](#multi-modal-ingestion-image-captioning),
 [Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition),
 [Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired),
-and [Semantic response cache](#semantic-response-cache).
+[Semantic response cache](#semantic-response-cache),
+and [Corrective retrieval](#corrective-retrieval--admit-when-nothing-matches).
 HyDE — the other technique named in the query-rewriting entry — was
 considered and not built; see that section for why.)
 
@@ -1768,18 +1807,7 @@ once it returns. Switching to `llm.stream()` and `st.write_stream()`
 gives a typewriter-style response and noticeably improves perceived
 latency on long answers.
 
-### 4. Corrective retrieval — admit when nothing matches
-
-Today the LLM always answers from whatever `core.retriever.retrieve`
-returns, even when every candidate is a weak match. Self-RAG and
-Corrective RAG (CRAG) add a grading step: if the top results
-(post-rerank, using the cross-encoder scores `core/reranker.py` already
-computes) fall below a confidence threshold, skip generation and tell
-the user no good match was found — or broaden the search — instead of
-quietly answering from marginal context and risking a
-plausible-sounding hallucination.
-
-### 5. Citation-level relevance feedback
+### 4. Citation-level relevance feedback
 
 Enterprise search products (Glean's promote/demote, Copilot's 👍/👎)
 close the loop between what users actually found useful and what
@@ -1790,7 +1818,7 @@ retrieval surfaces next time. Add a thumbs up/down per citation in
 boost/penalty — turning the audit trail this project already logs into
 a genuine learning-to-rank signal instead of a read-only log.
 
-### 6. Ingestion-time secret / PII scanning
+### 5. Ingestion-time secret / PII scanning
 
 Jira comments, Confluence pages, and email bodies routinely contain
 pasted API keys, connection strings, or customer PII — today they're
@@ -1803,7 +1831,7 @@ system redact or quarantine a match instead of silently vectorizing a
 leaked credential — relevant given this same codebase already treats
 *its own* stored credentials as sensitive enough to Fernet-encrypt.
 
-### 7. Offline retrieval/answer-quality eval harness
+### 6. Offline retrieval/answer-quality eval harness
 
 Tuning knobs like `HNSW_EF_SEARCH`, `RRF_K`, `RERANK_CANDIDATE_K`, and
 `MAX_HITS_PER_SOURCE` are currently tuned by eyeballing results. RAGAS,

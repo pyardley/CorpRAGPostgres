@@ -275,6 +275,30 @@ class Settings(BaseSettings):
     RERANK_MODEL: str = "BAAI/bge-reranker-base"
     RERANK_CANDIDATE_K: int = 50
 
+    # ── Corrective retrieval (admit when nothing matches) ────────────────────
+    #
+    # `core.rag_chain.answer_question` already skips the LLM call when
+    # retrieval returns zero hits. This extends the same judgment call to the
+    # case where retrieval *did* return hits but the best one is a weak
+    # match: Self-RAG / Corrective RAG (CRAG) call this a "grading" step —
+    # skipping generation trades a plausible-sounding hallucination for an
+    # honest "I don't know" (see `core.corrective_retrieval`).
+    #
+    # Only meaningful with reranking on — `RERANK_ENABLED`'s cross-encoder
+    # score is the only scoring signal in this pipeline calibrated to a fixed
+    # [0, 1] "relevance" scale comparable across queries (a sigmoid, since
+    # the default `RERANK_MODEL` has num_labels=1); raw cosine similarity and
+    # RRF fusion scores aren't. No-ops when `RERANK_ENABLED` is False,
+    # regardless of this flag.
+    #
+    # Off by default — like query rewriting and the response cache, this
+    # changes user-visible behaviour (an answer can be silently replaced by a
+    # decline), so it's opt-in until the default threshold is tuned against
+    # real traffic. `0.3` is a starting point on the reranker's [0, 1] scale —
+    # not the same scale as `SCORE_THRESHOLD` (a cosine-similarity floor).
+    CORRECTIVE_RETRIEVAL_ENABLED: bool = False
+    CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD: float = 0.3
+
     # ── Vector store ops ─────────────────────────────────────────────────────
     # Rows per upsert batch. We still chunk for memory + WAL pressure.
     VECTOR_UPSERT_BATCH_SIZE: int = 250

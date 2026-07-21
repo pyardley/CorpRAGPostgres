@@ -33,6 +33,7 @@ from loguru import logger
 
 from app.config import settings
 from app.utils import StepTimer, estimate_cost, extract_usage
+from core.corrective_retrieval import is_low_confidence
 from core.llm import get_llm
 from core.retriever import RetrievedChunk, deduplicate_by_resource
 
@@ -153,6 +154,23 @@ def _build_audit_record(
     }
 
 
+def _decline(message: str, steps: list[dict[str, Any]], retrieved_count: int) -> RAGAnswer:
+    """
+    Short-circuit before the LLM call, emitting the same shape of
+    ``RAGAnswer`` a real answer would — a zeroed audit record (via
+    ``_build_audit_record(response=None, ...)``) so the status bar and
+    ``query_audit_logs`` still see a well-formed row for the turn.
+    """
+    with StepTimer(steps, "build_context", retrieved_count=retrieved_count, citations_count=0):
+        pass
+    return RAGAnswer(
+        answer=message,
+        citations=[],
+        usage=_build_audit_record(response=None, duration_seconds=0.0),
+        steps=steps,
+    )
+
+
 def answer_question(
     question: str,
     hits: list[RetrievedChunk],
@@ -171,23 +189,30 @@ def answer_question(
     steps: list[dict[str, Any]] = []
 
     if not hits:
-        # No retrieval results — short-circuit before we waste an LLM
-        # call. We still emit a "build_context" step (with retrieved=0)
-        # so the audit shows what happened.
-        with StepTimer(steps, "build_context", retrieved_count=0, citations_count=0):
-            pass
-        return RAGAnswer(
-            answer=(
-                "I couldn't find anything in the sources you have selected that "
-                "answers that. Try widening your selection in the sidebar, or "
-                "running an ingestion pass for the relevant project / space / "
-                "database."
-            ),
-            citations=[],
-            # No LLM call was made — emit an empty audit record so the
-            # status bar still increments the prompt counter cleanly.
-            usage=_build_audit_record(response=None, duration_seconds=0.0),
-            steps=steps,
+        # No retrieval results — short-circuit before we waste an LLM call.
+        return _decline(
+            "I couldn't find anything in the sources you have selected that "
+            "answers that. Try widening your selection in the sidebar, or "
+            "running an ingestion pass for the relevant project / space / "
+            "database.",
+            steps,
+            retrieved_count=0,
+        )
+
+    if is_low_confidence(hits):
+        # Hits exist, but the best (post-rerank) one is a weak match —
+        # see core.corrective_retrieval for why this only fires when
+        # reranking is on. Skip the LLM call rather than answer from
+        # marginal context.
+        return _decline(
+            "I found some possibly related content, but nothing confident "
+            f"enough to answer from (top relevance score {hits[0].score:.2f} "
+            "is below the "
+            f"{settings.CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD:.2f} confidence "
+            "threshold). Try rephrasing your question, widening your source "
+            "selection in the sidebar, or running a fresh ingestion pass.",
+            steps,
+            retrieved_count=len(hits),
         )
 
     # Use de-duplicated, sorted citations for the visible "Sources" list, AND
