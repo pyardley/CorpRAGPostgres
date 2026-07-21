@@ -87,6 +87,47 @@ question:
 
 Switch any time — no reload, no reindex, no waiting.
 
+### Query rewriting before retrieval (multi-query decomposition)
+
+The chat layer normally sends the user's raw question straight to
+`core.retriever.retrieve` — no rewrite pass for vague or multi-part
+questions. When `QUERY_REWRITE_ENABLED=true`, `core/query_rewrite.py`
+adds one LLM call ahead of retrieval that either returns the question
+unchanged (simple, single-intent questions) or decomposes it into up to
+`QUERY_REWRITE_MAX_SUBQUERIES` standalone search queries — e.g. "compare
+X's retrieval quota to Y's caching approach" becomes two independent,
+self-contained queries. `app/chat.py` then calls `retrieve()` once per
+sub-query, pools the results (deduped by `(resource_id, chunk_index)`,
+keeping the higher score on overlap), and reranks the pool against the
+*original* question — not the synthetic sub-queries.
+
+```ini
+# .env
+QUERY_REWRITE_ENABLED=false          # default — off
+QUERY_REWRITE_MODEL=                 # optional override; falls back to the provider's normal chat model
+QUERY_REWRITE_MAX_SUBQUERIES=3       # hard cap: bounds embedding + SQL cost, not just output length
+```
+
+- **Off by default.** Unlike reranking (which adds latency *after*
+  retrieval), this adds a full extra LLM round trip *before* retrieval
+  even starts, on every turn — more user-facing, and worth opting into
+  deliberately.
+- **Concurrent sub-query retrieval.** The N `retrieve()` calls run in a
+  thread pool, so N sub-queries cost close to one round trip of
+  wall-clock time rather than N — each call already opens its own DB
+  session internally (`app.utils.get_db()`), so concurrent calls are
+  safe.
+- **Fails open.** Any rewrite error (bad structured-output parse, model
+  error, timeout) falls back to `[question]` — degrades to exactly
+  today's single-retrieve() behaviour, not a broken turn. A quality
+  knob, not an authorization boundary, same as reranking.
+- **Decomposition, not HyDE.** The alternative technique — embedding a
+  hypothetical answer passage (HyDE) instead of the question — was
+  considered and not built: it would require threading a second "what
+  to embed" parameter through `core/retriever.py` itself, since today it
+  embeds and full-text-searches the same string. Decomposition reuses
+  the retriever and reranker completely unchanged.
+
 ### Reranking with a cross-encoder
 
 Vector/RRF scoring never actually reads a candidate chunk's text against
@@ -1288,7 +1329,8 @@ layer. Steps emitted on a typical RAG turn:
 ```
 build_filter         -- translate sidebar selection into the metadata filter
 live_acl_check       -- (opt-in) intersect with a live source-system permission check
-vector_retrieval     -- pgvector top-K cosine + de-dup
+query_rewrite        -- (opt-in) decompose the question into sub-queries
+vector_retrieval     -- pgvector top-K cosine + de-dup (one call per sub-query, pooled)
 rerank               -- (opt-out) cross-encoder second pass over the candidates
 build_context        -- group hits by resource, build numbered LLM context
 llm_invocation       -- single llm.invoke(messages)
@@ -1299,7 +1341,10 @@ total                -- mirror of total_duration_ms (no JOIN required)
 `live_acl_check` is a single dict lookup (sub-millisecond) unless
 `LIVE_ACL_REVALIDATION_ENABLED=true` — see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation)
-below. `rerank` runs the cross-encoder by default — see
+below. `query_rewrite` is a single-item list return (sub-millisecond)
+unless `QUERY_REWRITE_ENABLED=true` — see
+[Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition)
+above. `rerank` runs the cross-encoder by default — see
 [Reranking with a cross-encoder](#reranking-with-a-cross-encoder) above;
 set `RERANK_ENABLED=false` to make it a no-op slice instead.
 
@@ -1569,11 +1614,15 @@ transport change, not a redesign.
 
 Things this codebase deliberately does not do today, listed in roughly
 ascending order of effort. (Live source-system ACL re-validation at
-query time, cross-encoder reranking, and multi-modal image captioning —
-formerly listed here — now ship as flags; see
+query time, cross-encoder reranking, multi-modal image captioning, and
+query rewriting via multi-query decomposition — formerly listed here —
+now ship as flags; see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation),
-[Reranking with a cross-encoder](#reranking-with-a-cross-encoder), and
-[Multi-modal ingestion (image captioning)](#multi-modal-ingestion-image-captioning).)
+[Reranking with a cross-encoder](#reranking-with-a-cross-encoder),
+[Multi-modal ingestion (image captioning)](#multi-modal-ingestion-image-captioning),
+and [Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition).
+HyDE — the other technique named in the query-rewriting entry — was
+considered and not built; see that section for why.)
 
 ### 1. Per-chunk visibility (issue / page-level granularity)
 
@@ -1596,20 +1645,7 @@ once it returns. Switching to `llm.stream()` and `st.write_stream()`
 gives a typewriter-style response and noticeably improves perceived
 latency on long answers.
 
-### 4. Query rewriting before retrieval (HyDE / decomposition)
-
-The chat layer sends the user's raw question straight to
-`core.retriever.retrieve`. LlamaIndex's HyDE transform and sub-question
-query engines, and Perplexity's query expansion, instead have the LLM
-rewrite the question first — either into a hypothetical answer passage
-(whose embedding often matches real chunks better than a short question
-does) or into several sub-questions run in parallel and merged. A new
-`query_rewrite` `StepTimer` step ahead of `vector_retrieval` would fit
-the existing per-turn step-timing pattern (`build_filter` →
-`live_acl_check` → `vector_retrieval` → `rerank` → …) with no retriever
-changes.
-
-### 5. Corrective retrieval — admit when nothing matches
+### 4. Corrective retrieval — admit when nothing matches
 
 Today the LLM always answers from whatever `core.retriever.retrieve`
 returns, even when every candidate is a weak match. Self-RAG and
@@ -1620,7 +1656,7 @@ the user no good match was found — or broaden the search — instead of
 quietly answering from marginal context and risking a
 plausible-sounding hallucination.
 
-### 6. Semantic response cache, in the same Postgres database
+### 5. Semantic response cache, in the same Postgres database
 
 Repeated or near-duplicate questions (a whole team asking "how do I get
 a Jira API token" over a week) currently re-run retrieval and pay for a
@@ -1632,7 +1668,7 @@ before `core.rag_chain.answer_question` runs, consistent with the "one
 database for everything" philosophy already called out under
 [Why PostgreSQL + pgvector?](#why-postgresql--pgvector).
 
-### 7. Citation-level relevance feedback
+### 6. Citation-level relevance feedback
 
 Enterprise search products (Glean's promote/demote, Copilot's 👍/👎)
 close the loop between what users actually found useful and what
@@ -1643,7 +1679,7 @@ retrieval surfaces next time. Add a thumbs up/down per citation in
 boost/penalty — turning the audit trail this project already logs into
 a genuine learning-to-rank signal instead of a read-only log.
 
-### 8. Ingestion-time secret / PII scanning
+### 7. Ingestion-time secret / PII scanning
 
 Jira comments, Confluence pages, and email bodies routinely contain
 pasted API keys, connection strings, or customer PII — today they're
@@ -1656,7 +1692,7 @@ system redact or quarantine a match instead of silently vectorizing a
 leaked credential — relevant given this same codebase already treats
 *its own* stored credentials as sensitive enough to Fernet-encrypt.
 
-### 9. Offline retrieval/answer-quality eval harness
+### 8. Offline retrieval/answer-quality eval harness
 
 Tuning knobs like `HNSW_EF_SEARCH`, `RRF_K`, `RERANK_CANDIDATE_K`, and
 `MAX_HITS_PER_SOURCE` are currently tuned by eyeballing results. RAGAS,
@@ -1668,7 +1704,7 @@ a curated `(question, expected resource_id)` set through `retrieve()`
 and `answer_question()` and tracking the scores over time, would turn
 retrieval tuning into something measurable instead of anecdotal.
 
-### 10. Lightweight entity graph (GraphRAG-inspired)
+### 9. Lightweight entity graph (GraphRAG-inspired)
 
 Pure chunk similarity can't answer relationship questions — "who else
 has touched tickets related to this outage?", "which repos does this

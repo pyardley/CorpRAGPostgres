@@ -162,6 +162,36 @@ class Settings(BaseSettings):
     RRF_K: int = 60
     FTS_LANGUAGE: str = "english"
 
+    # ── Query rewriting (multi-query decomposition) ──────────────────────────
+    #
+    # The chat layer sends the user's raw question straight to
+    # `core.retriever.retrieve` — no rewrite pass for vague or multi-part
+    # questions. When enabled, `core.query_rewrite.rewrite_query` makes one
+    # LLM call that either returns the question unchanged (simple,
+    # single-intent questions) or decomposes it into up to
+    # QUERY_REWRITE_MAX_SUBQUERIES standalone search queries. The chat layer
+    # then calls `retrieve()` once per sub-query (concurrently, via a thread
+    # pool, so N sub-queries cost close to one round trip of wall-clock time)
+    # and pools the results before reranking.
+    #
+    # Off by default — this adds a full extra LLM round trip *before*
+    # retrieval even starts, on every turn, more user-facing than
+    # reranking's post-retrieval latency. Fails OPEN: any rewrite error
+    # (bad structured-output parse, model error, timeout) falls back to
+    # `[question]` — degrades to exactly today's single-retrieve()
+    # behaviour, not a broken turn. This is a retrieval-quality knob, not
+    # an authorization boundary.
+    QUERY_REWRITE_ENABLED: bool = False
+
+    # Model used for the rewrite call. Falls back to the provider's normal
+    # chat model (`OPENAI_CHAT_MODEL` / `ANTHROPIC_MODEL`) when unset.
+    QUERY_REWRITE_MODEL: Optional[str] = None
+
+    # Hard cap on decomposed sub-queries. Directly bounds added cost/DB
+    # load: N sub-queries means N embedding API calls plus N sets of
+    # per-source SQL, not just a longer answer.
+    QUERY_REWRITE_MAX_SUBQUERIES: int = 3
+
     # ── Reranking (cross-encoder second stage) ───────────────────────────────
     #
     # Vector/RRF scoring never actually reads a candidate chunk's text

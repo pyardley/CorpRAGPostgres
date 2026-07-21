@@ -24,6 +24,7 @@ for each turn:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import streamlit as st
@@ -42,6 +43,7 @@ from app.utils import (
     update_session_totals,
 )
 from core.live_acl import revalidate
+from core.query_rewrite import rewrite_query
 from core.rag_chain import RAGAnswer, answer_question
 from core.reranker import rerank
 from core.retriever import RetrievedChunk, retrieve
@@ -262,6 +264,13 @@ def render_chat(state: SelectionState) -> None:
                     t_acl.extra["filter_keys"] = sorted(filter_dict.keys())
                 logger.debug("Chat filter after live ACL check: {}", filter_dict)
 
+                with StepTimer(chat_steps, "query_rewrite") as t_rewrite:
+                    # No-ops (returns [prompt]) unless QUERY_REWRITE_ENABLED
+                    # is set — see core.query_rewrite for the decomposition
+                    # LLM call.
+                    sub_queries = rewrite_query(prompt)
+                    t_rewrite.extra["sub_query_count"] = len(sub_queries)
+
                 with StepTimer(chat_steps, "vector_retrieval") as t_retr:
                     # user_id is required when ENABLE_RLS=True so the
                     # RLS policies on vector_chunks recognise the
@@ -270,13 +279,39 @@ def render_chat(state: SelectionState) -> None:
                     # for a wider candidate pool (RERANK_CANDIDATE_K)
                     # than the usual TOP_K so there's something for the
                     # cross-encoder to actually rerank.
-                    hits = retrieve(
-                        prompt,
-                        filter_dict,
-                        top_k=settings.RERANK_CANDIDATE_K if settings.RERANK_ENABLED else None,
-                        user_id=user["id"],
-                        fts_language=state.fts_language,
-                    )
+                    #
+                    # One retrieve() call per sub-query (usually just one —
+                    # query rewriting is off by default), run concurrently
+                    # so N sub-queries cost close to one round trip of
+                    # wall-clock time rather than N. Each retrieve() call
+                    # opens its own DB session internally, so concurrent
+                    # calls are safe. Pooled by (resource_id, chunk_index),
+                    # keeping the higher score on overlap — lighter-weight
+                    # than deduplicate_by_resource, which collapses to one
+                    # chunk *per resource* and would be too aggressive here,
+                    # before rerank even runs.
+                    top_k = settings.RERANK_CANDIDATE_K if settings.RERANK_ENABLED else None
+                    pooled: dict[tuple[str, int], RetrievedChunk] = {}
+                    with ThreadPoolExecutor(max_workers=len(sub_queries)) as pool:
+                        futures = [
+                            pool.submit(
+                                retrieve,
+                                q,
+                                filter_dict,
+                                top_k=top_k,
+                                user_id=user["id"],
+                                fts_language=state.fts_language,
+                            )
+                            for q in sub_queries
+                        ]
+                        for future in futures:
+                            for hit in future.result():
+                                key = (hit.resource_id, hit.chunk_index)
+                                existing = pooled.get(key)
+                                if existing is None or hit.score > existing.score:
+                                    pooled[key] = hit
+                    hits = list(pooled.values())
+                    t_retr.extra["sub_query_count"] = len(sub_queries)
                     t_retr.extra["retrieved_count"] = len(hits)
 
                 with StepTimer(chat_steps, "rerank") as t_rerank:
