@@ -202,6 +202,54 @@ The lists come from the user's rows in `user_accessible_resources`, which
 the ingestion pipeline populates whenever a user successfully ingests a
 scope.
 
+### Lightweight entity graph (GraphRAG-inspired)
+
+Pure chunk similarity can't answer relationship questions — "who else
+has touched tickets related to this outage?", "which repos does this
+author maintain?". When `ENABLE_ENTITY_GRAPH=true`, ingestion also
+writes `(subject, predicate, object)` triples to a new `entity_edges`
+table (`models/entity_edge.py`), tenancy-scoped exactly like
+`vector_chunks` — its own `source` / `resource_identifier` columns and
+RLS policies (`models/migrations.py`), joined against
+`user_accessible_resources` the same way.
+
+Two sources of edges:
+
+- **Deterministic, zero extra cost** — Jira's `assignee`/`reporter`
+  (stable `accountId`, falling back to display name) and Git's
+  per-commit author (email, falling back to name) are already present
+  in API responses the ingestors fetch anyway; `jira_ingestor.py` /
+  `git_ingestor.py` just weren't reading those fields before. No API
+  call, no LLM call. Git edges use the **repo scope** as the subject
+  (not the per-commit resource), so every commit by the same author
+  points at one repo-level node — that's what makes "which repos does X
+  maintain" a single query instead of N.
+- **LLM-extracted, opt-in** (`ENABLE_ENTITY_EXTRACTION_LLM=true`) — an
+  additional pass over free text (ticket descriptions/comments, commit
+  messages) via `core/entity_extraction.py`, capped at
+  `ENTITY_EXTRACTION_MAX_EDGES` per resource. Same fail-open philosophy
+  as reranking / query rewriting / image captioning: any extraction
+  error is logged and skipped, never blocks the resource's chunks or
+  its deterministic edges.
+
+```ini
+# .env
+ENABLE_ENTITY_GRAPH=false           # default off — new table + RLS policies + ingestion-time writes
+ENABLE_ENTITY_EXTRACTION_LLM=false  # additional opt-in LLM pass over free text; requires ENABLE_ENTITY_GRAPH
+ENTITY_EXTRACTION_MODEL=            # optional override; falls back to the provider's normal chat model
+ENTITY_EXTRACTION_MAX_EDGES=10
+```
+
+Queried at chat time via the **`entity_graph_query`** MCP tool (see
+[Hybrid RAG + MCP](#hybrid-rag--mcp-live-sql-server-table-data) below)
+rather than auto-injected into every RAG context — the LLM decides when
+a question actually needs graph traversal, consistent with how this
+codebase already handles live/structured data. The tool is bound
+whenever `ENABLE_ENTITY_GRAPH=true`, independent of the "Use Live SQL"
+toggle — there's no separate sidebar control, matching the plain
+`.env`-flag precedent set by reranking, live-ACL revalidation, and
+query rewriting.
+
 ### Stable resource IDs
 
 | Source     | Format                                                                                  |
@@ -1489,19 +1537,26 @@ rows — on top of the existing RAG over schemas / stored-procedure code.
 └─────────────────────────────────────────┘
 ```
 
+The same server also exposes `POST /mcp/tools/entity_graph_query`
+(bound to the LLM whenever `ENABLE_ENTITY_GRAPH=true`) for relationship
+questions — see
+[Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired)
+above.
+
 ### What changed (code map)
 
-| Path                            | Purpose                                        |
-| ------------------------------- | ---------------------------------------------- |
-| `mcp_server/server.py`          | FastAPI app exposing MCP-style tool endpoints  |
-| `mcp_server/tools/sql_tools.py` | Read-only SELECT validator + executor          |
-| `mcp_server/config.py`          | `MCP_HOST` / `MCP_PORT` / row caps / token     |
-| `core/mcp_client.py`            | `httpx` client + LangChain `StructuredTool`s   |
-| `app/mcp_manager.py`            | Spawns/health-checks the MCP child process     |
-| `core/mcp_chain.py`             | Hybrid answerer: RAG context + bound MCP tools |
-| `app/sidebar.py`                | "⚡ Use Live SQL Table Data (MCP)" toggle      |
-| `app/chat.py`                   | Routes through `core.mcp_chain` when toggle on |
-| `app/main.py`                   | `ensure_mcp_running()` on first auth load      |
+| Path                                       | Purpose                                        |
+| ------------------------------------------ | ----------------------------------------------- |
+| `mcp_server/server.py`                     | FastAPI app exposing MCP-style tool endpoints  |
+| `mcp_server/tools/sql_tools.py`            | Read-only SELECT validator + executor          |
+| `mcp_server/tools/entity_graph_tools.py`   | Entity-graph search (see [Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired)) |
+| `mcp_server/config.py`                     | `MCP_HOST` / `MCP_PORT` / row caps / token     |
+| `core/mcp_client.py`                       | `httpx` client + LangChain `StructuredTool`s   |
+| `app/mcp_manager.py`                       | Spawns/health-checks the MCP child process     |
+| `core/mcp_chain.py`                        | Hybrid answerer: RAG context + bound MCP tools |
+| `app/sidebar.py`                           | "⚡ Use Live SQL Table Data (MCP)" toggle      |
+| `app/chat.py`                              | Routes through `core.mcp_chain` when toggle on, or when `ENABLE_ENTITY_GRAPH=true` |
+| `app/main.py`                              | `ensure_mcp_running()` on first auth load      |
 
 ### Safety guarantees (enforced server-side)
 
@@ -1614,13 +1669,14 @@ transport change, not a redesign.
 
 Things this codebase deliberately does not do today, listed in roughly
 ascending order of effort. (Live source-system ACL re-validation at
-query time, cross-encoder reranking, multi-modal image captioning, and
-query rewriting via multi-query decomposition — formerly listed here —
-now ship as flags; see
+query time, cross-encoder reranking, multi-modal image captioning,
+query rewriting via multi-query decomposition, and a lightweight entity
+graph — formerly listed here — now ship as flags; see
 [Live source-system ACL re-validation](#3-live-source-system-acl-re-validation),
 [Reranking with a cross-encoder](#reranking-with-a-cross-encoder),
 [Multi-modal ingestion (image captioning)](#multi-modal-ingestion-image-captioning),
-and [Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition).
+[Query rewriting before retrieval](#query-rewriting-before-retrieval-multi-query-decomposition),
+and [Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired).
 HyDE — the other technique named in the query-rewriting entry — was
 considered and not built; see that section for why.)
 
@@ -1703,15 +1759,3 @@ the same shape as the existing `scripts/vector_store_admin.py`, running
 a curated `(question, expected resource_id)` set through `retrieve()`
 and `answer_question()` and tracking the scores over time, would turn
 retrieval tuning into something measurable instead of anecdotal.
-
-### 9. Lightweight entity graph (GraphRAG-inspired)
-
-Pure chunk similarity can't answer relationship questions — "who else
-has touched tickets related to this outage?", "which repos does this
-Confluence page's author maintain?". Microsoft's GraphRAG and Neo4j's
-GraphRAG pattern solve this by extracting entities and relationships at
-ingestion time into a graph layer. This doesn't need a separate graph
-database — a lightweight `entity_edges` table (`subject`, `predicate`,
-`object`, `source_resource_id`) populated during ingestion and joined
-against `user_accessible_resources` for the same tenancy guarantees
-already enforced on `vector_chunks` would cover the common cases.

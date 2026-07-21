@@ -54,6 +54,7 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 
 from app.config import settings
 from app.utils import grant_access
+from core.entity_graph import upsert_edges
 from core.vector_store import (
     ResourceChunk,
     compute_content_fingerprint,
@@ -98,6 +99,10 @@ class SourceResource:
     last_updated: str  # ISO-8601 string
     metadata: dict[str, Any] = field(default_factory=dict)
     image_refs: list[ImageRef] = field(default_factory=list)
+    # Deterministic (subject, predicate, object) edges the ingestor
+    # already knows from structured fields (e.g. Jira assignee/reporter,
+    # Git commit author) — see BaseIngestor._persist_entity_edges.
+    entity_edges: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -370,6 +375,8 @@ class BaseIngestor(ABC):
         result.items_processed += 1
         result.vectors_upserted += upserted
 
+        self._persist_entity_edges(resource)
+
         if (
             result.last_item_updated_at is None
             or resource.last_updated > result.last_item_updated_at
@@ -503,6 +510,44 @@ class BaseIngestor(ABC):
                 )
             )
         return chunks
+
+    def _persist_entity_edges(self, resource: SourceResource) -> int:
+        """
+        Persist `resource.entity_edges` (deterministic, set by the
+        ingestor — e.g. Jira assignee/reporter, Git commit author) plus,
+        when `settings.ENABLE_ENTITY_EXTRACTION_LLM` is set, edges
+        extracted from `resource.text` by an LLM pass.
+
+        No-ops (returns 0) unless `settings.ENABLE_ENTITY_GRAPH` is set.
+        The LLM extraction pass fails OPEN — an extraction error is
+        logged and skipped; deterministic edges (and the resource's
+        chunks) still persist normally.
+        """
+        if not settings.ENABLE_ENTITY_GRAPH:
+            return 0
+
+        edges: list[tuple[str, str, str, str]] = [
+            (subject, predicate, obj, "deterministic")
+            for subject, predicate, obj in resource.entity_edges
+        ]
+
+        if settings.ENABLE_ENTITY_EXTRACTION_LLM:
+            from core.entity_extraction import extract_entities
+
+            # extract_entities() already fails open (logs + returns []),
+            # so no try/except needed here.
+            edges += [
+                (subject, predicate, obj, "llm")
+                for subject, predicate, obj in extract_entities(resource.text)
+            ]
+
+        return upsert_edges(
+            self.source,
+            self.resource_identifier_for(resource),
+            resource.resource_id,
+            edges,
+            user_id=self.user_id,
+        )
 
     def _prune_orphan_tail_chunks(
         self, resource_id: str, kept_chunks: int

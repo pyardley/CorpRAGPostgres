@@ -41,6 +41,7 @@ from typing import Any, Iterable, Optional
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from app.config import settings
 from app.ingestion.base import BaseIngestor, SourceResource
 
 
@@ -248,6 +249,18 @@ class GitIngestor(BaseIngestor):
                 text += f"\nFiles changed: {', '.join(files_changed)}"
 
             git_scope = f"{repo.full_name}@{branch}"
+
+            # Deterministic entity edge — no extra API call, the author
+            # is already in `commit.commit.author`. Subject is the repo
+            # scope (not the per-commit resource) so every commit by the
+            # same author points at one repo-level node — this is what
+            # lets "which repos does X maintain" be a single query.
+            entity_edges: list[tuple[str, str, str]] = []
+            if settings.ENABLE_ENTITY_GRAPH and author_obj:
+                person = author_obj.email or author_obj.name
+                if person:
+                    entity_edges.append((git_scope, "modified_by", person))
+
             return SourceResource(
                 resource_id=f"git:{git_scope}:commit:{sha}",
                 title=f"{repo.name}: {short_msg or sha[:8]}",
@@ -262,6 +275,7 @@ class GitIngestor(BaseIngestor):
                     "sha": sha[:8],
                     "object_name": sha[:8],
                 },
+                entity_edges=entity_edges,
             )
         except Exception as exc:
             logger.warning("[git] Could not convert commit: {}", exc)

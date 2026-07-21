@@ -233,7 +233,14 @@ def render_chat(state: SelectionState) -> None:
     audit_record: dict[str, Any] | None = None
     success = True
     error_message: str | None = None
-    used_mcp_path = bool(state.use_mcp_sql and "sql" in state.sources)
+    # The entity-graph MCP tool has no dedicated sidebar toggle (same
+    # precedent as reranking / live-ACL / query rewriting — a pure
+    # .env-level flag). Once an operator sets ENABLE_ENTITY_GRAPH=true,
+    # every turn takes the hybrid/MCP path so the tool is available,
+    # independent of whether the user has "Use Live SQL" on.
+    used_mcp_path = bool(
+        (state.use_mcp_sql and "sql" in state.sources) or settings.ENABLE_ENTITY_GRAPH
+    )
 
     # Wall-clock the entire answer-generation cycle (retrieval + reasoning
     # + tool calls). This is the user-perceived latency and is what we

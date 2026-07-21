@@ -201,3 +201,59 @@ def get_query_rewrite_llm() -> BaseChatModel:
         )
 
     raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
+
+
+@lru_cache(maxsize=1)
+def get_entity_extraction_llm() -> BaseChatModel:
+    """
+    Chat model used for LLM-extracted entity edges (see
+    `core.entity_extraction`).
+
+    Falls back to `get_llm()` when `ENTITY_EXTRACTION_MODEL` is unset.
+    """
+    if not settings.ENTITY_EXTRACTION_MODEL:
+        return get_llm()
+
+    provider = settings.LLM_PROVIDER
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        if not settings.OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+        logger.info("Using OpenAI entity-extraction LLM: {}", settings.ENTITY_EXTRACTION_MODEL)
+        return ChatOpenAI(
+            model=settings.ENTITY_EXTRACTION_MODEL,
+            temperature=0.1,
+            openai_api_key=settings.OPENAI_API_KEY,
+            request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        if not settings.ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+        logger.info("Using Anthropic entity-extraction LLM: {}", settings.ENTITY_EXTRACTION_MODEL)
+        return ChatAnthropic(
+            model=settings.ENTITY_EXTRACTION_MODEL,
+            temperature=0.1,
+            anthropic_api_key=settings.ANTHROPIC_API_KEY,
+            default_request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    if provider == "grok":
+        from langchain_openai import ChatOpenAI
+
+        if not settings.GROK_API_KEY:
+            raise RuntimeError("GROK_API_KEY is not set.")
+        logger.info("Using Grok entity-extraction LLM: {}", settings.ENTITY_EXTRACTION_MODEL)
+        return ChatOpenAI(
+            model=settings.ENTITY_EXTRACTION_MODEL,
+            temperature=0.1,
+            openai_api_key=settings.GROK_API_KEY,
+            openai_api_base=settings.GROK_BASE_URL,
+            request_timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")

@@ -80,6 +80,38 @@ class Settings(BaseSettings):
     MAX_IMAGE_BYTES: int = 5_000_000
     MAX_IMAGES_PER_INGESTION_RUN: int = 200
 
+    # ── Entity graph (GraphRAG-inspired) ──────────────────────────────────────
+    #
+    # Pure chunk similarity can't answer relationship questions ("who else
+    # has touched tickets related to this outage?", "which repos does this
+    # author maintain?"). When enabled, ingestion also writes lightweight
+    # (subject, predicate, object) triples to the `entity_edges` table --
+    # deterministically from structured fields already fetched (Jira
+    # assignee/reporter, Git commit author) at zero extra API/LLM cost.
+    # Queried at chat time via the `entity_graph_query` MCP tool
+    # (`mcp_server/tools/entity_graph_tools.py`), bound to the LLM whenever
+    # this flag is on -- see `core.mcp_client.build_mcp_tools`.
+    #
+    # Off by default, same category as multi-modal ingestion: an
+    # ingestion-time enrichment step with its own table + RLS policies.
+    ENABLE_ENTITY_GRAPH: bool = False
+
+    # Additional opt-in pass: also extract relationships from free text
+    # (ticket descriptions/comments, commit messages) via an LLM call --
+    # see `core.entity_extraction`. Requires ENABLE_ENTITY_GRAPH. Unlike
+    # the deterministic edges above, this has the same cost/latency/
+    # fail-open surface as reranking / query rewriting / image captioning.
+    ENABLE_ENTITY_EXTRACTION_LLM: bool = False
+
+    # Model used for LLM-extracted edges. Falls back to the provider's
+    # normal chat model when unset.
+    ENTITY_EXTRACTION_MODEL: Optional[str] = None
+
+    # Cap on LLM-extracted edges per resource (deterministic edges are
+    # not capped -- there are at most two, assignee + reporter, per Jira
+    # issue, or one per Git commit).
+    ENTITY_EXTRACTION_MAX_EDGES: int = 10
+
     # ── Chunking ─────────────────────────────────────────────────────────────
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200

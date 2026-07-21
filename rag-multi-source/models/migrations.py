@@ -319,6 +319,56 @@ _RLS_STATEMENTS: tuple[tuple[str, str], ...] = (
         USING (user_id = current_setting('app.current_user_id', true))
         """,
     ),
+    # 5. entity_edges -- same tenancy shape as vector_chunks, joined on
+    #    (source, resource_identifier) directly (no COALESCE needed --
+    #    unlike vector_chunks' five promoted scope columns, entity_edges
+    #    has just one resource_identifier column).
+    (
+        "entity_edges_enable_rls",
+        "ALTER TABLE entity_edges ENABLE ROW LEVEL SECURITY",
+    ),
+    (
+        "entity_edges_select_policy",
+        """
+        CREATE POLICY entity_edges_tenant_select ON entity_edges
+        FOR SELECT
+        USING (
+            current_setting('app.current_user_id', true) IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM user_accessible_resources uar
+                WHERE uar.user_id = current_setting('app.current_user_id', true)
+                  AND uar.source = entity_edges.source
+                  AND uar.resource_identifier = entity_edges.resource_identifier
+            )
+        )
+        """,
+    ),
+    (
+        "entity_edges_insert_policy",
+        """
+        CREATE POLICY entity_edges_tenant_insert ON entity_edges
+        FOR INSERT
+        WITH CHECK (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
+    (
+        "entity_edges_update_policy",
+        """
+        CREATE POLICY entity_edges_tenant_update ON entity_edges
+        FOR UPDATE
+        USING (current_setting('app.current_user_id', true) IS NOT NULL)
+        WITH CHECK (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
+    (
+        "entity_edges_delete_policy",
+        """
+        CREATE POLICY entity_edges_tenant_delete ON entity_edges
+        FOR DELETE
+        USING (current_setting('app.current_user_id', true) IS NOT NULL)
+        """,
+    ),
 )
 
 
@@ -334,6 +384,10 @@ _RLS_POLICY_NAMES: dict[str, str] = {
     "uar_owner_insert": "user_accessible_resources",
     "uar_owner_update": "user_accessible_resources",
     "uar_owner_delete": "user_accessible_resources",
+    "entity_edges_tenant_select": "entity_edges",
+    "entity_edges_tenant_insert": "entity_edges",
+    "entity_edges_tenant_update": "entity_edges",
+    "entity_edges_tenant_delete": "entity_edges",
 }
 
 
@@ -422,10 +476,10 @@ def _rls_enabled(engine: Engine, table: str) -> bool:
 
 def _apply_rls_policies(engine: Engine) -> None:
     """
-    Enable RLS + create the tenancy policies on ``vector_chunks`` and
-    ``user_accessible_resources``. Idempotent -- skips ENABLE if already
-    on, and skips CREATE POLICY for any policy already present in
-    ``pg_policies``.
+    Enable RLS + create the tenancy policies on ``vector_chunks``,
+    ``user_accessible_resources``, and ``entity_edges``. Idempotent --
+    skips ENABLE if already on, and skips CREATE POLICY for any policy
+    already present in ``pg_policies``.
 
     Quietly returns if ``settings.ENABLE_RLS`` is False so the helper
     is opt-in and existing deployments continue to work unchanged.
@@ -488,7 +542,7 @@ def drop_rls_policies(engine: Engine) -> None:
             conn.execute(
                 text(f'DROP POLICY IF EXISTS "{policy_name}" ON "{table}"')
             )
-        for table in {"vector_chunks", "user_accessible_resources"}:
+        for table in {"vector_chunks", "user_accessible_resources", "entity_edges"}:
             logger.info("Disabling RLS on {}", table)
             conn.execute(
                 text(f'ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY')
@@ -505,6 +559,7 @@ def run_migrations(engine: Engine) -> None:
     import models.vector_chunk  # noqa: F401
     import models.query_audit_log  # noqa: F401
     import models.query_step_timing  # noqa: F401
+    import models.entity_edge  # noqa: F401
 
     # 1. pgvector extension must exist before vector_chunks can be created.
     with engine.begin() as conn:

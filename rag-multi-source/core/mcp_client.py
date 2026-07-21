@@ -24,6 +24,7 @@ from typing import Any, Optional
 import httpx
 from loguru import logger
 
+from app.config import settings
 from mcp_server.config import mcp_settings
 
 
@@ -197,6 +198,21 @@ class MCPClient:
             },
         )
 
+    def entity_graph_query(
+        self,
+        user_id: str,
+        entity: str,
+        max_results: Optional[int] = None,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/entity_graph_query",
+            {
+                "user_id": user_id,
+                "entity": entity,
+                "max_results": max_results,
+            },
+        )
+
     def close(self) -> None:
         try:
             self._client.close()
@@ -280,7 +296,7 @@ def build_mcp_tools(user_id: str) -> list[Any]:
         result = client.sql_list_databases(user_id=user_id)
         return result.markdown if result.ok else f"ERROR: {result.error}"
 
-    return [
+    tools = [
         StructuredTool.from_function(
             func=_run_sql_query,
             name="sql_table_query",
@@ -306,3 +322,47 @@ def build_mcp_tools(user_id: str) -> list[Any]:
             args_schema=SqlListDatabasesArgs,
         ),
     ]
+
+    # Only bound when settings.ENABLE_ENTITY_GRAPH is set — checked
+    # internally here rather than requiring every caller to pass a flag,
+    # matching how core.reranker.rerank() / core.query_rewrite.rewrite_query()
+    # check their own settings.
+    if settings.ENABLE_ENTITY_GRAPH:
+
+        class EntityGraphQueryArgs(BaseModel):
+            entity: str = Field(
+                ...,
+                description=(
+                    "A resource id (e.g. 'jira:PROJ-123'), a person's "
+                    "name/accountId/email, or a repo scope (e.g. "
+                    "'owner/repo@main') to search for."
+                ),
+            )
+            max_results: Optional[int] = Field(
+                default=None, description="Max edges to return (default 20)."
+            )
+
+        def _run_entity_graph_query(entity: str, max_results: Optional[int] = None) -> str:
+            result = client.entity_graph_query(
+                user_id=user_id, entity=entity, max_results=max_results
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_entity_graph_query,
+                name="entity_graph_query",
+                description=(
+                    "Search the entity relationship graph for edges "
+                    "involving a person, ticket, or repository — "
+                    "assigned_to, reported_by (Jira), modified_by (Git), "
+                    "plus any LLM-extracted relationships. Use this for "
+                    "relationship questions plain text search can't "
+                    "answer, e.g. 'who else worked on tickets like this "
+                    "one' or 'which repos does alice maintain'."
+                ),
+                args_schema=EntityGraphQueryArgs,
+            )
+        )
+
+    return tools

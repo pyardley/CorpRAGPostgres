@@ -136,6 +136,7 @@ class JiraIngestor(BaseIngestor):
         comments_block = self._format_comments(key, fields, session)
         comment_count = comments_block.count("\n--- comment ")
         image_refs = self._image_refs(fields, session)
+        entity_edges = self._entity_edges(key, fields)
 
         text = (
             f"# {key}: {summary}\n\n"
@@ -162,7 +163,33 @@ class JiraIngestor(BaseIngestor):
                 "comment_count": comment_count,
             },
             image_refs=image_refs,
+            entity_edges=entity_edges,
         )
+
+    # Entity graph
+    def _entity_edges(
+        self, key: str, fields: dict[str, Any]
+    ) -> list[tuple[str, str, str]]:
+        """
+        Deterministic (subject, predicate, object) edges from fields
+        already fetched — no extra API call, no LLM. Prefers the
+        stable `accountId` over `displayName` (a person's display name
+        can change; their account ID doesn't).
+        """
+        if not settings.ENABLE_ENTITY_GRAPH:
+            return []
+
+        edges: list[tuple[str, str, str]] = []
+        for predicate, person_field in (
+            ("assigned_to", fields.get("assignee")),
+            ("reported_by", fields.get("reporter")),
+        ):
+            if not person_field:
+                continue
+            person = person_field.get("accountId") or person_field.get("displayName")
+            if person:
+                edges.append((f"jira:{key}", predicate, person))
+        return edges
 
     # Images
     def _image_refs(

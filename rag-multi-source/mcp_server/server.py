@@ -1,13 +1,14 @@
 """
 FastAPI MCP server.
 
-Exposes the SQL tools defined in :mod:`mcp_server.tools.sql_tools` over
-HTTP/JSON. Endpoints:
+Exposes the tools defined in :mod:`mcp_server.tools.sql_tools` and
+:mod:`mcp_server.tools.entity_graph_tools` over HTTP/JSON. Endpoints:
 
 * ``GET  /healthz``                    — liveness probe (no auth)
 * ``GET  /mcp/tools``                  — list available tool descriptors
 * ``POST /mcp/tools/sql_table_query``  — run a read-only SELECT
 * ``POST /mcp/tools/sql_list_databases`` — list user-accessible DBs
+* ``POST /mcp/tools/entity_graph_query`` — search the entity relationship graph
 
 All ``/mcp/*`` endpoints require the ``X-MCP-Token`` header to match
 :attr:`mcp_server.config.mcp_settings.MCP_SHARED_TOKEN`.
@@ -32,7 +33,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from mcp_server.config import generate_token, mcp_settings
-from mcp_server.tools import sql_tools
+from mcp_server.tools import entity_graph_tools, sql_tools
 
 
 # Shared on-disk token location — kept in sync with app/mcp_manager.py so
@@ -98,6 +99,15 @@ class SQLTableQueryRequest(BaseModel):
 
 class SQLListDatabasesRequest(BaseModel):
     user_id: str = Field(..., description="Calling user's UUID.")
+
+
+class EntityGraphQueryRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    entity: str = Field(..., description="Entity to search for (subject or object).")
+    max_results: Optional[int] = Field(
+        default=None,
+        description="Optional result cap; clamped server-side.",
+    )
 
 
 class ToolEnvelope(BaseModel):
@@ -172,7 +182,7 @@ async def healthz() -> dict[str, Any]:
 @app.get("/mcp/tools", dependencies=[Depends(require_token)])
 async def list_tools() -> dict[str, Any]:
     """Return all registered MCP tool descriptors."""
-    return {"tools": sql_tools.TOOL_SPECS}
+    return {"tools": sql_tools.TOOL_SPECS + entity_graph_tools.TOOL_SPECS}
 
 
 @app.post(
@@ -196,6 +206,20 @@ async def call_sql_table_query(req: SQLTableQueryRequest) -> ToolEnvelope:
         db_name=req.db_name,
         query=req.query,
         max_rows=req.max_rows,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/entity_graph_query",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_entity_graph_query(req: EntityGraphQueryRequest) -> ToolEnvelope:
+    result = entity_graph_tools.query_entities(
+        user_id=req.user_id,
+        entity=req.entity,
+        max_results=req.max_results,
     )
     return ToolEnvelope(**result.to_dict())
 
