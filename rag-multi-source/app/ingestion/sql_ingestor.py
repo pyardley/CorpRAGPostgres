@@ -24,7 +24,9 @@ from typing import Any, Iterable, Optional
 
 from loguru import logger
 
+from app.config import settings
 from app.ingestion.base import BaseIngestor, SourceResource
+from core.sql_dependency_extraction import find_references
 
 
 _SQL_ROUTINES = """
@@ -204,25 +206,129 @@ class SQLIngestor(BaseIngestor):
             return
 
         try:
-            yield from self._iter_routines(engine, db_name, since)
-            yield from self._iter_views(engine, db_name)
-            yield from self._iter_tables(engine, db_name)
-            yield from self._iter_triggers(engine, db_name, since)
+            # Fetch pass: every object's raw rows, before building any
+            # SourceResource. This lets us assemble a whole-database
+            # catalog of known object names up front (see
+            # _build_known_objects) so each object's definition text can
+            # be scanned for references to any OTHER object in the same
+            # database — the static dependency graph (see
+            # core.sql_dependency_extraction.find_references) needs the
+            # full catalog to exist before it can classify a single match.
+            routine_rows = self._fetch_routines(engine, db_name)
+            view_rows = self._fetch_views(engine, db_name)
+            table_groups = self._fetch_tables(engine, db_name)
+            trigger_rows = self._fetch_triggers(engine, db_name)
+
+            known_objects = self._build_known_objects(
+                routine_rows, view_rows, table_groups, trigger_rows
+            )
+
+            # Build pass: rows -> SourceResource, now with entity_edges
+            # populated from the catalog built above.
+            yield from self._resources_from_routines(
+                routine_rows, db_name, since, known_objects
+            )
+            yield from self._resources_from_views(view_rows, db_name, known_objects)
+            yield from self._resources_from_tables(
+                table_groups, db_name, known_objects
+            )
+            yield from self._resources_from_triggers(
+                trigger_rows, db_name, since, known_objects
+            )
         finally:
             engine.dispose()
 
-    def _iter_routines(
-        self, engine, db_name: str, since: Optional[str]
-    ) -> Iterable[SourceResource]:
+    # ── Fetch pass (raw rows, no SourceResource construction) ────────────────
+
+    def _fetch_routines(self, engine, db_name: str) -> list[Any]:
         from sqlalchemy import text
 
         try:
             with engine.connect() as conn:
-                rows = conn.execute(text(_SQL_ROUTINES)).fetchall()
+                return conn.execute(text(_SQL_ROUTINES)).fetchall()
         except Exception as exc:
             logger.warning("[sql] Routines failed for {}: {}", db_name, exc)
-            return
+            return []
 
+    def _fetch_views(self, engine, db_name: str) -> list[Any]:
+        from sqlalchemy import text
+
+        try:
+            with engine.connect() as conn:
+                return conn.execute(text(_SQL_VIEWS)).fetchall()
+        except Exception as exc:
+            logger.warning("[sql] Views failed for {}: {}", db_name, exc)
+            return []
+
+    def _fetch_tables(self, engine, db_name: str) -> dict[str, list]:
+        """Column rows grouped by `schema.table_name` — the natural
+        "fetch" step for tables, since a table's DDL is reconstructed
+        from its column set rather than a single definition column."""
+        from sqlalchemy import text
+
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(_SQL_TABLE_COLS)).fetchall()
+        except Exception as exc:
+            logger.warning("[sql] Tables failed for {}: {}", db_name, exc)
+            return {}
+
+        tables: dict[str, list] = {}
+        for row in rows:
+            full_name = f"{row[0]}.{row[1]}"
+            tables.setdefault(full_name, []).append(row)
+        return tables
+
+    def _fetch_triggers(self, engine, db_name: str) -> list[Any]:
+        from sqlalchemy import text
+
+        try:
+            with engine.connect() as conn:
+                return conn.execute(text(_SQL_TRIGGERS)).fetchall()
+        except Exception as exc:
+            logger.warning("[sql] Triggers failed for {}: {}", db_name, exc)
+            return []
+
+    # ── Whole-database object catalog (for static dependency extraction) ────
+
+    def _build_known_objects(
+        self,
+        routine_rows: list[Any],
+        view_rows: list[Any],
+        table_groups: dict[str, list],
+        trigger_rows: list[Any],
+    ) -> dict[str, tuple[str, str]]:
+        """
+        Lowercased "schema.name" -> (canonical_name, object_type) for
+        every table/view/procedure/function/trigger in this database.
+        Temp tables and CTEs never appear here since they never appear
+        in INFORMATION_SCHEMA/sys.triggers — exactly the set of names
+        `core.sql_dependency_extraction.find_references` should be
+        searching for.
+        """
+        known: dict[str, tuple[str, str]] = {}
+        for schema_name, object_name, object_type, _definition, _last_altered in routine_rows:
+            full_name = f"{schema_name}.{object_name}"
+            known[full_name.lower()] = (full_name, object_type.lower())
+        for schema_name, object_name, _object_type, _definition in view_rows:
+            full_name = f"{schema_name}.{object_name}"
+            known[full_name.lower()] = (full_name, "view")
+        for full_name in table_groups:
+            known[full_name.lower()] = (full_name, "table")
+        for schema_name, trigger_name, _table_name, _definition, _is_disabled, _modify_date, _trigger_events in trigger_rows:
+            full_name = f"{schema_name}.{trigger_name}"
+            known[full_name.lower()] = (full_name, "trigger")
+        return known
+
+    # ── Build pass (rows -> SourceResource) ──────────────────────────────────
+
+    def _resources_from_routines(
+        self,
+        rows: list[Any],
+        db_name: str,
+        since: Optional[str],
+        known_objects: dict[str, tuple[str, str]],
+    ) -> Iterable[SourceResource]:
         for schema_name, object_name, object_type, definition, last_altered in rows:
             last_altered_str = str(last_altered) if last_altered else ""
             if since and last_altered_str and last_altered_str < since:
@@ -247,18 +353,17 @@ class SQLIngestor(BaseIngestor):
                     "object_type": object_type.lower(),
                     "server": self._server,
                 },
+                entity_edges=_qualified_edges(
+                    definition or "", full_name, known_objects, db_name
+                ),
             )
 
-    def _iter_views(self, engine, db_name: str) -> Iterable[SourceResource]:
-        from sqlalchemy import text
-
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(_SQL_VIEWS)).fetchall()
-        except Exception as exc:
-            logger.warning("[sql] Views failed for {}: {}", db_name, exc)
-            return
-
+    def _resources_from_views(
+        self,
+        rows: list[Any],
+        db_name: str,
+        known_objects: dict[str, tuple[str, str]],
+    ) -> Iterable[SourceResource]:
         for schema_name, object_name, _object_type, definition in rows:
             full_name = f"{schema_name}.{object_name}"
             text_body = (
@@ -279,24 +384,18 @@ class SQLIngestor(BaseIngestor):
                     "object_type": "view",
                     "server": self._server,
                 },
+                entity_edges=_qualified_edges(
+                    definition or "", full_name, known_objects, db_name
+                ),
             )
 
-    def _iter_tables(self, engine, db_name: str) -> Iterable[SourceResource]:
-        from sqlalchemy import text
-
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(_SQL_TABLE_COLS)).fetchall()
-        except Exception as exc:
-            logger.warning("[sql] Tables failed for {}: {}", db_name, exc)
-            return
-
-        tables: dict[str, list] = {}
-        for row in rows:
-            full_name = f"{row[0]}.{row[1]}"
-            tables.setdefault(full_name, []).append(row)
-
-        for full_name, cols in tables.items():
+    def _resources_from_tables(
+        self,
+        table_groups: dict[str, list],
+        db_name: str,
+        known_objects: dict[str, tuple[str, str]],
+    ) -> Iterable[SourceResource]:
+        for full_name, cols in table_groups.items():
             schema_name = cols[0][0]
             ddl_lines: list[str] = []
             for col in cols:
@@ -310,12 +409,11 @@ class SQLIngestor(BaseIngestor):
                 default_str = f" DEFAULT {default}" if default else ""
                 ddl_lines.append(f"  {col_name} {type_str} {null_str}{default_str}")
 
+            ddl = "CREATE TABLE " + full_name + " (\n" + ",\n".join(ddl_lines) + "\n)"
             text_body = (
                 f"SQL Server TABLE: {full_name}\n"
                 f"Database: {db_name}\n\n"
-                f"-- Columns:\nCREATE TABLE {full_name} (\n"
-                + ",\n".join(ddl_lines)
-                + "\n)"
+                f"-- Columns:\n{ddl}"
             )
             yield SourceResource(
                 resource_id=f"sql:{self._server}.{db_name}.{full_name}",
@@ -330,20 +428,21 @@ class SQLIngestor(BaseIngestor):
                     "object_type": "table",
                     "server": self._server,
                 },
+                # No FK/REFERENCES clause appears in the rendered DDL
+                # above, so this always comes back empty today — kept
+                # for consistency and in case the DDL rendering grows
+                # FK info later. See core.sql_dependency_extraction's
+                # module docstring.
+                entity_edges=_qualified_edges(ddl, full_name, known_objects, db_name),
             )
 
-    def _iter_triggers(
-        self, engine, db_name: str, since: Optional[str]
+    def _resources_from_triggers(
+        self,
+        rows: list[Any],
+        db_name: str,
+        since: Optional[str],
+        known_objects: dict[str, tuple[str, str]],
     ) -> Iterable[SourceResource]:
-        from sqlalchemy import text
-
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(_SQL_TRIGGERS)).fetchall()
-        except Exception as exc:
-            logger.warning("[sql] Triggers failed for {}: {}", db_name, exc)
-            return
-
         for (
             schema_name,
             trigger_name,
@@ -381,12 +480,34 @@ class SQLIngestor(BaseIngestor):
                     "object_type": "trigger",
                     "server": self._server,
                 },
+                entity_edges=_qualified_edges(
+                    definition or "", full_name, known_objects, db_name
+                ),
             )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _qualified_edges(
+    definition: str,
+    full_name: str,
+    known_objects: dict[str, tuple[str, str]],
+    db_name: str,
+) -> list[tuple[str, str, str]]:
+    """
+    ``find_references`` scoped to this ingest run: no-ops entirely when
+    ``settings.ENABLE_SQL_DEPENDENCY_GRAPH`` is off, and prefixes both
+    sides of each edge with ``db_name`` so subject/object match the
+    ``{db_name}.{schema}.{object_name}`` form ``entity_edges`` expects
+    (matching ``resource_identifier``'s tenancy scope for this source).
+    """
+    if not settings.ENABLE_SQL_DEPENDENCY_GRAPH:
+        return []
+    edges = find_references(definition, full_name.lower(), known_objects)
+    return [(f"{db_name}.{s}", p, f"{db_name}.{o}") for s, p, o in edges]
+
 
 def _extract_server(conn_str: str) -> str:
     """

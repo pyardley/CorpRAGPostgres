@@ -75,8 +75,10 @@ TWO sources of truth and you are EXPECTED to use both:
 1. **RAG context (numbered sources)** — indexed Jira tickets, Confluence
    pages, SQL Server *schemas and stored-procedure code*, and Git
    files/commits. Cite inline as [1], [2], …
-2. **Live SQL tools (MCP)** — `sql_table_query` (returns rows) and
-   `sql_list_databases` (lists DBs the user can query).
+2. **Live SQL tools (MCP)** — `sql_table_query` (returns rows),
+   `sql_list_databases` (lists DBs the user can query), and
+   `sql_dependency_graph` (traverses the static SQL object dependency
+   graph — see the tracing rules below).
 
 Tool-call policy — read carefully:
 
@@ -111,16 +113,29 @@ Answering rules:
 Tracing / impact-analysis rules — read carefully when the question asks how
 a value is derived, or what depends on/is affected by a table, column,
 view, procedure, or function:
+* For "what breaks if I change/drop X" (or similar blast-radius
+  questions), call `sql_dependency_graph` with `direction="downstream"`
+  BEFORE answering from RAG context alone — RAG retrieval is top-K
+  similarity search and has no guarantee it surfaced every object that
+  references X; the dependency graph is exhaustive over what was
+  ingested (though it's static/text-derived, so treat an empty result
+  as inconclusive, not proof of no dependency — it can't see dynamic
+  SQL).
+* For "trace X back to its source tables" (lineage questions), call
+  `sql_dependency_graph` with `direction="upstream"` the same way.
 * Name EVERY intermediate stage explicitly — every temp table, CTE, join,
   and staging step. Never summarize or skip past an intermediate stage
   even if it seems minor.
 * Open up any called function or procedure and state its actual
   logic/formula from its definition — never describe it only by name.
-* If a referenced object's definition isn't visible in the RAG context,
-  say so explicitly rather than silently omitting that step or guessing.
+  If a referenced object's definition isn't visible in the RAG context
+  (the dependency graph only gives you names, not bodies), say so
+  explicitly rather than silently omitting that step or guessing.
 * State explicitly whether a value's path is independent of, or shares a
   stage with, other objects' processing (e.g. a shared staging procedure
-  used by other reports vs. a bespoke inline path).
+  used by other reports vs. a bespoke inline path) — `sql_dependency_graph`
+  is exactly how you confirm this rather than guessing from RAG context
+  alone.
 """
 
 
@@ -211,18 +226,44 @@ def _execute_tool_call(
         )
     elif name == "sql_list_databases":
         result = client.sql_list_databases(user_id=user_id)
+    elif name == "entity_graph_query":
+        # Bound in build_mcp_tools() whenever ENABLE_ENTITY_GRAPH is on,
+        # but never had a dispatch branch here — the LLM could request
+        # it, but every call fell through to "unknown tool" below and
+        # silently failed. Fixed alongside sql_dependency_graph since
+        # both are graph-lookup tools sharing this same dispatcher.
+        result = client.entity_graph_query(
+            user_id=user_id,
+            entity=args.get("entity", ""),
+            max_results=args.get("max_results"),
+        )
+    elif name == "sql_dependency_graph":
+        result = client.sql_dependency_graph(
+            user_id=user_id,
+            object_name=args.get("object_name", ""),
+            direction=args.get("direction", "both"),
+            max_hops=args.get("max_hops"),
+        )
     else:
         return f"ERROR: unknown tool {name!r}", None
 
     if not result.ok:
         return f"ERROR: {result.error}", None
 
-    header = (
-        f"_(Live data via MCP — "
-        f"{result.metadata.get('row_count', '?')} row(s), "
-        f"{result.metadata.get('duration_ms', '?')} ms)_\n\n"
-    )
-    return header + result.markdown, result.metadata
+    # Only the two live-SQL tools actually hit the target database at
+    # query time — the "(Live data via MCP ...)" framing (and the
+    # row_count/duration_ms it reports) would be misleading for the two
+    # graph-lookup tools, which read the app's own persisted entity_edges
+    # table instead.
+    if name in ("sql_table_query", "sql_list_databases"):
+        header = (
+            f"_(Live data via MCP — "
+            f"{result.metadata.get('row_count', '?')} row(s), "
+            f"{result.metadata.get('duration_ms', '?')} ms)_\n\n"
+        )
+        return header + result.markdown, result.metadata
+
+    return result.markdown, result.metadata
 
 
 def _current_model_name() -> str:

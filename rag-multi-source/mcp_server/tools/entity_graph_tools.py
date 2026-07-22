@@ -12,10 +12,19 @@ LLM pass over free text (see `core.entity_extraction`). This tool lets
 the LLM query that graph directly.
 
 Tenancy mirrors `sql_tools.table_query`: resolve the calling user's
-accessible Jira project keys / Git scopes and restrict the query to
-rows whose `(source, resource_identifier)` matches one of them —
-enforced here at the application layer, reinforced by the
+accessible Jira project keys / Git scopes / SQL databases and restrict
+the query to rows whose `(source, resource_identifier)` matches one of
+them — enforced here at the application layer, reinforced by the
 `entity_edges` RLS policies (`models.migrations`) as defence-in-depth.
+
+Also exposes `traverse_sql_dependencies` (the `sql_dependency_graph`
+tool) — a multi-hop BFS over `source="sql"` edges, which
+`app.ingestion.sql_ingestor` populates via
+`core.sql_dependency_extraction.find_references` when
+`settings.ENABLE_SQL_DEPENDENCY_GRAPH` is on. `query_entities` itself
+only does a single-hop lookup with no directionality, which isn't
+enough to answer "what breaks if I change X" (needs to walk multiple
+hops downstream) or "trace X back to source" (needs to walk upstream).
 """
 
 from __future__ import annotations
@@ -66,7 +75,54 @@ TOOL_SPECS: list[dict[str, Any]] = [
             },
             "required": ["entity"],
         },
-    }
+    },
+    {
+        "name": "sql_dependency_graph",
+        "description": (
+            "Traverse the static SQL object dependency graph built at "
+            "ingestion time from table/view/procedure/function/trigger "
+            "definitions. Use direction='downstream' for 'what breaks if "
+            "I change/drop X' (blast radius — what depends on X), and "
+            "direction='upstream' for 'trace X back to its source "
+            "tables' (lineage — what X depends on). Returns hop-labeled "
+            "(subject, predicate, object) edges; predicate is 'calls' "
+            "(procedure/function), 'writes_to', or 'references'. This is "
+            "a STATIC, text-derived graph — it can't see dynamic SQL, so "
+            "treat an empty result as inconclusive, not proof of no "
+            "dependency."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "object_name": {
+                    "type": "string",
+                    "description": (
+                        "A table/view/procedure/function/trigger name to "
+                        "start from, e.g. "
+                        "'dbo.usp_BuildReport_CustomerChurnRisk' or just "
+                        "'usp_BuildReport_CustomerChurnRisk'."
+                    ),
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["upstream", "downstream", "both"],
+                    "description": (
+                        "'downstream' = what depends on this object "
+                        "(impact analysis). 'upstream' = what this "
+                        "object depends on (lineage). 'both' = both "
+                        "directions."
+                    ),
+                    "default": "both",
+                },
+                "max_hops": {
+                    "type": "integer",
+                    "description": "Max traversal hops (default 3, max 5).",
+                    "default": 3,
+                },
+            },
+            "required": ["object_name"],
+        },
+    },
 ]
 
 
@@ -107,6 +163,7 @@ def query_entities(
     with get_db() as db:
         jira_scopes = revalidate(db, user_id, "jira", list_accessible(db, user_id, "jira"))
         git_scopes = revalidate(db, user_id, "git", list_accessible(db, user_id, "git"))
+        sql_scopes = revalidate(db, user_id, "sql", list_accessible(db, user_id, "sql"))
 
         clauses = []
         if jira_scopes:
@@ -117,14 +174,20 @@ def query_entities(
             clauses.append(
                 and_(EntityEdge.source == "git", EntityEdge.resource_identifier.in_(git_scopes))
             )
+        if sql_scopes:
+            clauses.append(
+                and_(EntityEdge.source == "sql", EntityEdge.resource_identifier.in_(sql_scopes))
+            )
 
         if not clauses:
-            logger.info("[mcp.entity_graph] user={} has no accessible Jira/Git scopes", user_id)
+            logger.info(
+                "[mcp.entity_graph] user={} has no accessible Jira/Git/SQL scopes", user_id
+            )
             return ToolResult(
                 ok=True,
                 tool="entity_graph_query",
                 data={"edges": []},
-                markdown="_(no accessible Jira/Git scopes — run a Jira or Git ingestion first)_",
+                markdown="_(no accessible Jira/Git/SQL scopes — run an ingestion first)_",
                 metadata={"count": 0},
             )
 
@@ -173,4 +236,127 @@ def query_entities(
         data={"edges": edges},
         markdown=md,
         metadata={"count": len(edges)},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tool: sql_dependency_graph
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MAX_HOPS_CEILING = 5
+_EDGES_PER_HOP_CAP = 500
+
+
+def traverse_sql_dependencies(
+    user_id: str,
+    object_name: str,
+    direction: str = "both",
+    max_hops: Optional[int] = None,
+) -> ToolResult:
+    """
+    Multi-hop BFS over the static SQL dependency graph
+    (`entity_edges` rows with `source="sql"`), tenancy-scoped to the
+    user's accessible SQL databases.
+
+    "downstream" walks backwards from `object_name` (matching it, then
+    each subsequent frontier, against edges' `object` column, collecting
+    the matched `subject`s as the next frontier) — this answers "what
+    depends on / would break if I changed this" (blast radius).
+    "upstream" walks forwards (matching against `subject`, collecting
+    `object`s) — this answers "what does this depend on / trace it back
+    to source". "both" runs both traversals independently.
+
+    Matching is substring (`ILIKE %name%`), same convention as
+    `query_entities` above, so a caller can pass a bare name
+    ("usp_BuildReport_X") or a fully/partially qualified one
+    ("dbo.usp_BuildReport_X", "MyDb.dbo.usp_BuildReport_X").
+    """
+    if direction not in ("upstream", "downstream", "both"):
+        direction = "both"
+    hops = max(1, min(int(max_hops or 3), _MAX_HOPS_CEILING))
+
+    with get_db() as db:
+        sql_scopes = revalidate(db, user_id, "sql", list_accessible(db, user_id, "sql"))
+        if not sql_scopes:
+            logger.info("[mcp.sql_dependency_graph] user={} has no accessible SQL scopes", user_id)
+            return ToolResult(
+                ok=True,
+                tool="sql_dependency_graph",
+                data={"edges": {}},
+                markdown="_(no accessible SQL databases — run a SQL ingestion first)_",
+                metadata={"count": 0},
+            )
+
+        base_clause = and_(
+            EntityEdge.source == "sql", EntityEdge.resource_identifier.in_(sql_scopes)
+        )
+
+        def _bfs(forward: bool) -> list[dict[str, Any]]:
+            visited = {object_name.lower()}
+            frontier = {object_name}
+            results: list[dict[str, Any]] = []
+            for hop in range(1, hops + 1):
+                if not frontier:
+                    break
+                match_col = EntityEdge.subject if forward else EntityEdge.object
+                rows = (
+                    db.query(EntityEdge)
+                    .filter(base_clause)
+                    .filter(or_(*[match_col.ilike(f"%{n}%") for n in frontier]))
+                    .limit(_EDGES_PER_HOP_CAP)
+                    .all()
+                )
+                next_frontier: set[str] = set()
+                for r in rows:
+                    results.append(
+                        {
+                            "hop": hop,
+                            "subject": r.subject,
+                            "predicate": r.predicate,
+                            "object": r.object,
+                        }
+                    )
+                    nxt = r.object if forward else r.subject
+                    if nxt.lower() not in visited:
+                        next_frontier.add(nxt)
+                        visited.add(nxt.lower())
+                frontier = next_frontier
+            return results
+
+        edge_sets: dict[str, list[dict[str, Any]]] = {}
+        if direction in ("upstream", "both"):
+            edge_sets["upstream"] = _bfs(forward=True)
+        if direction in ("downstream", "both"):
+            edge_sets["downstream"] = _bfs(forward=False)
+
+    total = sum(len(rows) for rows in edge_sets.values())
+    parts: list[str] = []
+    for label, rows in edge_sets.items():
+        if not rows:
+            parts.append(f"**{label}** — _(no edges found)_")
+            continue
+        header = (
+            f"**{label}** (from {object_name}):\n\n"
+            "| Hop | Subject | Predicate | Object |\n| --- | --- | --- | --- |\n"
+        )
+        body = "\n".join(
+            f"| {r['hop']} | {r['subject']} | {r['predicate']} | {r['object']} |"
+            for r in rows
+        )
+        parts.append(header + body)
+    markdown = "\n\n".join(parts) if parts else f"_(no edges found for {object_name!r})_"
+
+    logger.info(
+        "[mcp.sql_dependency_graph] user={} object={!r} direction={} -> {} edges",
+        user_id,
+        object_name,
+        direction,
+        total,
+    )
+    return ToolResult(
+        ok=True,
+        tool="sql_dependency_graph",
+        data={"edges": edge_sets},
+        markdown=markdown,
+        metadata={"count": total},
     )

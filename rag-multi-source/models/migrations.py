@@ -189,6 +189,28 @@ _ADDITIVE_INDEXES: Iterable[tuple[str, str, str]] = (
         "CREATE INDEX IF NOT EXISTS ix_vector_chunks_text_search_simple "
         "ON vector_chunks USING GIN (text_search_simple)",
     ),
+    # -- SQL dependency graph traversal ---------------------------------------
+    # `entity_graph_tools.traverse_sql_dependencies` walks entity_edges
+    # hop-by-hop, each hop filtering on (source, resource_identifier) plus
+    # an ILIKE match against subject (upstream) or object (downstream). A
+    # single interconnected SQL schema can produce several thousand edge
+    # rows -- a real step up from Jira/Git's 1-2-edges-per-resource today
+    # -- so these composite indexes (rather than relying on the existing
+    # single-column indexes on source/resource_identifier/subject/object)
+    # keep each hop's filter a single index scan instead of a sequential
+    # scan over the whole table.
+    (
+        "ix_entity_edges_lookup_subject",
+        "entity_edges",
+        "CREATE INDEX IF NOT EXISTS ix_entity_edges_lookup_subject "
+        "ON entity_edges (source, resource_identifier, subject)",
+    ),
+    (
+        "ix_entity_edges_lookup_object",
+        "entity_edges",
+        "CREATE INDEX IF NOT EXISTS ix_entity_edges_lookup_object "
+        "ON entity_edges (source, resource_identifier, object)",
+    ),
 )
 
 

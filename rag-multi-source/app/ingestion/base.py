@@ -518,12 +518,19 @@ class BaseIngestor(ABC):
         when `settings.ENABLE_ENTITY_EXTRACTION_LLM` is set, edges
         extracted from `resource.text` by an LLM pass.
 
-        No-ops (returns 0) unless `settings.ENABLE_ENTITY_GRAPH` is set.
+        No-ops (returns 0) unless `settings.ENABLE_ENTITY_GRAPH` is set,
+        or this is a SQL ingestor with `settings.ENABLE_SQL_DEPENDENCY_GRAPH`
+        set (see `app.ingestion.sql_ingestor` — a separate flag since the
+        SQL dependency graph is a deterministic, zero-cost regex pass,
+        not the LLM-relationship feature `ENABLE_ENTITY_GRAPH` gates).
         The LLM extraction pass fails OPEN — an extraction error is
         logged and skipped; deterministic edges (and the resource's
         chunks) still persist normally.
         """
-        if not settings.ENABLE_ENTITY_GRAPH:
+        sql_dependency_graph_active = (
+            self.source == "sql" and settings.ENABLE_SQL_DEPENDENCY_GRAPH
+        )
+        if not settings.ENABLE_ENTITY_GRAPH and not sql_dependency_graph_active:
             return 0
 
         edges: list[tuple[str, str, str, str]] = [

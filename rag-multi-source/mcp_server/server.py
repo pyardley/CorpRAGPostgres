@@ -9,6 +9,7 @@ Exposes the tools defined in :mod:`mcp_server.tools.sql_tools` and
 * ``POST /mcp/tools/sql_table_query``  — run a read-only SELECT
 * ``POST /mcp/tools/sql_list_databases`` — list user-accessible DBs
 * ``POST /mcp/tools/entity_graph_query`` — search the entity relationship graph
+* ``POST /mcp/tools/sql_dependency_graph`` — traverse the static SQL dependency graph
 
 All ``/mcp/*`` endpoints require the ``X-MCP-Token`` header to match
 :attr:`mcp_server.config.mcp_settings.MCP_SHARED_TOKEN`.
@@ -107,6 +108,17 @@ class EntityGraphQueryRequest(BaseModel):
     max_results: Optional[int] = Field(
         default=None,
         description="Optional result cap; clamped server-side.",
+    )
+
+
+class SQLDependencyGraphRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    object_name: str = Field(..., description="SQL object name to start traversal from.")
+    direction: str = Field(
+        default="both", description="'upstream' | 'downstream' | 'both'."
+    )
+    max_hops: Optional[int] = Field(
+        default=None, description="Optional hop cap; clamped server-side."
     )
 
 
@@ -220,6 +232,21 @@ async def call_entity_graph_query(req: EntityGraphQueryRequest) -> ToolEnvelope:
         user_id=req.user_id,
         entity=req.entity,
         max_results=req.max_results,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/sql_dependency_graph",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_sql_dependency_graph(req: SQLDependencyGraphRequest) -> ToolEnvelope:
+    result = entity_graph_tools.traverse_sql_dependencies(
+        user_id=req.user_id,
+        object_name=req.object_name,
+        direction=req.direction,
+        max_hops=req.max_hops,
     )
     return ToolEnvelope(**result.to_dict())
 

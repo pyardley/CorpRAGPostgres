@@ -213,6 +213,23 @@ class MCPClient:
             },
         )
 
+    def sql_dependency_graph(
+        self,
+        user_id: str,
+        object_name: str,
+        direction: str = "both",
+        max_hops: Optional[int] = None,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/sql_dependency_graph",
+            {
+                "user_id": user_id,
+                "object_name": object_name,
+                "direction": direction,
+                "max_hops": max_hops,
+            },
+        )
+
     def close(self) -> None:
         try:
             self._client.close()
@@ -362,6 +379,66 @@ def build_mcp_tools(user_id: str) -> list[Any]:
                     "one' or 'which repos does alice maintain'."
                 ),
                 args_schema=EntityGraphQueryArgs,
+            )
+        )
+
+    # Bound whenever the static SQL dependency graph is populated at
+    # ingestion time — checked internally, same precedent as
+    # ENABLE_ENTITY_GRAPH above.
+    if settings.ENABLE_SQL_DEPENDENCY_GRAPH:
+
+        class SqlDependencyGraphArgs(BaseModel):
+            object_name: str = Field(
+                ...,
+                description=(
+                    "A table/view/procedure/function/trigger name to "
+                    "start from, e.g. "
+                    "'dbo.usp_BuildReport_CustomerChurnRisk' or just "
+                    "'usp_BuildReport_CustomerChurnRisk'."
+                ),
+            )
+            direction: str = Field(
+                default="both",
+                description=(
+                    "'downstream' = what depends on this object (impact "
+                    "analysis / blast radius). 'upstream' = what this "
+                    "object depends on (lineage / trace to source). "
+                    "'both' = both directions."
+                ),
+            )
+            max_hops: Optional[int] = Field(
+                default=None, description="Max traversal hops (default 3, max 5)."
+            )
+
+        def _run_sql_dependency_graph(
+            object_name: str, direction: str = "both", max_hops: Optional[int] = None
+        ) -> str:
+            result = client.sql_dependency_graph(
+                user_id=user_id,
+                object_name=object_name,
+                direction=direction,
+                max_hops=max_hops,
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_sql_dependency_graph,
+                name="sql_dependency_graph",
+                description=(
+                    "Traverse the static SQL object dependency graph "
+                    "built at ingestion time from table/view/procedure/"
+                    "function/trigger definitions. Use "
+                    "direction='downstream' for 'what breaks if I "
+                    "change/drop X' (blast radius), and "
+                    "direction='upstream' for 'trace X back to its "
+                    "source tables' (lineage). Returns hop-labeled "
+                    "(subject, predicate, object) edges. This is a "
+                    "STATIC, text-derived graph — an empty result is "
+                    "inconclusive, not proof of no dependency; it can't "
+                    "see dynamic SQL."
+                ),
+                args_schema=SqlDependencyGraphArgs,
             )
         )
 

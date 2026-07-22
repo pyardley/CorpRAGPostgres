@@ -112,6 +112,24 @@ class Settings(BaseSettings):
     # issue, or one per Git commit).
     ENTITY_EXTRACTION_MAX_EDGES: int = 10
 
+    # Separate from ENABLE_ENTITY_GRAPH (which stays scoped to the
+    # Jira/Git relationship graph above): when on, SQLIngestor statically
+    # parses each ingested table/view/procedure/function/trigger
+    # definition for references to other objects in the same database
+    # (see `core.sql_dependency_extraction.find_references`) and writes
+    # them to the same `entity_edges` table, tagged `source="sql"`. This
+    # is what lets impact-analysis questions ("what breaks if I change
+    # X", "trace Y back to source") discover multi-hop dependency chains
+    # -- including ones that never made it into the top-K retrieved
+    # chunks -- via the `sql_dependency_graph` MCP tool
+    # (`mcp_server/tools/entity_graph_tools.py`).
+    #
+    # Default on, unlike ENABLE_ENTITY_GRAPH: this is a deterministic,
+    # zero-marginal-cost regex pass over text already fetched during
+    # ingestion, not an LLM call -- there's no cost/latency reason to
+    # gate it off by default the way the LLM-extraction pass above is.
+    ENABLE_SQL_DEPENDENCY_GRAPH: bool = True
+
     # ── Semantic response cache ───────────────────────────────────────────────
     #
     # Repeated or near-duplicate questions currently re-run the full
