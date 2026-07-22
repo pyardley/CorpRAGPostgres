@@ -63,6 +63,7 @@ from core.llm import get_llm
 from core.mcp_client import build_mcp_tools, get_mcp_client
 from core.rag_chain import RAGAnswer, _format_context  # type: ignore[attr-defined]
 from core.retriever import RetrievedChunk, deduplicate_by_resource
+from core.trace_completeness import check_trace_completeness
 
 
 MAX_TOOL_HOPS = 4
@@ -106,6 +107,20 @@ Answering rules:
 * Cite RAG-derived facts with [N].
 * Be concise. Use markdown tables for tabular results and fenced
   code blocks for SQL.
+
+Tracing / impact-analysis rules — read carefully when the question asks how
+a value is derived, or what depends on/is affected by a table, column,
+view, procedure, or function:
+* Name EVERY intermediate stage explicitly — every temp table, CTE, join,
+  and staging step. Never summarize or skip past an intermediate stage
+  even if it seems minor.
+* Open up any called function or procedure and state its actual
+  logic/formula from its definition — never describe it only by name.
+* If a referenced object's definition isn't visible in the RAG context,
+  say so explicitly rather than silently omitting that step or guessing.
+* State explicitly whether a value's path is independent of, or shares a
+  stage with, other objects' processing (e.g. a shared staging procedure
+  used by other reports vs. a bespoke inline path).
 """
 
 
@@ -419,6 +434,15 @@ def answer_question_with_mcp(
                 t_post.extra["tool_calls_made"] = sum(
                     1 for s in steps if s["step_name"].startswith("mcp_tool_call:")
                 )
+                missing = check_trace_completeness(question, hits, text)
+                t_post.extra["trace_incomplete_count"] = len(missing)
+                if missing:
+                    text += (
+                        "\n\n_Note: this trace may be incomplete — objects "
+                        "present in the source but not mentioned above: "
+                        + ", ".join(missing)
+                        + "._"
+                    )
             final_citations = citations + extra_citations
             logger.info(
                 "[mcp.chain] done after {} hop(s). tokens={} cost=${:.5f} "
@@ -500,6 +524,15 @@ def answer_question_with_mcp(
             )
         t_post.extra["hops"] = MAX_TOOL_HOPS + 1
         t_post.extra["budget_exhausted"] = True
+        missing = check_trace_completeness(question, hits, text)
+        t_post.extra["trace_incomplete_count"] = len(missing)
+        if missing:
+            text += (
+                "\n\n_Note: this trace may be incomplete — objects present "
+                "in the source but not mentioned above: "
+                + ", ".join(missing)
+                + "._"
+            )
 
     # The hop loop is the most likely place we'd want to know which step
     # was running when something went wrong; record_step_timing makes

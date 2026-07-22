@@ -48,6 +48,8 @@ from core.rag_chain import RAGAnswer, answer_question
 from core.reranker import rerank
 from core.response_cache import check_response_cache, store_response_cache
 from core.retriever import RetrievedChunk, retrieve
+from core.sql_object_context import expand_sql_chunks
+from core.trace_completeness import is_tracing_question
 from core.vector_store import build_query_filter
 
 
@@ -281,14 +283,24 @@ def render_chat(state: SelectionState) -> None:
                     # call, since the cache key (a fingerprint of the
                     # *resolved* accessible scopes, not user_id) is already
                     # known before any of those steps run.
+                    #
+                    # Also skipped for lineage/impact-analysis-style
+                    # questions over SQL sources: a schema re-ingestion
+                    # (redefined proc, added dependency) doesn't invalidate
+                    # a previously-cached trace answer, and staleness here
+                    # is worse than a cache miss — see core.trace_completeness.
+                    skip_cache = used_mcp_path or (
+                        "sql" in state.sources and is_tracing_question(prompt)
+                    )
                     cached = (
                         None
-                        if used_mcp_path
+                        if skip_cache
                         else check_response_cache(
                             user["id"], prompt, filter_dict, state.fts_language
                         )
                     )
                     t_cache.extra["hit"] = cached is not None
+                    t_cache.extra["skipped"] = skip_cache
 
                 if cached is not None:
                     result = cached
@@ -350,6 +362,17 @@ def render_chat(state: SelectionState) -> None:
                         hits = rerank(prompt, hits, top_n=settings.TOP_K)
                         t_rerank.extra["reranked_count"] = len(hits)
 
+                    with StepTimer(chat_steps, "sql_object_expansion") as t_expand:
+                        # A SQL hit may only be one fragment of a larger
+                        # stored procedure/view/function/trigger body (see
+                        # core.sql_object_context) — reassemble every
+                        # fragmented SQL object into its full definition
+                        # before the LLM ever sees it, so a lineage-tracing
+                        # answer can't silently skip a middle stage just
+                        # because that stage's chunk didn't win a slot.
+                        hits = expand_sql_chunks(hits, user["id"])
+                        t_expand.extra["expanded_count"] = len(hits)
+
                     history = [
                         (m["role"], m["content"])
                         for m in st.session_state.messages
@@ -371,10 +394,14 @@ def render_chat(state: SelectionState) -> None:
                         # Only the plain RAG path is cached — see the
                         # core.response_cache module docstring for why the
                         # MCP/hybrid path is excluded (live data must never
-                        # be served from a cache).
-                        store_response_cache(
-                            user["id"], prompt, filter_dict, state.fts_language, result
-                        )
+                        # be served from a cache). `skip_cache` additionally
+                        # excludes tracing-style SQL questions (see the
+                        # response_cache_check step above) so a stale
+                        # lineage answer never gets stored either.
+                        if not skip_cache:
+                            store_response_cache(
+                                user["id"], prompt, filter_dict, state.fts_language, result
+                            )
 
                 audit_record = dict(result.usage or {})
             except Exception as exc:

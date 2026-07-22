@@ -143,6 +143,15 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200
 
+    # A stored procedure/view/function/trigger body routinely exceeds
+    # CHUNK_SIZE and splits across several vector_chunks rows with no
+    # SQL-aware boundary — landing mid-CTE/mid-join is common. Before a
+    # SQL hit reaches the LLM, core.sql_object_context.expand_sql_chunks
+    # reassembles all of a resource's chunks into one block, up to this
+    # many chunks; past the cap it's left as the retrieved fragment
+    # rather than risk inlining a pathologically large object whole.
+    SQL_OBJECT_REASSEMBLY_MAX_CHUNKS: int = 15
+
     # ── Retrieval ────────────────────────────────────────────────────────────
     TOP_K: int = 8
     SCORE_THRESHOLD: float = 0.10

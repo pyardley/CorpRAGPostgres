@@ -36,6 +36,7 @@ from app.utils import StepTimer, estimate_cost, extract_usage
 from core.corrective_retrieval import is_low_confidence
 from core.llm import get_llm
 from core.retriever import RetrievedChunk, deduplicate_by_resource
+from core.trace_completeness import check_trace_completeness
 
 
 SYSTEM_PROMPT = """You are CorporateRAG, an enterprise assistant that answers
@@ -54,7 +55,21 @@ Rules:
 3. Be concise and direct. Prefer bullet points for lists, fenced code blocks
    for SQL, JSON, or code snippets.
 4. If the question references something that is clearly out of scope for the
-   selected sources, tell the user which sources to enable."""
+   selected sources, tell the user which sources to enable.
+5. When tracing how a value is derived, or what depends on/is affected by a
+   table, column, view, procedure, or function, name EVERY intermediate
+   stage explicitly — every temp table, CTE, join, and staging step. Never
+   summarize or skip past an intermediate stage even if it seems minor.
+6. When a called function or procedure is referenced, open it up and state
+   its actual logic/formula from its definition in the context — never
+   describe it only by name.
+7. If a referenced object's definition is not present in the provided
+   context, say so explicitly rather than silently omitting that step or
+   guessing at its behavior.
+8. When a value's path could plausibly go through more than one route (e.g.
+   a shared staging procedure used by other objects vs. a bespoke inline
+   path), state explicitly which one applies here and whether it is shared
+   with or independent of other objects' processing."""
 
 
 @dataclass
@@ -271,6 +286,15 @@ def answer_question(
         t_post.extra["prompt_tokens"] = audit["prompt_tokens"]
         t_post.extra["completion_tokens"] = audit["completion_tokens"]
         t_post.extra["total_tokens"] = audit["total_tokens"]
+        missing = check_trace_completeness(question, hits, text)
+        t_post.extra["trace_incomplete_count"] = len(missing)
+        if missing:
+            text += (
+                "\n\n_Note: this trace may be incomplete — objects present "
+                "in the source but not mentioned above: "
+                + ", ".join(missing)
+                + "._"
+            )
 
     logger.info(
         "[rag.chain] LLM call: provider={} model={} tokens={} (in={}, out={}) "
