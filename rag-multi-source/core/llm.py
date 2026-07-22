@@ -85,9 +85,20 @@ def get_llm() -> BaseChatModel:
 @lru_cache(maxsize=1)
 def get_reranker():
     from sentence_transformers import CrossEncoder
+    from torch.nn import Sigmoid
 
+    # Force sigmoid activation regardless of the configured model's own
+    # default. Cross-encoders disagree on this: BAAI/bge-reranker-base
+    # defaults to a sigmoid (num_labels=1), but cross-encoder/ms-marco-*
+    # models default to Identity() (raw, unbounded logits) despite also
+    # being num_labels=1 — their HF config predates that convention. Since
+    # `core.corrective_retrieval.is_low_confidence` thresholds `hit.score`
+    # against a fixed [0, 1] value, every configured model must produce
+    # scores on that scale; sigmoid is a monotonic transform, so it never
+    # changes the reranked *order*, only the scale, so this is free for
+    # RERANK_ENABLED's own ranking purpose too.
     logger.info("Loading cross-encoder reranker: {}", settings.RERANK_MODEL)
-    return CrossEncoder(settings.RERANK_MODEL)
+    return CrossEncoder(settings.RERANK_MODEL, activation_fn=Sigmoid())
 
 
 @lru_cache(maxsize=1)

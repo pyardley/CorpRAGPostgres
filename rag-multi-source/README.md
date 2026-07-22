@@ -137,26 +137,42 @@ second retrieval stage: it asks `core.retriever.retrieve` for
 `RERANK_CANDIDATE_K` candidates (default 50, instead of the usual
 `TOP_K`), then `core/reranker.py` runs a local cross-encoder
 (`sentence_transformers.CrossEncoder`, model `RERANK_MODEL` — default
-`BAAI/bge-reranker-base`) that jointly encodes `(query, chunk_text)` for
-every candidate, re-scores and re-sorts them, and keeps the top `TOP_K`.
-This is typically far more accurate than cosine similarity alone at
-picking the genuinely relevant chunk, especially on "tricky" queries
-where the right answer isn't the top vector hit.
+`cross-encoder/ms-marco-MiniLM-L-6-v2`) that jointly encodes `(query,
+chunk_text)` for every candidate, re-scores and re-sorts them, and keeps
+the top `TOP_K`. This is typically far more accurate than cosine
+similarity alone at picking the genuinely relevant chunk, especially on
+"tricky" queries where the right answer isn't the top vector hit.
 
 ```ini
 # .env
-RERANK_ENABLED=true                  # default — set false to skip the second stage
-RERANK_MODEL=BAAI/bge-reranker-base  # any sentence-transformers CrossEncoder repo id
-RERANK_CANDIDATE_K=50                # candidates fetched before reranking
+RERANK_ENABLED=true                              # default — set false to skip the second stage
+RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2  # any sentence-transformers CrossEncoder repo id
+RERANK_CANDIDATE_K=50                            # candidates fetched before reranking
 ```
 
 - **No new dependency.** `sentence-transformers` is already required for
   the HuggingFace embeddings fallback; the reranker reuses it and runs on
   CPU in-process, cached as a singleton (`core.llm.get_reranker`) after
   first use.
+- **Sized for CPU.** Cross-encoder inference cost scales roughly linearly
+  with model size × candidate count. `ms-marco-MiniLM-L-6-v2` (~22M
+  params) is the default specifically because it's cheap enough to run
+  `RERANK_CANDIDATE_K` candidates on CPU without dominating a chat turn's
+  latency — the larger, multilingual `BAAI/bge-reranker-base` (~278M
+  params) it replaced benchmarked at ~200ms per `(query, chunk)` pair on a
+  6-core CPU, i.e. ~10s of inference alone at the default candidate
+  count. Any `sentence-transformers` CrossEncoder repo id can be
+  substituted here if quality matters more than latency for your corpus.
+- **Always sigmoid-activated.** `core.llm.get_reranker` explicitly passes
+  `activation_fn=Sigmoid()` regardless of which model is configured —
+  cross-encoders disagree on their own default here (some apply a sigmoid
+  out of the box, some return raw unbounded logits), and the corrective
+  retrieval feature below needs every model's `hit.score` to land on the
+  same fixed `[0, 1]` scale. Sigmoid is a monotonic transform, so this
+  never changes the reranked order, only the scale.
 - **First-run download.** The first query after enabling downloads the
-  model weights from the HuggingFace Hub (a few hundred MB for the
-  default model) — expect a one-time delay on the first turn.
+  model weights from the HuggingFace Hub — expect a one-time delay on the
+  first turn.
 - **Fails open.** Unlike the live-ACL check below, this is a ranking
   quality knob, not an authorization boundary — any reranker error
   (model load failure, missing torch, OOM) is logged and chat falls back
@@ -186,12 +202,13 @@ CORRECTIVE_RETRIEVAL_ENABLED=false        # off by default — opt in
 CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD=0.3  # on the reranker's [0, 1] scale
 ```
 
-- **Depends on reranking.** The default reranker (`BAAI/bge-reranker-base`)
-  applies a sigmoid to its output, so `hit.score` is a `[0, 1]` relevance
-  score comparable across queries — unlike raw cosine similarity or an RRF
-  fusion rank, neither of which is on a fixed scale. This check is
-  therefore a no-op whenever `RERANK_ENABLED=false`, regardless of this
-  flag. `CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD` is a different scale from
+- **Depends on reranking.** `core.llm.get_reranker` forces sigmoid
+  activation on whichever `RERANK_MODEL` is configured (see above), so
+  `hit.score` is always a `[0, 1]` relevance score comparable across
+  queries — unlike raw cosine similarity or an RRF fusion rank, neither
+  of which is on a fixed scale. This check is therefore a no-op whenever
+  `RERANK_ENABLED=false`, regardless of this flag.
+  `CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD` is a different scale from
   `SCORE_THRESHOLD` (a cosine-similarity floor applied at retrieval time)
   — don't confuse the two.
 - **Off by default.** Like query rewriting and the response cache, this
@@ -283,6 +300,18 @@ RESPONSE_CACHE_TTL_SECONDS=3600
 - **Never applies to the MCP/hybrid (live SQL) path.** Live data must
   never be served from a cache — a cache check is skipped entirely
   whenever `used_mcp_path` is true.
+- **Currently inert whenever `ENABLE_ENTITY_GRAPH=true`.** `used_mcp_path`
+  is `true` whenever *either* the user's "Use Live SQL" toggle is on
+  *or* `ENABLE_ENTITY_GRAPH` is on (see
+  [Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired)
+  below) — the entity graph's MCP tool has to be bound on every turn to
+  be available, so every turn takes the hybrid path once the flag is on,
+  and the bullet above then skips the cache check on all of them. With
+  both flags set, `RESPONSE_CACHE_ENABLED=true` never checks or
+  populates the cache, full stop — it isn't a partial degradation, it's
+  a no-op. This is deliberate, not an oversight: see
+  [Possible enhancements § response cache vs. entity graph](#7-let-the-response-cache-and-entity-graph-coexist)
+  for why a naive fix is unsafe and what a real one requires.
 - **Strict similarity threshold, deliberately.** `SCORE_THRESHOLD`
   (0.10) governs which chunks are *candidates* for reranking — a false
   positive there just means a weak candidate gets considered.
@@ -346,6 +375,20 @@ whenever `ENABLE_ENTITY_GRAPH=true`, independent of the "Use Live SQL"
 toggle — there's no separate sidebar control, matching the plain
 `.env`-flag precedent set by reranking, live-ACL revalidation, and
 query rewriting.
+
+Side effect worth knowing: making the tool available this way means
+*every* chat turn takes `app/chat.py`'s hybrid/MCP path once this flag
+is on — not just questions that actually need graph traversal — because
+`used_mcp_path` cannot tell "entity graph might be needed" apart from
+"the user turned on live SQL." Two consequences: `sql_table_query` /
+`sql_list_databases` end up bound and callable on *every* turn too (see
+`core/mcp_client.py`'s `build_mcp_tools()` — they're bound
+unconditionally, not gated on the "Use Live SQL" sidebar toggle at
+all), and [the semantic response cache](#semantic-response-cache)
+becomes entirely inert, since it never checks or stores on the hybrid
+path. See
+[Possible enhancements § response cache vs. entity graph](#7-let-the-response-cache-and-entity-graph-coexist)
+for the fix.
 
 ### Stable resource IDs
 
@@ -1842,3 +1885,53 @@ the same shape as the existing `scripts/vector_store_admin.py`, running
 a curated `(question, expected resource_id)` set through `retrieve()`
 and `answer_question()` and tracking the scores over time, would turn
 retrieval tuning into something measurable instead of anecdotal.
+
+### 7. Let the response cache and entity graph coexist
+
+Today `RESPONSE_CACHE_ENABLED=true` and `ENABLE_ENTITY_GRAPH=true` are
+effectively mutually exclusive — see the callouts in
+[Semantic response cache](#semantic-response-cache) and
+[Lightweight entity graph](#lightweight-entity-graph-graphrag-inspired)
+above. `used_mcp_path` in `app/chat.py` is `true` whenever *either* the
+"Use Live SQL" toggle is on *or* `ENABLE_ENTITY_GRAPH` is on, and the
+response cache unconditionally skips both checking and storing whenever
+`used_mcp_path` is `true`. With entity graph enabled, every turn takes
+that path, so the cache never engages — not degraded, entirely inert.
+
+The tempting fix — bypass the cache only when the user's SQL toggle is
+genuinely on, and let it run for turns where only the entity graph
+forced the hybrid path — is unsafe as stated, because that distinction
+doesn't actually exist yet at the tool level: `core/mcp_client.py`'s
+`build_mcp_tools()` binds `sql_table_query` / `sql_list_databases`
+*unconditionally* whenever the hybrid path runs, regardless of whether
+the "Use Live SQL" toggle is on, and `HYBRID_SYSTEM_PROMPT`
+(`core/mcp_chain.py`) actively instructs the model it's "EXPECTED to
+use both" sources and "MUST call `sql_table_query`" for anything that
+smells like a data request. So an "entity-graph-only" turn can still
+invoke live SQL today — caching its answer risks serving live data back
+to a different user, for up to `RESPONSE_CACHE_TTL_SECONDS`, which is
+exactly what the response cache's own docstring rules out.
+
+A safe version needs two changes, in order:
+
+1. **Gate SQL tool binding on the toggle.** Thread `state.use_mcp_sql`
+   (or an equivalent per-request flag) into `build_mcp_tools()` so
+   `sql_table_query` / `sql_list_databases` are only bound when the user
+   has genuinely opted into live SQL — not just whenever the hybrid path
+   is entered for entity-graph reasons. Only after this can an
+   "entity-graph-only" turn be trusted to never touch live data.
+2. **Split the single `used_mcp_path` flag into two.** One flag (say,
+   `live_sql_path = state.use_mcp_sql and "sql" in state.sources`) keeps
+   gating the response-cache bypass, on both the check *and* the store
+   side — `store_response_cache` needs the same narrower condition, or
+   the check will simply miss forever since nothing populates the
+   bucket. The broader `used_mcp_path` keeps deciding whether
+   `answer_question_with_mcp()` (vs. plain `answer_question()`) is
+   called, unchanged, since the entity graph tool still needs to be
+   bound whenever `ENABLE_ENTITY_GRAPH` is on.
+
+Worth validating afterwards: `RESPONSE_CACHE_SIMILARITY_THRESHOLD`
+(0.97) was tuned against plain-RAG answer phrasing, not MCP/tool-
+augmented answers, which can have more variable structure (tool-output
+headers, inline "(live data from ...)" labels) — check it still holds
+before relying on it for the newly-cacheable hybrid answers.

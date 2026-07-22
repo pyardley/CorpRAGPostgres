@@ -280,8 +280,26 @@ class Settings(BaseSettings):
     # error (model load failure, missing torch, OOM) fails OPEN — logged, and
     # the un-reranked candidate order is used — this is a quality knob, not
     # an authorization boundary.
+    #
+    # ``ms-marco-MiniLM-L-6-v2`` (~22M params) was chosen over the larger,
+    # multilingual ``BAAI/bge-reranker-base`` (~278M params) it replaced —
+    # on a CPU-only deployment, cross-encoder inference cost scales roughly
+    # linearly with candidate count and model size (benchmarked at ~200ms
+    # per (query, chunk) pair for bge-reranker-base, i.e. ~10s just for
+    # inference at the default RERANK_CANDIDATE_K=50 — the dominant cost in
+    # a chat turn). Any ``sentence-transformers`` CrossEncoder repo id can
+    # be substituted here.
+    #
+    # ``core.llm.get_reranker`` always forces sigmoid activation
+    # (``activation_fn=Sigmoid()``) regardless of which model is
+    # configured — cross-encoders disagree on their own default here (bge
+    # defaults to sigmoid, ms-marco defaults to raw unbounded logits,
+    # despite both being ``num_labels=1``), and
+    # ``CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD`` below needs every model to
+    # land on the same fixed [0, 1] scale. Sigmoid is a monotonic
+    # transform, so it never changes the reranked order — only the scale.
     RERANK_ENABLED: bool = True
-    RERANK_MODEL: str = "BAAI/bge-reranker-base"
+    RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     RERANK_CANDIDATE_K: int = 50
 
     # ── Corrective retrieval (admit when nothing matches) ────────────────────
@@ -295,8 +313,9 @@ class Settings(BaseSettings):
     #
     # Only meaningful with reranking on — `RERANK_ENABLED`'s cross-encoder
     # score is the only scoring signal in this pipeline calibrated to a fixed
-    # [0, 1] "relevance" scale comparable across queries (a sigmoid, since
-    # the default `RERANK_MODEL` has num_labels=1); raw cosine similarity and
+    # [0, 1] "relevance" scale comparable across queries (`core.llm.get_reranker`
+    # forces a sigmoid activation on whichever model is configured, precisely
+    # so this holds regardless of `RERANK_MODEL`); raw cosine similarity and
     # RRF fusion scores aren't. No-ops when `RERANK_ENABLED` is False,
     # regardless of this flag.
     #
