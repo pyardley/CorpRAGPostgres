@@ -20,12 +20,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.config import settings
 from app.utils import get_db, set_current_user_for_rls
 from core.retriever import RetrievedChunk
+from models.entity_edge import EntityEdge
 from models.vector_chunk import VectorChunk
+
+_ATOMIC_OBJECT_TYPES = {"procedure", "function", "view", "trigger", "table"}
 
 
 def expand_sql_chunks(
@@ -99,3 +102,129 @@ def expand_sql_chunks(
             )
         )
     return expanded
+
+
+def _split_qualified(qualified: str) -> tuple[str, str]:
+    """'{db_name}.{schema}.{object_name}' -> (db_name, 'schema.object_name')."""
+    db_name, _, rest = qualified.partition(".")
+    return db_name, rest
+
+
+def expand_hits_with_dependencies(
+    hits: list[RetrievedChunk],
+    user_id: Optional[str] = None,
+    max_hops: int = 1,
+    max_extra: int = 5,
+) -> list[RetrievedChunk]:
+    """
+    Force-include objects directly connected (via the static SQL
+    dependency graph, `entity_edges`) to the SQL hits already retrieved
+    — bypassing the similarity/rerank cutoff entirely.
+
+    Closes the specific gap `expand_sql_chunks` can't: a genuinely
+    relevant object (e.g. a called function) that never won a top-K
+    slot at all, because it was crowded out by a loosely-related object
+    that happened to score higher. No-ops unless
+    `settings.SQL_DEPENDENCY_FORCED_INCLUSION_ENABLED` is set — off by
+    default, since this inflates prompt size/cost/latency on every turn
+    a SQL object is retrieved, worst-case badly for a "hub" object
+    referenced by many procedures.
+
+    Only SQL hits whose `object_type` is atomic (procedure/function/
+    view/trigger/table) seed the traversal — the synthetic "live-mcp"
+    citation and any other source pass through untouched.
+    """
+    if not settings.SQL_DEPENDENCY_FORCED_INCLUSION_ENABLED or not hits:
+        return hits
+
+    seed: set[tuple[str, str]] = set()
+    for hit in hits:
+        if hit.source != "sql":
+            continue
+        md = hit.metadata or {}
+        if md.get("object_type") not in _ATOMIC_OBJECT_TYPES:
+            continue
+        db_name = md.get("db_name")
+        object_name = md.get("object_name")
+        if db_name and object_name:
+            seed.add((db_name, object_name))
+
+    if not seed:
+        return hits
+
+    visited = set(seed)
+    frontier = set(seed)
+    connected: list[tuple[str, str]] = []
+
+    with get_db() as db:
+        set_current_user_for_rls(db, user_id)
+        for _hop in range(max_hops):
+            if not frontier or len(connected) >= max_extra:
+                break
+            next_frontier: set[tuple[str, str]] = set()
+            for db_name, object_name in frontier:
+                qualified = f"{db_name}.{object_name}"
+                rows = (
+                    db.query(EntityEdge.subject, EntityEdge.object)
+                    .filter(EntityEdge.source == "sql")
+                    .filter(EntityEdge.resource_identifier == db_name)
+                    .filter(or_(EntityEdge.subject == qualified, EntityEdge.object == qualified))
+                    .limit(100)
+                    .all()
+                )
+                for subj, obj in rows:
+                    for candidate in (subj, obj):
+                        key = _split_qualified(candidate)
+                        if key in visited:
+                            continue
+                        visited.add(key)
+                        next_frontier.add(key)
+                        connected.append(key)
+                        if len(connected) >= max_extra:
+                            break
+                    if len(connected) >= max_extra:
+                        break
+                if len(connected) >= max_extra:
+                    break
+            frontier = next_frontier
+
+        if not connected:
+            return hits
+
+        existing_resource_ids = {h.resource_id for h in hits}
+        extra_hits: list[RetrievedChunk] = []
+        for c_db, c_object in connected[:max_extra]:
+            rows = db.execute(
+                select(
+                    VectorChunk.resource_id,
+                    VectorChunk.chunk_index,
+                    VectorChunk.text,
+                    VectorChunk.title,
+                    VectorChunk.url,
+                )
+                .where(VectorChunk.source == "sql")
+                .where(VectorChunk.db_name == c_db)
+                .where(VectorChunk.object_name == c_object)
+                .order_by(VectorChunk.chunk_index)
+            ).all()
+            if not rows or rows[0].resource_id in existing_resource_ids:
+                continue
+            extra_hits.append(
+                RetrievedChunk(
+                    resource_id=rows[0].resource_id,
+                    source="sql",
+                    chunk_index=0,
+                    score=0.0,  # sentinel — force-included, not similarity-ranked
+                    text="\n\n".join(r.text for r in rows),
+                    title=rows[0].title or rows[0].resource_id,
+                    url=rows[0].url or "",
+                    metadata={
+                        "db_name": c_db,
+                        "object_name": c_object,
+                        "object_type": "forced-dependency",
+                    },
+                )
+            )
+            existing_resource_ids.add(rows[0].resource_id)
+
+    return hits + extra_hits

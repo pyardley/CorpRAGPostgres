@@ -199,6 +199,52 @@ def test_bare_name_matches_only_for_dbo_schema():
     assert edges == [("dbo.Foo", "references", "dbo.Widgets")]
 
 
+def test_keyword_bare_word_does_not_collide_with_same_named_table():
+    """Regression test: a T-SQL keyword (RETURNS) that happens to
+    word-boundary-match a real table's bare name (dbo.Returns) must
+    never produce a false edge — caught live against the actual
+    fixture: fn_NetLineAmount's own `RETURNS DECIMAL(12,2)` clause was
+    being reported as a reference to the Returns table before this
+    fix. The function body has no genuine dependency at all (it's a
+    pure scalar calculation), so the correct result is no edges."""
+    definition = (
+        "CREATE FUNCTION dbo.fn_NetLineAmount(@Quantity INT, @UnitPrice DECIMAL(10,2), "
+        "@DiscountPct DECIMAL(5,2))\n"
+        "RETURNS DECIMAL(12,2)\n"
+        "AS\n"
+        "BEGIN\n"
+        "    RETURN CAST(@Quantity AS DECIMAL(12,2)) * @UnitPrice * (1 - (@DiscountPct / 100.0));\n"
+        "END;\n"
+    )
+    known = {
+        "dbo.fn_netlineamount": ("dbo.fn_NetLineAmount", "function"),
+        "dbo.returns": ("dbo.Returns", "table"),
+    }
+    edges = find_references(definition, "dbo.fn_netlineamount", known)
+    assert edges == []
+
+
+def test_bare_keyword_collision_does_not_block_a_real_bare_reference():
+    """The keyword-context restriction must still allow a genuine bare
+    reference elsewhere in the same text, even when a RETURNS clause
+    is also present."""
+    definition = (
+        "CREATE FUNCTION dbo.Foo()\n"
+        "RETURNS INT\n"
+        "AS\n"
+        "BEGIN\n"
+        "    DECLARE @x INT = (SELECT COUNT(*) FROM Returns);\n"
+        "    RETURN @x;\n"
+        "END;\n"
+    )
+    known = {
+        "dbo.foo": ("dbo.Foo", "function"),
+        "dbo.returns": ("dbo.Returns", "table"),
+    }
+    edges = find_references(definition, "dbo.foo", known)
+    assert edges == [("dbo.Foo", "references", "dbo.Returns")]
+
+
 def test_writes_to_predicate_for_insert_and_update_targets():
     definition = (
         "CREATE PROCEDURE dbo.Foo AS BEGIN "

@@ -230,6 +230,36 @@ class MCPClient:
             },
         )
 
+    def sql_object_definition(
+        self,
+        user_id: str,
+        db_name: str,
+        object_name: str,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/sql_object_definition",
+            {"user_id": user_id, "db_name": db_name, "object_name": object_name},
+        )
+
+    def sql_object_dependencies(
+        self,
+        user_id: str,
+        db_name: str,
+        object_name: str,
+        direction: str = "both",
+        max_hops: Optional[int] = None,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/sql_object_dependencies",
+            {
+                "user_id": user_id,
+                "db_name": db_name,
+                "object_name": object_name,
+                "direction": direction,
+                "max_hops": max_hops,
+            },
+        )
+
     def close(self) -> None:
         try:
             self._client.close()
@@ -439,6 +469,99 @@ def build_mcp_tools(user_id: str) -> list[Any]:
                     "see dynamic SQL."
                 ),
                 args_schema=SqlDependencyGraphArgs,
+            )
+        )
+
+    # Live-catalog counterpart to the static graph above — needs VIEW
+    # DEFINITION / VIEW DATABASE STATE permission on the stored SQL
+    # login, hence its own flag so an operator without those can
+    # disable it cleanly rather than seeing repeated tool-call failures.
+    if settings.ENABLE_SQL_DEPENDENCY_MCP_TOOLS:
+
+        class SqlObjectDefinitionArgs(BaseModel):
+            db_name: str = Field(..., description="Target SQL Server database name.")
+            object_name: str = Field(
+                ...,
+                description=(
+                    "A table/view/procedure/function/trigger name, e.g. "
+                    "'dbo.fn_NetLineAmount' or just 'fn_NetLineAmount'."
+                ),
+            )
+
+        class SqlObjectDependenciesArgs(BaseModel):
+            db_name: str = Field(..., description="Target SQL Server database name.")
+            object_name: str = Field(
+                ...,
+                description=(
+                    "A table/view/procedure/function/trigger name to "
+                    "start from, e.g. 'dbo.usp_BuildReport_X' or just "
+                    "'usp_BuildReport_X'."
+                ),
+            )
+            direction: str = Field(
+                default="both",
+                description=(
+                    "'downstream' = what depends on this object (impact "
+                    "analysis / blast radius). 'upstream' = what this "
+                    "object depends on (lineage / trace to source). "
+                    "'both' = both directions."
+                ),
+            )
+            max_hops: Optional[int] = Field(
+                default=None, description="Max traversal hops (default 3)."
+            )
+
+        def _run_sql_object_definition(db_name: str, object_name: str) -> str:
+            result = client.sql_object_definition(
+                user_id=user_id, db_name=db_name, object_name=object_name
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        def _run_sql_object_dependencies(
+            db_name: str,
+            object_name: str,
+            direction: str = "both",
+            max_hops: Optional[int] = None,
+        ) -> str:
+            result = client.sql_object_dependencies(
+                user_id=user_id,
+                db_name=db_name,
+                object_name=object_name,
+                direction=direction,
+                max_hops=max_hops,
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_sql_object_definition,
+                name="sql_object_definition",
+                description=(
+                    "Fetch the COMPLETE, unchunked definition of a live "
+                    "SQL Server table/view/procedure/function/trigger — "
+                    "straight from the database, not the (possibly "
+                    "fragmented or stale) ingested copy. Use this "
+                    "whenever you need to open up a called function/"
+                    "procedure's actual logic rather than naming it."
+                ),
+                args_schema=SqlObjectDefinitionArgs,
+            )
+        )
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_sql_object_dependencies,
+                name="sql_object_dependencies",
+                description=(
+                    "Traverse LIVE SQL Server dependency metadata "
+                    "(sys.dm_sql_referenced_entities / "
+                    "sys.dm_sql_referencing_entities), multiple hops "
+                    "deep. More authoritative than sql_dependency_graph "
+                    "since it reflects the database's current state, "
+                    "not the last ingestion. Use direction='downstream' "
+                    "for 'what breaks if I change X', direction='upstream' "
+                    "for 'trace X back to source'."
+                ),
+                args_schema=SqlObjectDependenciesArgs,
             )
         )
 

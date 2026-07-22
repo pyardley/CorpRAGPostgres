@@ -130,6 +130,24 @@ class Settings(BaseSettings):
     # gate it off by default the way the LLM-extraction pass above is.
     ENABLE_SQL_DEPENDENCY_GRAPH: bool = True
 
+    # Live-catalog counterpart to ENABLE_SQL_DEPENDENCY_GRAPH: binds two
+    # additional MCP tools on the hybrid chat path --
+    # `sql_object_definition` (fetches a complete, unchunked object body
+    # from `sys.sql_modules` / column metadata on demand) and
+    # `sql_object_dependencies` (hop-by-hop `sys.dm_sql_referenced_entities`
+    # / `sys.dm_sql_referencing_entities`, supplemented by the same static
+    # `core.sql_dependency_extraction.find_references` fallback the
+    # ingestor uses, for what those DMVs miss). See
+    # `mcp_server/tools/sql_schema_tools.py`.
+    #
+    # Separate flag, default on but easy to disable: unlike the static
+    # graph above, these tools need `VIEW DEFINITION`
+    # (`sys.sql_modules`) and ideally `VIEW DATABASE STATE` (the
+    # dependency DMVs) permissions on the stored SQL login -- an
+    # operator whose login lacks them can turn this off cleanly instead
+    # of seeing repeated tool-call failures.
+    ENABLE_SQL_DEPENDENCY_MCP_TOOLS: bool = True
+
     # ── Semantic response cache ───────────────────────────────────────────────
     #
     # Repeated or near-duplicate questions currently re-run the full
@@ -169,6 +187,20 @@ class Settings(BaseSettings):
     # many chunks; past the cap it's left as the retrieved fragment
     # rather than risk inlining a pathologically large object whole.
     SQL_OBJECT_REASSEMBLY_MAX_CHUNKS: int = 15
+
+    # Forced-inclusion: for SQL hits in the plain (non-MCP) retrieval
+    # path, additionally pull in objects directly connected to them via
+    # the static SQL dependency graph (entity_edges), bypassing the
+    # similarity/rerank cutoff entirely -- closing the case where a
+    # genuinely relevant object (e.g. a called function) never wins a
+    # top-K slot at all. See core.sql_object_context.expand_hits_with_dependencies.
+    #
+    # Off by default, unlike the other SQL retrieval-completeness knobs
+    # above: this directly inflates prompt size/cost/latency every turn
+    # a SQL object is retrieved, and worst-case badly for a "hub" object
+    # referenced by many procedures. Enable only after checking the
+    # real prompt-size impact against your own schema.
+    SQL_DEPENDENCY_FORCED_INCLUSION_ENABLED: bool = False
 
     # ── Retrieval ────────────────────────────────────────────────────────────
     TOP_K: int = 8

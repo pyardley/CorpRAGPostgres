@@ -66,7 +66,16 @@ from core.retriever import RetrievedChunk, deduplicate_by_resource
 from core.trace_completeness import check_trace_completeness
 
 
-MAX_TOOL_HOPS = 4
+
+# Raised from 4: a tracing/impact-analysis turn can legitimately spend
+# several hops just confirming dependency-graph structure (e.g. walking
+# upstream through 2-3 objects to reach base tables) before it has any
+# budget left to open up a called function's actual definition — verified
+# in testing that 4 hops let the model exhaust its whole budget on
+# dependency lookups and reach the final-summary path without ever
+# calling sql_object_definition. 6 leaves headroom for both without
+# uncapping the loop.
+MAX_TOOL_HOPS = 6
 
 
 HYBRID_SYSTEM_PROMPT = """You are CorporateRAG, an enterprise assistant with
@@ -76,9 +85,12 @@ TWO sources of truth and you are EXPECTED to use both:
    pages, SQL Server *schemas and stored-procedure code*, and Git
    files/commits. Cite inline as [1], [2], …
 2. **Live SQL tools (MCP)** — `sql_table_query` (returns rows),
-   `sql_list_databases` (lists DBs the user can query), and
-   `sql_dependency_graph` (traverses the static SQL object dependency
-   graph — see the tracing rules below).
+   `sql_list_databases` (lists DBs the user can query),
+   `sql_dependency_graph` (static SQL dependency graph, built at
+   ingestion time), `sql_object_definition` (fetches a complete,
+   unchunked live object body), and `sql_object_dependencies` (live
+   dependency-DMV traversal — see the tracing rules below for how these
+   relate).
 
 Tool-call policy — read carefully:
 
@@ -113,29 +125,41 @@ Answering rules:
 Tracing / impact-analysis rules — read carefully when the question asks how
 a value is derived, or what depends on/is affected by a table, column,
 view, procedure, or function:
-* For "what breaks if I change/drop X" (or similar blast-radius
-  questions), call `sql_dependency_graph` with `direction="downstream"`
-  BEFORE answering from RAG context alone — RAG retrieval is top-K
-  similarity search and has no guarantee it surfaced every object that
-  references X; the dependency graph is exhaustive over what was
-  ingested (though it's static/text-derived, so treat an empty result
-  as inconclusive, not proof of no dependency — it can't see dynamic
-  SQL).
-* For "trace X back to its source tables" (lineage questions), call
-  `sql_dependency_graph` with `direction="upstream"` the same way.
+* Prefer `sql_object_dependencies` over `sql_dependency_graph` when you
+  need to be certain about current state — it queries the LIVE database
+  (sys.dm_sql_referenced_entities / sys.dm_sql_referencing_entities), so
+  it reflects schema changes made after the last ingestion; the static
+  `sql_dependency_graph` only knows what was true as of ingestion time,
+  but has no live-connection dependency, so fall back to it if
+  `sql_object_dependencies` isn't available.
+* For "what breaks if I change/drop X" (blast-radius questions), call
+  one of these with `direction="downstream"` BEFORE answering from RAG
+  context alone — RAG retrieval is top-K similarity search and has no
+  guarantee it surfaced every object that references X. For "trace X
+  back to its source tables" (lineage questions), use
+  `direction="upstream"` the same way. Both tools can miss dynamic SQL,
+  so treat an empty result as inconclusive, not proof of no dependency.
 * Name EVERY intermediate stage explicitly — every temp table, CTE, join,
   and staging step. Never summarize or skip past an intermediate stage
   even if it seems minor.
-* Open up any called function or procedure and state its actual
-  logic/formula from its definition — never describe it only by name.
-  If a referenced object's definition isn't visible in the RAG context
-  (the dependency graph only gives you names, not bodies), say so
-  explicitly rather than silently omitting that step or guessing.
 * State explicitly whether a value's path is independent of, or shares a
   stage with, other objects' processing (e.g. a shared staging procedure
-  used by other reports vs. a bespoke inline path) — `sql_dependency_graph`
-  is exactly how you confirm this rather than guessing from RAG context
-  alone.
+  used by other reports vs. a bespoke inline path) — the dependency
+  tools are exactly how you confirm this rather than guessing from RAG
+  context alone.
+
+MANDATORY rule for any function or procedure that computes a value
+inline (anything you'd otherwise just name, e.g. "NetAmount is computed
+via fn_NetLineAmount"): you MUST call `sql_object_definition` on it and
+quote its actual formula/logic in your answer. This is a SEPARATE step
+from checking dependencies — confirming a function is *called* via
+`sql_object_dependencies`/`sql_dependency_graph` does NOT satisfy this
+rule, and stopping there is a failure. Do this even if the RAG context
+excerpt looks complete, and even if you've already spent several tool
+calls on dependency lookups — budget the remaining hops for it. Before
+writing your final answer, check: for every function/procedure named
+in your draft, did you actually call `sql_object_definition` on it? If
+not, call it now, before responding.
 """
 
 
@@ -240,6 +264,20 @@ def _execute_tool_call(
     elif name == "sql_dependency_graph":
         result = client.sql_dependency_graph(
             user_id=user_id,
+            object_name=args.get("object_name", ""),
+            direction=args.get("direction", "both"),
+            max_hops=args.get("max_hops"),
+        )
+    elif name == "sql_object_definition":
+        result = client.sql_object_definition(
+            user_id=user_id,
+            db_name=args.get("db_name", ""),
+            object_name=args.get("object_name", ""),
+        )
+    elif name == "sql_object_dependencies":
+        result = client.sql_object_dependencies(
+            user_id=user_id,
+            db_name=args.get("db_name", ""),
             object_name=args.get("object_name", ""),
             direction=args.get("direction", "both"),
             max_hops=args.get("max_hops"),

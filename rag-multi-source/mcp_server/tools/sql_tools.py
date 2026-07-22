@@ -36,12 +36,12 @@ from typing import Any, Optional
 
 import sqlparse
 from loguru import logger
-from sqlalchemy import event, text
-from sqlalchemy.engine import URL, Engine, create_engine
+from sqlalchemy import text
 
-from app.utils import get_db, list_accessible, load_credential
+from app.utils import get_db, list_accessible
 from core.live_acl import revalidate
 from mcp_server.config import mcp_settings
+from mcp_server.tools._sql_engine import get_engine, shutdown  # noqa: F401 - shutdown re-exported
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -263,65 +263,6 @@ def _inject_row_limit(query: str, max_rows: int) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Engine cache (one per (user_id, db_name))
-# ──────────────────────────────────────────────────────────────────────────────
-
-_engine_cache: dict[tuple[str, str], Engine] = {}
-
-
-def _get_engine(user_id: str, db_name: str) -> Engine:
-    """
-    Build (or reuse) a SQLAlchemy engine for the given user/database.
-
-    Mirrors ``app.ingestion.sql_ingestor.SQLIngestor._make_engine``: we
-    rewrite/append ``DATABASE=`` and pin the catalog with a
-    ``USE [db]`` connect-event so logins with a server-default DB still
-    land in the right place.
-    """
-    cache_key = (user_id, db_name)
-    if cache_key in _engine_cache:
-        return _engine_cache[cache_key]
-
-    with get_db() as db:
-        conn_str = load_credential(db, user_id, "sql", "conn_str")
-    if not conn_str:
-        raise PermissionError(
-            "User has no stored SQL Server connection string."
-        )
-
-    if "DATABASE=" in conn_str.upper():
-        conn_str = re.sub(
-            r"DATABASE=[^;]+",
-            f"DATABASE={db_name}",
-            conn_str,
-            flags=re.IGNORECASE,
-        )
-    else:
-        conn_str = conn_str.rstrip(";") + f";DATABASE={db_name}"
-
-    url = URL.create("mssql+pyodbc", query={"odbc_connect": conn_str})
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        pool_size=2,
-        max_overflow=2,
-        # Per-statement timeout (seconds). The pyodbc layer respects this.
-        connect_args={"timeout": mcp_settings.MCP_SQL_QUERY_TIMEOUT_SECONDS},
-    )
-
-    @event.listens_for(engine, "connect")
-    def _force_db(dbapi_conn, _conn_record):
-        cursor = dbapi_conn.cursor()
-        try:
-            cursor.execute(f"USE [{db_name}]")
-        finally:
-            cursor.close()
-
-    _engine_cache[cache_key] = engine
-    return engine
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Markdown rendering
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -422,7 +363,7 @@ def table_query(
 
     # 3. Execute.
     try:
-        engine = _get_engine(user_id, db_name)
+        engine = get_engine(user_id, db_name)
         with engine.connect() as conn:
             # Defence-in-depth: explicit read-only transaction on MSSQL.
             try:
@@ -467,16 +408,3 @@ def table_query(
         },
     )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Lifecycle
-# ──────────────────────────────────────────────────────────────────────────────
-
-def shutdown() -> None:
-    """Dispose every cached engine on server shutdown."""
-    for key, engine in list(_engine_cache.items()):
-        try:
-            engine.dispose()
-        except Exception:  # noqa: BLE001
-            logger.warning("Engine dispose failed for {}", key)
-    _engine_cache.clear()

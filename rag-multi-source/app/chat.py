@@ -48,7 +48,7 @@ from core.rag_chain import RAGAnswer, answer_question
 from core.reranker import rerank
 from core.response_cache import check_response_cache, store_response_cache
 from core.retriever import RetrievedChunk, retrieve
-from core.sql_object_context import expand_sql_chunks
+from core.sql_object_context import expand_hits_with_dependencies, expand_sql_chunks
 from core.trace_completeness import is_tracing_question
 from core.vector_store import build_query_filter
 
@@ -372,6 +372,17 @@ def render_chat(state: SelectionState) -> None:
                         # because that stage's chunk didn't win a slot.
                         hits = expand_sql_chunks(hits, user["id"])
                         t_expand.extra["expanded_count"] = len(hits)
+
+                    with StepTimer(chat_steps, "sql_dependency_expansion") as t_dep_expand:
+                        # No-ops (returns hits unchanged) unless
+                        # SQL_DEPENDENCY_FORCED_INCLUSION_ENABLED is set —
+                        # off by default. When on, force-includes objects
+                        # directly connected via the static SQL dependency
+                        # graph that never won a retrieval slot at all
+                        # (expand_sql_chunks above only helps once an
+                        # object already made the cut).
+                        hits = expand_hits_with_dependencies(hits, user["id"])
+                        t_dep_expand.extra["expanded_count"] = len(hits)
 
                     history = [
                         (m["role"], m["content"])

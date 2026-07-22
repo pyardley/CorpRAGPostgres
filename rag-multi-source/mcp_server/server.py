@@ -10,6 +10,8 @@ Exposes the tools defined in :mod:`mcp_server.tools.sql_tools` and
 * ``POST /mcp/tools/sql_list_databases`` — list user-accessible DBs
 * ``POST /mcp/tools/entity_graph_query`` — search the entity relationship graph
 * ``POST /mcp/tools/sql_dependency_graph`` — traverse the static SQL dependency graph
+* ``POST /mcp/tools/sql_object_definition`` — fetch a live, unchunked object body
+* ``POST /mcp/tools/sql_object_dependencies`` — traverse live SQL dependency DMVs
 
 All ``/mcp/*`` endpoints require the ``X-MCP-Token`` header to match
 :attr:`mcp_server.config.mcp_settings.MCP_SHARED_TOKEN`.
@@ -34,7 +36,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from mcp_server.config import generate_token, mcp_settings
-from mcp_server.tools import entity_graph_tools, sql_tools
+from mcp_server.tools import entity_graph_tools, sql_schema_tools, sql_tools
 
 
 # Shared on-disk token location — kept in sync with app/mcp_manager.py so
@@ -122,6 +124,24 @@ class SQLDependencyGraphRequest(BaseModel):
     )
 
 
+class SQLObjectDefinitionRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    db_name: str = Field(..., description="Target SQL Server database name.")
+    object_name: str = Field(..., description="Table/view/procedure/function/trigger name.")
+
+
+class SQLObjectDependenciesRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    db_name: str = Field(..., description="Target SQL Server database name.")
+    object_name: str = Field(..., description="SQL object name to start traversal from.")
+    direction: str = Field(
+        default="both", description="'upstream' | 'downstream' | 'both'."
+    )
+    max_hops: Optional[int] = Field(
+        default=None, description="Optional hop cap; clamped server-side."
+    )
+
+
 class ToolEnvelope(BaseModel):
     """Uniform response envelope returned by every tool endpoint."""
 
@@ -194,7 +214,11 @@ async def healthz() -> dict[str, Any]:
 @app.get("/mcp/tools", dependencies=[Depends(require_token)])
 async def list_tools() -> dict[str, Any]:
     """Return all registered MCP tool descriptors."""
-    return {"tools": sql_tools.TOOL_SPECS + entity_graph_tools.TOOL_SPECS}
+    return {
+        "tools": sql_tools.TOOL_SPECS
+        + entity_graph_tools.TOOL_SPECS
+        + sql_schema_tools.TOOL_SPECS
+    }
 
 
 @app.post(
@@ -244,6 +268,36 @@ async def call_entity_graph_query(req: EntityGraphQueryRequest) -> ToolEnvelope:
 async def call_sql_dependency_graph(req: SQLDependencyGraphRequest) -> ToolEnvelope:
     result = entity_graph_tools.traverse_sql_dependencies(
         user_id=req.user_id,
+        object_name=req.object_name,
+        direction=req.direction,
+        max_hops=req.max_hops,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/sql_object_definition",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_sql_object_definition(req: SQLObjectDefinitionRequest) -> ToolEnvelope:
+    result = sql_schema_tools.object_definition(
+        user_id=req.user_id,
+        db_name=req.db_name,
+        object_name=req.object_name,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/sql_object_dependencies",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_sql_object_dependencies(req: SQLObjectDependenciesRequest) -> ToolEnvelope:
+    result = sql_schema_tools.object_dependencies(
+        user_id=req.user_id,
+        db_name=req.db_name,
         object_name=req.object_name,
         direction=req.direction,
         max_hops=req.max_hops,

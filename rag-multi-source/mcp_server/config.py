@@ -42,6 +42,12 @@ class MCPSettings(BaseSettings):
     MCP_SQL_DEFAULT_ROWS: int = 50
     MCP_SQL_QUERY_TIMEOUT_SECONDS: int = 15
 
+    # Hard ceiling on traversal hops for sql_object_dependencies,
+    # regardless of what the caller requests — SQL Server has no single
+    # DMV giving transitive closure, so this tool recurses per hop
+    # (sys.dm_sql_referenced_entities / sys.dm_sql_referencing_entities).
+    MCP_SQL_MAX_DEPENDENCY_HOPS: int = 5
+
     # ── Logging ──────────────────────────────────────────────────────────────
     MCP_LOG_LEVEL: str = "INFO"
 

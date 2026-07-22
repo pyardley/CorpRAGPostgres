@@ -25,6 +25,17 @@ Known limitations, by design:
   this app's rendered DDL (see `sql_ingestor.py::_iter_tables`), so
   scanning a table's own "definition" never yields outgoing edges —
   only inbound edges (other objects that reference the table) show up.
+- A bare (unqualified) object name is only counted as a reference when
+  it directly follows an actual referencing keyword (FROM/JOIN/INTO/
+  UPDATE/TABLE/EXEC/EXECUTE) — not on every bare word-boundary match.
+  Without this, a T-SQL keyword that happens to collide with a real
+  table name produces a false edge: `RETURNS DECIMAL(12,2)` in a
+  function's return-type declaration word-boundary-matches a table
+  literally named `dbo.Returns` (confirmed against the RetailReportingDemo
+  fixture — `fn_NetLineAmount`'s own `RETURNS` clause was being reported
+  as a reference to the `Returns` table). Schema-qualified matches
+  (`dbo.Returns`) aren't affected — a keyword is never preceded by a
+  schema name in valid T-SQL, so no restriction is needed there.
 """
 
 from __future__ import annotations
@@ -41,6 +52,8 @@ _WRITE_TARGET_RE = re.compile(
     r"(\[?\w+\]?(?:\.\[?\w+\]?)?)",
     re.IGNORECASE,
 )
+
+_BARE_REFERENCE_KEYWORDS = r"FROM|JOIN|INTO|UPDATE|TABLE|EXEC|EXECUTE"
 
 
 def _strip_comments(definition: str) -> str:
@@ -73,7 +86,11 @@ def find_references(
     (non-schema-qualified) match is only attempted for objects in the
     `dbo` schema — the overwhelmingly common unqualified-reference case
     — since matching every schema's bare names risks cross-schema false
-    positives for short/generic names.
+    positives for short/generic names, and only when the bare name
+    directly follows an actual referencing keyword (see module
+    docstring for why — a bare word-boundary match alone lets T-SQL
+    keywords collide with same-named tables, e.g. `RETURNS` vs. a table
+    named `Returns`).
 
     Returns (subject, predicate, object) triples where `subject` is the
     scanned object's own canonical name and `object` is the matched
@@ -95,14 +112,21 @@ def find_references(
             continue
 
         schema, _, bare_name = key.partition(".")
-        patterns = [key]
-        if schema == "dbo":
-            patterns.append(bare_name)
 
-        if not any(
-            re.search(rf"(?<!\w){re.escape(p)}(?!\w)", text, re.IGNORECASE)
-            for p in patterns
-        ):
+        qualified_found = bool(
+            re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text, re.IGNORECASE)
+        )
+        bare_found = False
+        if not qualified_found and schema == "dbo":
+            bare_found = bool(
+                re.search(
+                    rf"\b(?:{_BARE_REFERENCE_KEYWORDS})\s+\[?{re.escape(bare_name)}\]?(?!\w)",
+                    text,
+                    re.IGNORECASE,
+                )
+            )
+
+        if not (qualified_found or bare_found):
             continue
 
         if object_type in ("procedure", "function"):

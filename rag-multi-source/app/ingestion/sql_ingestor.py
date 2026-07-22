@@ -26,6 +26,7 @@ from loguru import logger
 
 from app.config import settings
 from app.ingestion.base import BaseIngestor, SourceResource
+from core.sql_ddl import render_table_ddl
 from core.sql_dependency_extraction import find_references
 
 
@@ -397,19 +398,7 @@ class SQLIngestor(BaseIngestor):
     ) -> Iterable[SourceResource]:
         for full_name, cols in table_groups.items():
             schema_name = cols[0][0]
-            ddl_lines: list[str] = []
-            for col in cols:
-                col_name = col[2]
-                data_type = col[3]
-                max_len = col[4]
-                nullable = col[5]
-                default = col[6]
-                type_str = data_type + (f"({max_len})" if max_len else "")
-                null_str = "NULL" if nullable == "YES" else "NOT NULL"
-                default_str = f" DEFAULT {default}" if default else ""
-                ddl_lines.append(f"  {col_name} {type_str} {null_str}{default_str}")
-
-            ddl = "CREATE TABLE " + full_name + " (\n" + ",\n".join(ddl_lines) + "\n)"
+            ddl = render_table_ddl(full_name, cols)
             text_body = (
                 f"SQL Server TABLE: {full_name}\n"
                 f"Database: {db_name}\n\n"
