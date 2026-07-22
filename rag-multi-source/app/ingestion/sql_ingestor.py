@@ -51,6 +51,27 @@ WHERE v.VIEW_DEFINITION IS NOT NULL
 ORDER BY v.TABLE_SCHEMA, v.TABLE_NAME
 """
 
+_SQL_TRIGGERS = """
+SELECT
+    s.name             AS schema_name,
+    tr.name            AS trigger_name,
+    OBJECT_NAME(tr.parent_id) AS table_name,
+    sm.definition      AS definition,
+    tr.is_disabled     AS is_disabled,
+    tr.modify_date     AS modify_date,
+    (
+        SELECT STRING_AGG(te.type_desc, ', ')
+        FROM sys.trigger_events te
+        WHERE te.object_id = tr.object_id
+    )                  AS trigger_events
+FROM sys.triggers tr
+JOIN sys.sql_modules sm ON sm.object_id = tr.object_id
+JOIN sys.tables t ON t.object_id = tr.parent_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE tr.is_ms_shipped = 0
+ORDER BY s.name, t.name, tr.name
+"""
+
 _SQL_TABLE_COLS = """
 SELECT
     c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE,
@@ -186,6 +207,7 @@ class SQLIngestor(BaseIngestor):
             yield from self._iter_routines(engine, db_name, since)
             yield from self._iter_views(engine, db_name)
             yield from self._iter_tables(engine, db_name)
+            yield from self._iter_triggers(engine, db_name, since)
         finally:
             engine.dispose()
 
@@ -306,6 +328,57 @@ class SQLIngestor(BaseIngestor):
                     "schema_name": schema_name,
                     "object_name": full_name,
                     "object_type": "table",
+                    "server": self._server,
+                },
+            )
+
+    def _iter_triggers(
+        self, engine, db_name: str, since: Optional[str]
+    ) -> Iterable[SourceResource]:
+        from sqlalchemy import text
+
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(_SQL_TRIGGERS)).fetchall()
+        except Exception as exc:
+            logger.warning("[sql] Triggers failed for {}: {}", db_name, exc)
+            return
+
+        for (
+            schema_name,
+            trigger_name,
+            table_name,
+            definition,
+            is_disabled,
+            modify_date,
+            trigger_events,
+        ) in rows:
+            modify_date_str = str(modify_date) if modify_date else ""
+            if since and modify_date_str and modify_date_str < since:
+                continue
+
+            full_name = f"{schema_name}.{trigger_name}"
+            parent_full_name = f"{schema_name}.{table_name}"
+            status_str = "DISABLED" if is_disabled else "ENABLED"
+            text_body = (
+                f"SQL Server TRIGGER: {full_name}\n"
+                f"Database: {db_name}\n"
+                f"Table: {parent_full_name}\n"
+                f"Events: {trigger_events or '(unknown)'}\n"
+                f"Status: {status_str}\n\n"
+                f"-- Definition:\n{definition or '(definition not available)'}"
+            )
+            yield SourceResource(
+                resource_id=f"sql:{self._server}.{db_name}.{full_name}",
+                title=f"{db_name}: {full_name} (TRIGGER on {parent_full_name})",
+                text=text_body,
+                url="",
+                last_updated=modify_date_str or datetime.utcnow().isoformat(),
+                metadata={
+                    "db_name": db_name,
+                    "schema_name": schema_name,
+                    "object_name": full_name,
+                    "object_type": "trigger",
                     "server": self._server,
                 },
             )
