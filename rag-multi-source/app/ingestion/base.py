@@ -526,6 +526,18 @@ class BaseIngestor(ABC):
         The LLM extraction pass fails OPEN — an extraction error is
         logged and skipped; deterministic edges (and the resource's
         chunks) still persist normally.
+
+        The LLM pass never runs for `source == "sql"`, even when
+        `ENABLE_ENTITY_EXTRACTION_LLM` is on: `core.entity_extraction`'s
+        prompt is framed around Jira/Git free text (ticket descriptions,
+        commit messages) with no SQL-object scoping, and running it over
+        stored-procedure/function definitions produces relationship
+        noise (predicates like `has_column`, `defines`, `executes`,
+        `related_to`) rather than code-structure signal — confirmed live
+        against the RetailReportingDemo fixture, where it wrote 457 such
+        edges alongside 67 clean deterministic ones from
+        `core.sql_dependency_extraction.find_references`. SQL's
+        dependency graph relies on the deterministic edges only.
         """
         sql_dependency_graph_active = (
             self.source == "sql" and settings.ENABLE_SQL_DEPENDENCY_GRAPH
@@ -538,7 +550,7 @@ class BaseIngestor(ABC):
             for subject, predicate, obj in resource.entity_edges
         ]
 
-        if settings.ENABLE_ENTITY_EXTRACTION_LLM:
+        if settings.ENABLE_ENTITY_EXTRACTION_LLM and self.source != "sql":
             from core.entity_extraction import extract_entities
 
             # extract_entities() already fails open (logs + returns []),

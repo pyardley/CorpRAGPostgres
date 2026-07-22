@@ -219,6 +219,7 @@ class MCPClient:
         object_name: str,
         direction: str = "both",
         max_hops: Optional[int] = None,
+        extraction_method: str = "deterministic",
     ) -> MCPToolResult:
         return self._post(
             "/mcp/tools/sql_dependency_graph",
@@ -227,6 +228,7 @@ class MCPClient:
                 "object_name": object_name,
                 "direction": direction,
                 "max_hops": max_hops,
+                "extraction_method": extraction_method,
             },
         )
 
@@ -439,15 +441,29 @@ def build_mcp_tools(user_id: str) -> list[Any]:
             max_hops: Optional[int] = Field(
                 default=None, description="Max traversal hops (default 3, max 5)."
             )
+            extraction_method: str = Field(
+                default="deterministic",
+                description=(
+                    "'deterministic' (default) restricts to the "
+                    "regex-derived static-parse edges — the only ones "
+                    "with real code-structure signal. 'all' also "
+                    "includes any LLM-extracted edges (debugging only; "
+                    "SQL objects shouldn't normally have any)."
+                ),
+            )
 
         def _run_sql_dependency_graph(
-            object_name: str, direction: str = "both", max_hops: Optional[int] = None
+            object_name: str,
+            direction: str = "both",
+            max_hops: Optional[int] = None,
+            extraction_method: str = "deterministic",
         ) -> str:
             result = client.sql_dependency_graph(
                 user_id=user_id,
                 object_name=object_name,
                 direction=direction,
                 max_hops=max_hops,
+                extraction_method=extraction_method,
             )
             return result.markdown if result.ok else f"ERROR: {result.error}"
 

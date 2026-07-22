@@ -119,6 +119,19 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "description": "Max traversal hops (default 3, max 5).",
                     "default": 3,
                 },
+                "extraction_method": {
+                    "type": "string",
+                    "enum": ["deterministic", "all"],
+                    "description": (
+                        "'deterministic' (default) restricts to the "
+                        "regex-derived static-parse edges — the only "
+                        "ones with real code-structure signal for "
+                        "tracing. 'all' also includes any LLM-extracted "
+                        "edges (debugging only; SQL objects shouldn't "
+                        "normally have any)."
+                    ),
+                    "default": "deterministic",
+                },
             },
             "required": ["object_name"],
         },
@@ -252,6 +265,7 @@ def traverse_sql_dependencies(
     object_name: str,
     direction: str = "both",
     max_hops: Optional[int] = None,
+    extraction_method: str = "deterministic",
 ) -> ToolResult:
     """
     Multi-hop BFS over the static SQL dependency graph
@@ -270,9 +284,20 @@ def traverse_sql_dependencies(
     `query_entities` above, so a caller can pass a bare name
     ("usp_BuildReport_X") or a fully/partially qualified one
     ("dbo.usp_BuildReport_X", "MyDb.dbo.usp_BuildReport_X").
+
+    `extraction_method` defaults to `"deterministic"` — SQL edges from
+    `core.sql_dependency_extraction.find_references` are the only ones
+    with real code-structure signal; an `"llm"`-tagged SQL edge is
+    noise from `core.entity_extraction`'s free-text pass having run
+    (before it was scoped away from `source == "sql"` — see
+    `app.ingestion.base._persist_entity_edges`) over object definitions
+    it was never designed to parse. Pass `"all"` to see everything,
+    including any such noise still sitting in an un-re-ingested database.
     """
     if direction not in ("upstream", "downstream", "both"):
         direction = "both"
+    if extraction_method not in ("deterministic", "all"):
+        extraction_method = "deterministic"
     hops = max(1, min(int(max_hops or 3), _MAX_HOPS_CEILING))
 
     with get_db() as db:
@@ -287,9 +312,10 @@ def traverse_sql_dependencies(
                 metadata={"count": 0},
             )
 
-        base_clause = and_(
-            EntityEdge.source == "sql", EntityEdge.resource_identifier.in_(sql_scopes)
-        )
+        clauses = [EntityEdge.source == "sql", EntityEdge.resource_identifier.in_(sql_scopes)]
+        if extraction_method != "all":
+            clauses.append(EntityEdge.extraction_method == "deterministic")
+        base_clause = and_(*clauses)
 
         def _bfs(forward: bool) -> list[dict[str, Any]]:
             visited = {object_name.lower()}
@@ -347,10 +373,11 @@ def traverse_sql_dependencies(
     markdown = "\n\n".join(parts) if parts else f"_(no edges found for {object_name!r})_"
 
     logger.info(
-        "[mcp.sql_dependency_graph] user={} object={!r} direction={} -> {} edges",
+        "[mcp.sql_dependency_graph] user={} object={!r} direction={} extraction_method={} -> {} edges",
         user_id,
         object_name,
         direction,
+        extraction_method,
         total,
     )
     return ToolResult(
@@ -358,5 +385,5 @@ def traverse_sql_dependencies(
         tool="sql_dependency_graph",
         data={"edges": edge_sets},
         markdown=markdown,
-        metadata={"count": total},
+        metadata={"count": total, "extraction_method": extraction_method},
     )

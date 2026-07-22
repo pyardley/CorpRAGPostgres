@@ -1935,3 +1935,126 @@ Worth validating afterwards: `RESPONSE_CACHE_SIMILARITY_THRESHOLD`
 augmented answers, which can have more variable structure (tool-output
 headers, inline "(live data from ...)" labels) — check it still holds
 before relying on it for the newly-cacheable hybrid answers.
+
+### 8. SQL Server impact analysis: gaps found and closed
+
+The static dependency graph (`core.sql_dependency_extraction`,
+`sql_dependency_graph`) and live tools (`sql_object_definition`,
+`sql_object_dependencies`) closed the main gaps found while testing
+impact-analysis questions ("what breaks if I change X", "trace Y back
+to source") against a purpose-built fixture (see
+`fixtures/sql-server-impact-analysis-prompt.md`). Four follow-on gaps
+surfaced during further live testing; all four are now closed:
+
+- **`ENABLE_ENTITY_EXTRACTION_LLM`'s free-text pass didn't check
+  `source` before running on SQL objects.** `BaseIngestor._persist_entity_edges`
+  gated its *deterministic* edges per-source, but the LLM-extraction
+  branch underneath it ran unconditionally whenever
+  `ENABLE_ENTITY_GRAPH` (or `ENABLE_SQL_DEPENDENCY_GRAPH`) was on and
+  `ENABLE_ENTITY_EXTRACTION_LLM` was also on — meaning it also ran over
+  stored-procedure/function definitions, producing noisy,
+  inconsistently-named predicates (`has_column`, `defines`, `executes`,
+  `related_to`, …) written to `entity_edges` alongside the clean,
+  deterministic `calls`/`references`/`writes_to` edges from
+  `find_references`. Confirmed in one ingestion run of the fixture
+  database: 457 LLM-tagged edges against 67 deterministic ones for the
+  same 38 objects. **Fixed**: the LLM pass is now scoped away from
+  `source == "sql"` entirely (`app/ingestion/base.py`); a normal
+  re-ingest purges any previously-written `"llm"`-tagged SQL edges via
+  `upsert_edges`'s delete-then-insert semantics.
+- **No way to filter `entity_edges` by `extraction_method`.** Even
+  after the fix above, historical noise persists until re-ingested, and
+  there was no way for a caller to request deterministic-only edges.
+  **Fixed**: `traverse_sql_dependencies` (and the `sql_dependency_graph`
+  MCP tool/client wrapper) now accepts `extraction_method:
+  "deterministic" | "all"`, defaulting to `"deterministic"`.
+- **Forced-inclusion into the plain (non-MCP) RAG path shipped off by
+  default and was never validated against a real schema.**
+  `core.sql_object_context.expand_hits_with_dependencies`
+  (`SQL_DEPENDENCY_FORCED_INCLUSION_ENABLED`) force-includes objects
+  connected via the dependency graph, bypassing the similarity/rerank
+  cutoff. **Measured**: against the fixture's worst case
+  (`dbo.usp_StageCompletedOrderLines`, shared by 3 of 5 report procs),
+  asking "What breaks if I change dbo.usp_StageCompletedOrderLines?"
+  via the plain-RAG path — off, retrieval already surfaced all 3
+  dependent procedures unaided (6 hits, 13.2k context chars, 3760
+  prompt tokens, zero incomplete traces). On, forced-inclusion pulled
+  in 5 more objects (+2255 chars, +18.1% prompt tokens) but named the
+  same 3 procedures with no completeness gain. Left off by default
+  (see the measured numbers recorded in `app/config.py`'s comment);
+  the flag is now also gated to the plain-RAG path only, since the
+  hybrid/MCP path already has `sql_object_dependencies` as an on-demand
+  tool and gained nothing from forcing the same objects into every
+  prompt.
+- **The MANDATORY `sql_object_definition` prompt rule wasn't reliably
+  followed.** Confirmed via live A/B testing: the same tracing question,
+  asked twice, sometimes got the called function's formula opened up
+  and sometimes didn't — `core.trace_completeness` could only ever
+  append a caveat footer after the fact, never correct the model.
+  **Fixed**: `core.mcp_chain` now runs a bounded forced-retry —
+  `missing_definition_calls` (in `core.trace_completeness`) detects any
+  named procedure/function the model never opened via
+  `sql_object_definition`, and if hop budget allows (`MAX_TOOL_HOPS`
+  raised 4→6, with 2 hops reserved for the corrective round), injects
+  one corrective instruction naming the gap before accepting a final
+  answer. Verified via scripted unit tests
+  (`tests/test_mcp_chain_forced_retry.py`) covering: retry fires once
+  and converges; no retry when already compliant; no retry attempted
+  too close to hop exhaustion (falls back to the honest footer
+  instead). Live testing after the fix showed the model consistently
+  compliant on the first try, so the retry path is a safety net that
+  hasn't needed to fire in practice yet, not the primary mechanism.
+
+### 9. Apply the SQL impact-analysis lessons to GitHub repositories
+
+Git ingestion (`app/ingestion/git_ingestor.py`) pulls in full file
+contents and commit metadata, chunked the same generic way as every
+other source — no AST or function-boundary awareness — and the only
+`entity_edges` it writes are repo-level `modified_by` triples from
+commit authorship. There's no import/require parsing, no cross-file
+reference detection, and no "what else imports this module" or "what
+breaks if I change this function's signature" capability at all —
+exactly the gap `core.sql_dependency_extraction` closed for SQL
+Server, applied to a different source. There's also no live GitHub MCP
+tool analogous to `sql_object_definition` — a file is only readable
+via its ingested, possibly-stale chunked copy.
+
+The SQL work suggests the shape of the fix rather directly, and a
+few of its specific lessons are worth porting deliberately rather than
+rediscovering:
+
+- **Build the static graph the same way**: a two-pass approach — first
+  catalog every ingested file's stable identifier (`git_scope` +
+  `file_path`, already populated per file — see
+  `git_ingestor.py`'s `_file_to_resource`), then scan each file's
+  content for `import`/`from ... import` (Python) or
+  `import`/`require(` (JS/TS) statements resolving to another
+  cataloged file, emitting the same style of `(subject, "imports",
+  object)` edges `find_references` emits for SQL.
+- **Require an actual referencing keyword for any "bare" match, from
+  the start** — don't repeat the mistake that had to be fixed after
+  the fact for SQL (a bare word-boundary match on a module name
+  collided with an identically-named language keyword/table). Only
+  count a match when it directly follows `import`/`from`/`require(`,
+  not anywhere the module name string happens to appear.
+- **Build a test fixture with the same deliberate structure**: a small
+  multi-file demo repo where several files import one shared utility
+  module, and at least one file that looks similar but deliberately
+  doesn't — mirroring the SQL fixture's shared-vs-independent staging
+  procedure — before trusting that the graph (or an LLM asked to trace
+  it) gets the distinction right.
+- **A live tool has no DMV equivalent to fall back on.** SQL Server
+  ships `sys.dm_sql_referenced_entities` for free; GitHub's REST API
+  has nothing like it. A live `github_file_dependencies` tool would
+  have to run the *same* regex-based `find_references`-style
+  extraction against the file's current content — there's no
+  authoritative live source to defer to the way the SQL tools defer to
+  the DMVs, so get the static/text-scan approach right first, since
+  it's not a fallback here — it's the only mechanism available live or
+  otherwise.
+- **Expect to need the same prompt/tool-budget tuning, not just the
+  tool.** Building `sql_object_definition` didn't change behaviour by
+  itself — closing the gap took a larger tool-call budget and a
+  mandatory, failure-framed instruction. A `github_file_dependencies`
+  tool should assume the same will be true rather than treating a
+  quiet rollout as sufficient.

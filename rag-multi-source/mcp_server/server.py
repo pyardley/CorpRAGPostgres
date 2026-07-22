@@ -122,6 +122,10 @@ class SQLDependencyGraphRequest(BaseModel):
     max_hops: Optional[int] = Field(
         default=None, description="Optional hop cap; clamped server-side."
     )
+    extraction_method: str = Field(
+        default="deterministic",
+        description="'deterministic' (default) | 'all' (include LLM-tagged noise).",
+    )
 
 
 class SQLObjectDefinitionRequest(BaseModel):
@@ -271,6 +275,7 @@ async def call_sql_dependency_graph(req: SQLDependencyGraphRequest) -> ToolEnvel
         object_name=req.object_name,
         direction=req.direction,
         max_hops=req.max_hops,
+        extraction_method=req.extraction_method,
     )
     return ToolEnvelope(**result.to_dict())
 

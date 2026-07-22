@@ -200,6 +200,20 @@ class Settings(BaseSettings):
     # a SQL object is retrieved, and worst-case badly for a "hub" object
     # referenced by many procedures. Enable only after checking the
     # real prompt-size impact against your own schema.
+    #
+    # Measured against the worst case in this repo's own fixture --
+    # dbo.usp_StageCompletedOrderLines, shared by 3 of 5 report procs --
+    # asking "What breaks if I change dbo.usp_StageCompletedOrderLines?"
+    # via the plain-RAG path: off, retrieval already surfaced all 3
+    # dependent procedures unaided (6 hits, 13.2k context chars, 3760
+    # prompt tokens, trace_incomplete_count=0). On, forced-inclusion
+    # pulled in 5 more objects (11 hits, +2255 chars, 4441 prompt tokens,
+    # +18.1%) but named the same 3 procedures with the same
+    # trace_incomplete_count=0 -- no completeness gain for the added
+    # cost. Left off per the plan's criteria (flip only if growth is
+    # modest AND completeness measurably improves); re-measure if a
+    # schema with a much larger fan-out ever shows retrieval alone
+    # missing a genuine dependent.
     SQL_DEPENDENCY_FORCED_INCLUSION_ENABLED: bool = False
 
     # ── Retrieval ────────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ from core.llm import get_llm
 from core.mcp_client import build_mcp_tools, get_mcp_client
 from core.rag_chain import RAGAnswer, _format_context  # type: ignore[attr-defined]
 from core.retriever import RetrievedChunk, deduplicate_by_resource
-from core.trace_completeness import check_trace_completeness
+from core.trace_completeness import check_trace_completeness, missing_definition_calls
 
 
 
@@ -76,6 +76,25 @@ from core.trace_completeness import check_trace_completeness
 # calling sql_object_definition. 6 leaves headroom for both without
 # uncapping the loop.
 MAX_TOOL_HOPS = 6
+
+# A forced-retry round (see the `if not tool_calls:` branch below) needs
+# TWO more loop iterations after the one that detects non-compliance with
+# the MANDATORY sql_object_definition rule: one for the model to actually
+# call the tool, one more for it to produce a real final answer
+# incorporating the result. Any iteration with tool_calls is always
+# routed to tool-execution, never treated as final — so reserving only
+# one hop would let the tool-call turn consume the last iteration,
+# pushing the real final answer into the hop-exhausted fallback block
+# below instead of this loop's own final-answer path.
+_FORCED_RETRY_HOP_RESERVE = 2
+
+_FORCED_RETRY_TEMPLATE = (
+    "Before giving a final answer, you named the following function(s)/"
+    "procedure(s) without calling `sql_object_definition` on them: {names}. "
+    "Per the MANDATORY rule above, call `sql_object_definition` on each of "
+    "these now, quote their actual formula/logic, and only then give your "
+    "final answer."
+)
 
 
 HYBRID_SYSTEM_PROMPT = """You are CorporateRAG, an enterprise assistant with
@@ -267,6 +286,7 @@ def _execute_tool_call(
             object_name=args.get("object_name", ""),
             direction=args.get("direction", "both"),
             max_hops=args.get("max_hops"),
+            extraction_method=args.get("extraction_method", "deterministic"),
         )
     elif name == "sql_object_definition":
         result = client.sql_object_definition(
@@ -302,6 +322,33 @@ def _execute_tool_call(
         return header + result.markdown, result.metadata
 
     return result.markdown, result.metadata
+
+
+def _called_definition_targets(messages: list[Any]) -> set[str]:
+    """
+    Every `object_name` argument passed to `sql_object_definition` in any
+    `AIMessage.tool_calls` entry in `messages` so far this turn — no new
+    instrumentation needed, since every hop's tool calls already live in
+    `messages` (the per-hop `StepTimer` step only echoes `db_name`, not
+    the full args, which is why this reads `messages` directly instead).
+    """
+    targets: set[str] = set()
+    for msg in messages:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for call in tool_calls:
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
+            if name != "sql_object_definition":
+                continue
+            args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:  # noqa: BLE001
+                    args = {}
+            object_name = (args or {}).get("object_name")
+            if object_name:
+                targets.add(object_name)
+    return targets
 
 
 def _current_model_name() -> str:
@@ -480,6 +527,8 @@ def answer_question_with_mcp(
         )
     )
 
+    forced_retry_used = False
+
     for hop in range(MAX_TOOL_HOPS):
         with StepTimer(
             steps,
@@ -501,6 +550,36 @@ def answer_question_with_mcp(
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
+            # The model thinks it's done — but "thinks it's done" isn't
+            # the same as "actually complied with the MANDATORY
+            # sql_object_definition rule". Give it exactly one corrective
+            # round before accepting this as final, provided there's
+            # enough hop budget left for both the corrective tool call
+            # AND a real final answer afterward (see
+            # _FORCED_RETRY_HOP_RESERVE's comment for why that's 2 hops,
+            # not 1).
+            if not forced_retry_used and hop < MAX_TOOL_HOPS - _FORCED_RETRY_HOP_RESERVE:
+                unopened = missing_definition_calls(
+                    hits, _called_definition_targets(messages)
+                )
+                if unopened:
+                    forced_retry_used = True
+                    record_step_timing(
+                        steps,
+                        "forced_retry:sql_object_definition",
+                        duration_ms=0,
+                        hop=hop,
+                        missing=unopened,
+                    )
+                    messages.append(
+                        HumanMessage(
+                            content=_FORCED_RETRY_TEMPLATE.format(
+                                names=", ".join(unopened)
+                            )
+                        )
+                    )
+                    continue  # spend one more hop letting the model comply
+
             # Done.
             with StepTimer(steps, "post_processing") as t_post:
                 text = getattr(response, "content", "") or ""
@@ -520,6 +599,18 @@ def answer_question_with_mcp(
                         "\n\n_Note: this trace may be incomplete — objects "
                         "present in the source but not mentioned above: "
                         + ", ".join(missing)
+                        + "._"
+                    )
+                still_unopened = missing_definition_calls(
+                    hits, _called_definition_targets(messages)
+                )
+                t_post.extra["missing_definition_calls"] = still_unopened
+                if still_unopened:
+                    text += (
+                        "\n\n_Note: the following function(s)/procedure(s) "
+                        "were named but never opened via "
+                        "`sql_object_definition`: "
+                        + ", ".join(still_unopened)
                         + "._"
                     )
             final_citations = citations + extra_citations
@@ -610,6 +701,21 @@ def answer_question_with_mcp(
                 "\n\n_Note: this trace may be incomplete — objects present "
                 "in the source but not mentioned above: "
                 + ", ".join(missing)
+                + "._"
+            )
+        # No retry is attempted here — the hop budget is already
+        # exhausted by definition — but the footer should still be an
+        # honest signal in this last-resort path, same as the main loop's
+        # final-answer branch.
+        still_unopened = missing_definition_calls(
+            hits, _called_definition_targets(messages)
+        )
+        t_post.extra["missing_definition_calls"] = still_unopened
+        if still_unopened:
+            text += (
+                "\n\n_Note: the following function(s)/procedure(s) were "
+                "named but never opened via `sql_object_definition`: "
+                + ", ".join(still_unopened)
                 + "._"
             )
 

@@ -381,8 +381,21 @@ def render_chat(state: SelectionState) -> None:
                         # graph that never won a retrieval slot at all
                         # (expand_sql_chunks above only helps once an
                         # object already made the cut).
-                        hits = expand_hits_with_dependencies(hits, user["id"])
+                        #
+                        # Plain-RAG path only: on the hybrid/MCP path the
+                        # LLM already has sql_object_dependencies /
+                        # sql_dependency_graph as on-demand tools, so
+                        # forcing extra objects into every prompt there is
+                        # more likely redundant cost than value — the
+                        # plain path has no such fallback, which is the
+                        # actual gap this closes.
+                        chars_before = sum(len(h.text) for h in hits)
+                        if not used_mcp_path:
+                            hits = expand_hits_with_dependencies(hits, user["id"])
                         t_dep_expand.extra["expanded_count"] = len(hits)
+                        t_dep_expand.extra["chars_added"] = (
+                            sum(len(h.text) for h in hits) - chars_before
+                        )
 
                     history = [
                         (m["role"], m["content"])
