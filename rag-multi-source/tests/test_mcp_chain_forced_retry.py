@@ -34,6 +34,19 @@ def _chunk(resource_id, object_name, object_type, text, score=1.0):
     )
 
 
+def _git_chunk(resource_id, file_path, text, score=1.0):
+    return RetrievedChunk(
+        resource_id=resource_id,
+        source="git",
+        chunk_index=0,
+        score=score,
+        text=text,
+        title=file_path,
+        url="",
+        metadata={"file_path": file_path, "git_type": "file", "object_name": file_path},
+    )
+
+
 _ANCHOR_TEXT = """
 CREATE PROCEDURE dbo.usp_BuildReport_CustomerChurnRisk
 AS
@@ -59,6 +72,35 @@ def _hits():
             "dbo.fn_NetLineAmount",
             "function",
             "CREATE FUNCTION dbo.fn_NetLineAmount(...) RETURNS DECIMAL(12,2) ...",
+            score=0.5,
+        ),
+    ]
+
+
+_GIT_ANCHOR_TEXT = """Git File: feature_a.py
+Repository: acme/widgets
+Branch: main
+
+from shared.utils import helper
+
+
+def run(value):
+    return helper(value)
+"""
+
+
+def _git_hits():
+    return [
+        _git_chunk(
+            "git:acme/widgets@main:file:feature_a.py",
+            "feature_a.py",
+            _GIT_ANCHOR_TEXT,
+            score=0.95,
+        ),
+        _git_chunk(
+            "git:acme/widgets@main:file:shared/utils.py",
+            "shared/utils.py",
+            "def helper(value):\n    return value * 2\n",
             score=0.5,
         ),
     ]
@@ -246,3 +288,124 @@ def test_forced_retry_does_not_fire_near_hop_budget_exhaustion(monkeypatch):
 
     post = next(s for s in result.steps if s["step_name"] == "post_processing")
     assert post["metadata"]["missing_definition_calls"] == ["dbo.fn_NetLineAmount"]
+
+
+def test_git_forced_retry_fires_once_and_converges(monkeypatch):
+    """
+    Git analog of test_forced_retry_fires_once_and_converges: hop 0
+    names `helper()` (defined in shared/utils.py) without calling
+    `github_file_content` on it, despite shared/utils.py being a
+    candidate referenced file. Expect the gate to fire once, then accept
+    the real final answer after a compliant github_file_content call.
+    """
+    noncompliant_final = AIMessage(
+        content="run() calls helper() to double the value."
+    )
+    compliant_tool_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "github_file_content",
+                "args": {"git_scope": "acme/widgets@main", "file_path": "shared/utils.py"},
+                "id": "call_1",
+            }
+        ],
+    )
+    real_final = AIMessage(
+        content=(
+            "run() calls helper(), defined in shared/utils.py as "
+            "`return value * 2` — so run() doubles its input."
+        )
+    )
+
+    scripted = _ScriptedLLM([noncompliant_final, compliant_tool_call, real_final])
+    _install_common_stubs(monkeypatch, scripted)
+
+    result = answer_question_with_mcp(
+        "test-user-id",
+        "Explain what run() in feature_a.py does, tracing into any helpers it calls.",
+        _git_hits(),
+        history=[],
+    )
+
+    step_names = [s["step_name"] for s in result.steps]
+
+    assert step_names.count("forced_retry:github_file_content") == 1, step_names
+    assert step_names.count("llm_invocation") == 3, step_names
+    assert "mcp_tool_call:github_file_content" in step_names, step_names
+    assert result.answer == real_final.content
+
+    post = next(s for s in result.steps if s["step_name"] == "post_processing")
+    assert post["metadata"]["missing_content_opens"] == []
+    assert "never opened via `github_file_content`" not in result.answer
+
+
+def test_no_retry_when_github_file_content_called_immediately(monkeypatch):
+    """A model that calls github_file_content before finalizing should
+    never trigger the git forced-retry branch at all."""
+    compliant_tool_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "github_file_content",
+                "args": {"git_scope": "acme/widgets@main", "file_path": "shared/utils.py"},
+                "id": "call_1",
+            }
+        ],
+    )
+    real_final = AIMessage(
+        content="run() calls helper(), defined in shared/utils.py as `return value * 2`."
+    )
+    scripted = _ScriptedLLM([compliant_tool_call, real_final])
+    _install_common_stubs(monkeypatch, scripted)
+
+    result = answer_question_with_mcp(
+        "test-user-id",
+        "Explain what run() in feature_a.py does, tracing into any helpers it calls.",
+        _git_hits(),
+        history=[],
+    )
+
+    step_names = [s["step_name"] for s in result.steps]
+    assert "forced_retry:github_file_content" not in step_names
+    assert step_names.count("llm_invocation") == 2, step_names
+    assert result.answer == real_final.content
+
+
+def test_combined_sql_and_git_forced_retry_fires_once_with_both_names(monkeypatch):
+    """When a turn's hits mix SQL and Git candidates and the model skips
+    both MANDATORY tool calls, the single shared forced_retry_used latch
+    should still only fire once, naming both tools in one step."""
+    noncompliant_final = AIMessage(
+        content=(
+            "TotalNetAmount comes from dbo.usp_BuildReport_CustomerChurnRisk. "
+            "Separately, run() calls helper() to double the value."
+        )
+    )
+    real_final = AIMessage(
+        content=(
+            "TotalNetAmount is computed by dbo.fn_NetLineAmount as "
+            "Quantity * UnitPrice * (1 - DiscountPct). Separately, run() "
+            "calls helper(), defined in shared/utils.py as `return value * 2`."
+        )
+    )
+
+    scripted = _ScriptedLLM([noncompliant_final, real_final])
+    _install_common_stubs(monkeypatch, scripted)
+
+    result = answer_question_with_mcp(
+        "test-user-id",
+        "Trace TotalNetAmount, and separately explain run() in feature_a.py.",
+        _hits() + _git_hits(),
+        history=[],
+    )
+
+    step_names = [s["step_name"] for s in result.steps]
+    assert step_names.count("forced_retry:sql_object_definition+github_file_content") == 1, step_names
+    assert step_names.count("llm_invocation") == 2, step_names
+    # Neither MANDATORY tool was ever actually called in this script (the
+    # retry message alone doesn't force compliance), so the honest
+    # footers still apply on top of the model's second response -- the
+    # point of this test is the single combined retry step firing once,
+    # not full end-to-end convergence (covered by the single-source tests).
+    assert result.answer.startswith(real_final.content)

@@ -43,6 +43,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
 from app.ingestion.base import BaseIngestor, SourceResource
+from core.git_dependency_extraction import build_known_files
 
 
 _DEFAULT_EXTENSIONS = frozenset(
@@ -292,6 +293,7 @@ class GitIngestor(BaseIngestor):
             )
             return
 
+        paths: list[str] = []
         for item in tree.tree:
             if item.type != "blob":
                 continue
@@ -300,8 +302,20 @@ class GitIngestor(BaseIngestor):
             ext = ("." + filename.rsplit(".", 1)[-1]).lower() if "." in filename else ""
             if ext not in self._extensions:
                 continue
+            paths.append(path)
 
-            resource = self._file_to_resource(repo, branch, path)
+        # Catalog the *whole* filtered path list before fetching any
+        # content — cheap, since `get_git_tree(recursive=True)` already
+        # returned it in one call. This is what lets an import in a file
+        # that wasn't re-fetched this run (incremental mode) still resolve
+        # against files that were. Mirrors sql_ingestor.py's
+        # catalog-then-scan two-pass structure.
+        known_files = (
+            build_known_files(paths) if settings.ENABLE_GIT_DEPENDENCY_GRAPH else frozenset()
+        )
+
+        for path in paths:
+            resource = self._file_to_resource(repo, branch, path, known_files)
             if resource:
                 yield resource
             time.sleep(self.RATE_LIMIT_SLEEP)
@@ -311,7 +325,7 @@ class GitIngestor(BaseIngestor):
         wait=wait_exponential(multiplier=1, min=2, max=10),
     )
     def _file_to_resource(
-        self, repo, branch: str, path: str
+        self, repo, branch: str, path: str, known_files: frozenset[str] = frozenset()
     ) -> Optional[SourceResource]:
         try:
             file_obj = repo.get_contents(path, ref=branch)
@@ -336,6 +350,23 @@ class GitIngestor(BaseIngestor):
         )
 
         git_scope = f"{repo.full_name}@{branch}"
+
+        # Static import graph — README "Possible enhancements" §9. Same
+        # deterministic, zero-extra-API-call shape as the commit
+        # `modified_by` edges above: the content is already in hand from
+        # the fetch above. Prefixed with git_scope here (not inside
+        # find_imports) so the same file path in two different repos/
+        # branches never collides, mirroring how sql_ingestor.py prefixes
+        # find_references' output with db_name.
+        entity_edges: list[tuple[str, str, str]] = []
+        if settings.ENABLE_GIT_DEPENDENCY_GRAPH:
+            from core.git_dependency_extraction import find_imports
+
+            entity_edges = [
+                (f"{git_scope}:{subj}", predicate, f"{git_scope}:{obj}")
+                for subj, predicate, obj in find_imports(content, path, known_files)
+            ]
+
         return SourceResource(
             resource_id=f"git:{git_scope}:file:{path}",
             title=f"{repo.name}/{path}",
@@ -352,6 +383,7 @@ class GitIngestor(BaseIngestor):
                 "file_path": path,
                 "object_name": path,
             },
+            entity_edges=entity_edges,
         )
 
 

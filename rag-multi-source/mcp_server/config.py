@@ -48,6 +48,12 @@ class MCPSettings(BaseSettings):
     # (sys.dm_sql_referenced_entities / sys.dm_sql_referencing_entities).
     MCP_SQL_MAX_DEPENDENCY_HOPS: int = 5
 
+    # Hard ceiling on traversal hops for github_file_dependencies,
+    # regardless of what the caller requests — each hop is a live GitHub
+    # API fetch (there's no DMV/tree-wide equivalent to recurse through
+    # server-side), so this also bounds worst-case API calls per tool call.
+    MCP_GIT_MAX_DEPENDENCY_HOPS: int = 5
+
     # ── Logging ──────────────────────────────────────────────────────────────
     MCP_LOG_LEVEL: str = "INFO"
 

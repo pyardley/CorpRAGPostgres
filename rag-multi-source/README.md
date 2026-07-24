@@ -2019,74 +2019,103 @@ surfaced during further live testing; all four are now closed:
 
 ### 9. Apply the SQL impact-analysis lessons to GitHub repositories
 
-Git ingestion (`app/ingestion/git_ingestor.py`) pulls in full file
-contents and commit metadata, chunked the same generic way as every
-other source — no AST or function-boundary awareness — and the only
-`entity_edges` it writes are repo-level `modified_by` triples from
-commit authorship. There's no import/require parsing, no cross-file
-reference detection, and no "what else imports this module" or "what
-breaks if I change this function's signature" capability at all —
-exactly the gap `core.sql_dependency_extraction` closed for SQL
-Server, applied to a different source. There's also no live GitHub MCP
-tool analogous to `sql_object_definition` — a file is only readable
-via its ingested, possibly-stale chunked copy.
+**Implemented.** Git ingestion previously pulled in full file contents
+and commit metadata chunked the same generic way as every other source
+— no import/reference awareness at all, and the only `entity_edges` it
+wrote were repo-level `modified_by` triples from commit authorship.
+This closes that gap, applying the shape of the SQL work (§8/§11) to
+Git rather than rediscovering it — with one deliberate departure from
+how that work started: it goes straight to a real parser instead of
+regex, on the theory that inheriting SQL's original keyword-collision
+mistake would just mean re-fixing it later.
 
-The SQL work suggests the shape of the fix rather directly, and a
-few of its specific lessons are worth porting deliberately rather than
-rediscovering:
+- **Static import graph** (`core.git_dependency_extraction`): a
+  two-pass scan, same shape as `sql_ingestor.py`'s catalog-then-scan —
+  `git_ingestor.py`'s `_iter_files` now catalogs every filtered file
+  path from the single `get_git_tree(recursive=True)` call it already
+  made (cheap: paths only, no content) before fetching any file body,
+  then each file's content is scanned for import statements resolving
+  to another *cataloged* file, emitting `(subject, "imports", object)`
+  edges — written to `entity_edges` (`source="git"`) whenever
+  `ENABLE_GIT_DEPENDENCY_GRAPH=true` (default on, same "deterministic,
+  zero-marginal-cost parse pass" reasoning as `ENABLE_SQL_DEPENDENCY_GRAPH`).
+  Runs correctly in both `full` and `incremental` mode, since the
+  catalog only needs the path list, not content, so an import in a file
+  that wasn't re-fetched this run still resolves against the full
+  catalog.
+- **A real parser, not regex** — [tree-sitter](https://tree-sitter.github.io/tree-sitter/)
+  via `tree-sitter-language-pack` (prebuilt wheels, no per-language
+  toolchain), covering Python (`import`/`from ... import`, including
+  relative imports) and JavaScript/TypeScript (`import ... from`,
+  `require(...)`). An `import_statement`/`import_from_statement`/
+  `call_expression` node is structurally unambiguous, so the
+  keyword-collision bug class SQL's regex engine had to fix
+  after the fact (`RETURNS` colliding with a table named `Returns`, §8)
+  cannot happen here at all — there's no bare-keyword-adjacency
+  workaround to get right. Python absolute imports resolve by *path
+  suffix* against the known-file catalog (the repo root isn't
+  necessarily the top-level package root); a suffix matching more than
+  one file is treated as ambiguous and skipped, not guessed — same
+  "silence over noise" stance `find_references` documents for SQL.
+  Bare/npm-style JS/TS specifiers (`import x from 'react'`) are always
+  external packages and are silently skipped, never guessed at.
+- **Test fixture with the same deliberate structure** as the SQL
+  fixture's shared-vs-independent staging procedure:
+  [`fixtures/git/pyrepo/`](fixtures/git/pyrepo/) and
+  [`fixtures/git/jsrepo/`](fixtures/git/jsrepo/) — a shared `utils`
+  module imported by three-plus feature files across `import`,
+  `from X import Y`, `from X import submodule`, and multi-level
+  relative-import forms, plus an `independent.py`/`independent.js` file
+  that defines a same-named local helper but deliberately never imports
+  the shared module. `tests/test_git_dependency_extraction.py` (15
+  cases) asserts exact edge sets against these fixtures — no live
+  GitHub repo needed to test the parsing logic, unlike SQL Server.
+- **No DMV equivalent, so the live tool split by direction, not by
+  primary/fallback.** GitHub's API has nothing like
+  `sys.dm_sql_referenced_entities`. `mcp_server/tools/git_dependency_tools.py`
+  ships three tools (parity with the SQL trio): `git_dependency_graph`
+  (static BFS over the ingested graph, both directions — reuses the
+  same `bfs()` helper `sql_dependency_graph`'s traversal was refactored
+  into, `mcp_server/tools/_edge_bfs.py`, since the loop itself had no
+  SQL-specific logic to begin with), `github_file_content` (fetches a
+  file's current content straight from GitHub — parity with
+  `sql_object_definition`), and `github_file_dependencies`, which
+  genuinely splits by direction rather than layering a fallback: the
+  *upstream* direction (what a file imports) is live-primary — fetch
+  the file fresh and re-scan it, recursing hop-by-hop — since that's
+  cheap and always current; the *downstream* direction (what imports a
+  file — blast radius) has no live mechanism at all without scanning
+  the whole repo, so it defers entirely to the static graph, with
+  results tagged `"evidence": "live-scan"` vs `"evidence":
+  "static-graph"` so the caller can tell which is which. Both live
+  tools sit behind `ENABLE_GIT_DEPENDENCY_MCP_TOOLS` (default on — a
+  git PAT that can ingest can also read live content, so unlike
+  `ENABLE_SQL_DEPENDENCY_MCP_TOOLS` there's no permission mismatch to
+  guard against, but the flag stays for symmetry and to let an operator
+  disable live per-turn GitHub calls independently of the static graph).
+- **Prompt and forced-retry tuning, not just the tool** — the same
+  lesson §8's fourth bullet learned the hard way for SQL applied
+  proactively here instead of waiting to discover it live:
+  `HYBRID_SYSTEM_PROMPT` (`core/mcp_chain.py`) gained a Git tracing
+  section and a MANDATORY rule that any function/class named as
+  defining behavior in a Python/JS/TS file must have had
+  `github_file_content` called on it, and the existing forced-retry
+  loop (`missing_definition_calls` → `sql_object_definition`) now has a
+  Git-shaped sibling (`core.trace_completeness.missing_content_opens` →
+  `github_file_content`) wired into the *same* single-retry-per-turn
+  latch — a turn that skips both a MANDATORY SQL definition and a
+  MANDATORY file open still only gets one corrective round, naming both
+  gaps in one message, not two separate retries.
+  `tests/test_mcp_chain_forced_retry.py` covers the Git-only and
+  combined-SQL-and-Git cases with the same scripted-LLM scaffold used
+  for the original SQL test.
 
-- **Build the static graph the same way**: a two-pass approach — first
-  catalog every ingested file's stable identifier (`git_scope` +
-  `file_path`, already populated per file — see
-  `git_ingestor.py`'s `_file_to_resource`), then scan each file's
-  content for `import`/`from ... import` (Python) or
-  `import`/`require(` (JS/TS) statements resolving to another
-  cataloged file, emitting the same style of `(subject, "imports",
-  object)` edges `find_references` emits for SQL.
-- **Require an actual referencing keyword for any "bare" match, from
-  the start** — don't repeat the mistake that had to be fixed after
-  the fact for SQL (a bare word-boundary match on a module name
-  collided with an identically-named language keyword/table). Only
-  count a match when it directly follows `import`/`from`/`require(`,
-  not anywhere the module name string happens to appear.
-- **Consider a real parser instead of regex for the scan itself,
-  rather than inheriting SQL's original mistake.** No single tool
-  plays `sqlglot`'s role for general-purpose languages — they diverge
-  too much for one shared grammar — but
-  [tree-sitter](https://tree-sitter.github.io/tree-sitter/) is the
-  closest equivalent: one host library with a uniform query API, and
-  per-language grammars (Python, JS/TS, and anything else this repo
-  might ingest) available as prebuilt bindings (`tree-sitter-languages`
-  in Python) with no per-language toolchain to install — notably the
-  same technology GitHub itself uses for code navigation. An
-  `ImportStatement` node is unambiguous in a way no keyword-adjacency
-  regex rule can be, so it sidesteps the bare-match bug above entirely
-  rather than requiring the fix-after-the-fact discipline. It's still
-  syntactic only, not semantic, though — resolving `import foo.bar` to
-  the specific ingested `git_scope`/`file_path` in the graph would
-  still be work this codebase writes itself, the same relationship
-  `find_references` has to the SQL DMVs.
-- **Build a test fixture with the same deliberate structure**: a small
-  multi-file demo repo where several files import one shared utility
-  module, and at least one file that looks similar but deliberately
-  doesn't — mirroring the SQL fixture's shared-vs-independent staging
-  procedure — before trusting that the graph (or an LLM asked to trace
-  it) gets the distinction right.
-- **A live tool has no DMV equivalent to fall back on.** SQL Server
-  ships `sys.dm_sql_referenced_entities` for free; GitHub's REST API
-  has nothing like it. A live `github_file_dependencies` tool would
-  have to run the *same* regex-based `find_references`-style
-  extraction against the file's current content — there's no
-  authoritative live source to defer to the way the SQL tools defer to
-  the DMVs, so get the static/text-scan approach right first, since
-  it's not a fallback here — it's the only mechanism available live or
-  otherwise.
-- **Expect to need the same prompt/tool-budget tuning, not just the
-  tool.** Building `sql_object_definition` didn't change behaviour by
-  itself — closing the gap took a larger tool-call budget and a
-  mandatory, failure-framed instruction. A `github_file_dependencies`
-  tool should assume the same will be true rather than treating a
-  quiet rollout as sufficient.
+Not yet done: live end-to-end verification against a real GitHub repo +
+running MCP server (this session had no such infrastructure reachable,
+the same gap §11's live comparison hit for a real SQL Server) — what's
+verified today is the parser/extraction logic against the fixtures
+(unit tests) and the forced-retry wiring against a scripted LLM (unit
+tests), not a real model's tool-calling behavior against these prompts.
 
 ### 10. Full SQL AST parsing with `sqlglot` (column-level lineage)
 

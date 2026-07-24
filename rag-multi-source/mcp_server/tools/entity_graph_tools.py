@@ -37,6 +37,7 @@ from sqlalchemy import and_, or_
 
 from app.utils import get_db, list_accessible
 from core.live_acl import revalidate
+from mcp_server.tools._edge_bfs import bfs
 from models.entity_edge import EntityEdge
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -257,7 +258,6 @@ def query_entities(
 # ──────────────────────────────────────────────────────────────────────────────
 
 _MAX_HOPS_CEILING = 5
-_EDGES_PER_HOP_CAP = 500
 
 
 def traverse_sql_dependencies(
@@ -317,43 +317,11 @@ def traverse_sql_dependencies(
             clauses.append(EntityEdge.extraction_method == "deterministic")
         base_clause = and_(*clauses)
 
-        def _bfs(forward: bool) -> list[dict[str, Any]]:
-            visited = {object_name.lower()}
-            frontier = {object_name}
-            results: list[dict[str, Any]] = []
-            for hop in range(1, hops + 1):
-                if not frontier:
-                    break
-                match_col = EntityEdge.subject if forward else EntityEdge.object
-                rows = (
-                    db.query(EntityEdge)
-                    .filter(base_clause)
-                    .filter(or_(*[match_col.ilike(f"%{n}%") for n in frontier]))
-                    .limit(_EDGES_PER_HOP_CAP)
-                    .all()
-                )
-                next_frontier: set[str] = set()
-                for r in rows:
-                    results.append(
-                        {
-                            "hop": hop,
-                            "subject": r.subject,
-                            "predicate": r.predicate,
-                            "object": r.object,
-                        }
-                    )
-                    nxt = r.object if forward else r.subject
-                    if nxt.lower() not in visited:
-                        next_frontier.add(nxt)
-                        visited.add(nxt.lower())
-                frontier = next_frontier
-            return results
-
         edge_sets: dict[str, list[dict[str, Any]]] = {}
         if direction in ("upstream", "both"):
-            edge_sets["upstream"] = _bfs(forward=True)
+            edge_sets["upstream"] = bfs(db, base_clause, object_name, hops, forward=True)
         if direction in ("downstream", "both"):
-            edge_sets["downstream"] = _bfs(forward=False)
+            edge_sets["downstream"] = bfs(db, base_clause, object_name, hops, forward=False)
 
     total = sum(len(rows) for rows in edge_sets.values())
     parts: list[str] = []

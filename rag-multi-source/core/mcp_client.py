@@ -262,6 +262,55 @@ class MCPClient:
             },
         )
 
+    def git_dependency_graph(
+        self,
+        user_id: str,
+        git_scope: str,
+        file_path: str,
+        direction: str = "both",
+        max_hops: Optional[int] = None,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/git_dependency_graph",
+            {
+                "user_id": user_id,
+                "git_scope": git_scope,
+                "file_path": file_path,
+                "direction": direction,
+                "max_hops": max_hops,
+            },
+        )
+
+    def github_file_content(
+        self,
+        user_id: str,
+        git_scope: str,
+        file_path: str,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/github_file_content",
+            {"user_id": user_id, "git_scope": git_scope, "file_path": file_path},
+        )
+
+    def github_file_dependencies(
+        self,
+        user_id: str,
+        git_scope: str,
+        file_path: str,
+        direction: str = "both",
+        max_hops: Optional[int] = None,
+    ) -> MCPToolResult:
+        return self._post(
+            "/mcp/tools/github_file_dependencies",
+            {
+                "user_id": user_id,
+                "git_scope": git_scope,
+                "file_path": file_path,
+                "direction": direction,
+                "max_hops": max_hops,
+            },
+        )
+
     def close(self) -> None:
         try:
             self._client.close()
@@ -578,6 +627,150 @@ def build_mcp_tools(user_id: str) -> list[Any]:
                     "for 'trace X back to source'."
                 ),
                 args_schema=SqlObjectDependenciesArgs,
+            )
+        )
+
+    # Bound whenever the static Git import-dependency graph is populated
+    # at ingestion time — same precedent as ENABLE_SQL_DEPENDENCY_GRAPH
+    # above (README §9: applying the SQL impact-analysis lessons to Git).
+    if settings.ENABLE_GIT_DEPENDENCY_GRAPH:
+
+        class GitDependencyGraphArgs(BaseModel):
+            git_scope: str = Field(
+                ..., description="Repo scope, e.g. 'acme/widgets@main'."
+            )
+            file_path: str = Field(
+                ..., description="Repo-relative file path, e.g. 'src/utils.py'."
+            )
+            direction: str = Field(
+                default="both",
+                description=(
+                    "'downstream' = what imports this file (impact "
+                    "analysis / blast radius). 'upstream' = what this "
+                    "file imports (lineage). 'both' = both directions."
+                ),
+            )
+            max_hops: Optional[int] = Field(
+                default=None, description="Max traversal hops (default 3, max 5)."
+            )
+
+        def _run_git_dependency_graph(
+            git_scope: str,
+            file_path: str,
+            direction: str = "both",
+            max_hops: Optional[int] = None,
+        ) -> str:
+            result = client.git_dependency_graph(
+                user_id=user_id,
+                git_scope=git_scope,
+                file_path=file_path,
+                direction=direction,
+                max_hops=max_hops,
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_git_dependency_graph,
+                name="git_dependency_graph",
+                description=(
+                    "Traverse the static Git import-dependency graph "
+                    "built at ingestion time from Python/JS/TS import "
+                    "statements. Use direction='downstream' for 'what "
+                    "breaks if I change/rename this file' (blast "
+                    "radius), and direction='upstream' for 'what does "
+                    "this file depend on'. Returns hop-labeled (subject, "
+                    "predicate, object) edges. This is a STATIC, "
+                    "parse-time graph — an empty result is inconclusive, "
+                    "not proof of no dependency; it can't see dynamic "
+                    "imports."
+                ),
+                args_schema=GitDependencyGraphArgs,
+            )
+        )
+
+    # Live-catalog counterpart to ENABLE_GIT_DEPENDENCY_GRAPH — own flag,
+    # same precedent as ENABLE_SQL_DEPENDENCY_MCP_TOOLS.
+    if settings.ENABLE_GIT_DEPENDENCY_MCP_TOOLS:
+
+        class GithubFileContentArgs(BaseModel):
+            git_scope: str = Field(
+                ..., description="Repo scope, e.g. 'acme/widgets@main'."
+            )
+            file_path: str = Field(
+                ..., description="Repo-relative file path, e.g. 'src/utils.py'."
+            )
+
+        class GithubFileDependenciesArgs(BaseModel):
+            git_scope: str = Field(
+                ..., description="Repo scope, e.g. 'acme/widgets@main'."
+            )
+            file_path: str = Field(
+                ..., description="Repo-relative file path, e.g. 'src/utils.py'."
+            )
+            direction: str = Field(
+                default="both",
+                description=(
+                    "'downstream' = what imports this file (impact "
+                    "analysis / blast radius). 'upstream' = what this "
+                    "file imports (lineage). 'both' = both directions."
+                ),
+            )
+            max_hops: Optional[int] = Field(
+                default=None, description="Max traversal hops (default 3)."
+            )
+
+        def _run_github_file_content(git_scope: str, file_path: str) -> str:
+            result = client.github_file_content(
+                user_id=user_id, git_scope=git_scope, file_path=file_path
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        def _run_github_file_dependencies(
+            git_scope: str,
+            file_path: str,
+            direction: str = "both",
+            max_hops: Optional[int] = None,
+        ) -> str:
+            result = client.github_file_dependencies(
+                user_id=user_id,
+                git_scope=git_scope,
+                file_path=file_path,
+                direction=direction,
+                max_hops=max_hops,
+            )
+            return result.markdown if result.ok else f"ERROR: {result.error}"
+
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_github_file_content,
+                name="github_file_content",
+                description=(
+                    "Fetch the CURRENT, live content of a file straight "
+                    "from GitHub — not the (possibly stale) ingested/"
+                    "chunked copy. Use this whenever you need to open up "
+                    "a called function's or imported module's actual "
+                    "code rather than naming it."
+                ),
+                args_schema=GithubFileContentArgs,
+            )
+        )
+        tools.append(
+            StructuredTool.from_function(
+                func=_run_github_file_dependencies,
+                name="github_file_dependencies",
+                description=(
+                    "Check a file's dependencies against LIVE GitHub "
+                    "content. direction='upstream' freshly fetches the "
+                    "file (and, hop-by-hop, each file it imports) "
+                    "straight from GitHub — more authoritative than "
+                    "git_dependency_graph for this direction since it "
+                    "reflects the repo's current state. "
+                    "direction='downstream' (what imports this file) "
+                    "has no live equivalent, so it defers to the static "
+                    "graph instead."
+                ),
+                args_schema=GithubFileDependenciesArgs,
             )
         )
 

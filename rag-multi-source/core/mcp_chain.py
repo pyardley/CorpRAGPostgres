@@ -64,7 +64,11 @@ from core.mcp_client import build_mcp_tools, get_mcp_client
 from core.rag_chain import RAGAnswer, _format_context  # type: ignore[attr-defined]
 from core.retriever import RetrievedChunk, deduplicate_by_resource
 from core.sql_impact_engine import column_lineage_findings, join_shape_findings
-from core.trace_completeness import check_trace_completeness, missing_definition_calls
+from core.trace_completeness import (
+    check_trace_completeness,
+    missing_content_opens,
+    missing_definition_calls,
+)
 
 
 
@@ -89,13 +93,31 @@ MAX_TOOL_HOPS = 6
 # below instead of this loop's own final-answer path.
 _FORCED_RETRY_HOP_RESERVE = 2
 
-_FORCED_RETRY_TEMPLATE = (
-    "Before giving a final answer, you named the following function(s)/"
-    "procedure(s) without calling `sql_object_definition` on them: {names}. "
-    "Per the MANDATORY rule above, call `sql_object_definition` on each of "
-    "these now, quote their actual formula/logic, and only then give your "
-    "final answer."
+_FORCED_RETRY_SQL_CLAUSE = (
+    "you named the following function(s)/procedure(s) without calling "
+    "`sql_object_definition` on them: {names}"
 )
+_FORCED_RETRY_GIT_CLAUSE = (
+    "you referenced the following file(s) without calling "
+    "`github_file_content` on them: {names}"
+)
+
+
+def _forced_retry_message(unopened_sql: list[str], unopened_git: list[str]) -> str:
+    """Compose the corrective HumanMessage for whichever MANDATORY
+    rule(s) weren't satisfied this hop — SQL, Git, or both."""
+    clauses = []
+    if unopened_sql:
+        clauses.append(_FORCED_RETRY_SQL_CLAUSE.format(names=", ".join(unopened_sql)))
+    if unopened_git:
+        clauses.append(_FORCED_RETRY_GIT_CLAUSE.format(names=", ".join(unopened_git)))
+    return (
+        "Before giving a final answer, "
+        + "; and ".join(clauses)
+        + ". Per the MANDATORY rule(s) above, call the appropriate tool "
+        "on each of these now, quote their actual logic/content, and "
+        "only then give your final answer."
+    )
 
 
 HYBRID_SYSTEM_PROMPT = """You are CorporateRAG, an enterprise assistant with
@@ -111,6 +133,11 @@ TWO sources of truth and you are EXPECTED to use both:
    unchunked live object body), and `sql_object_dependencies` (live
    dependency-DMV traversal — see the tracing rules below for how these
    relate).
+3. **Live Git/GitHub tools (MCP)** — `git_dependency_graph` (static
+   import-dependency graph, built at ingestion time from Python/JS/TS
+   import statements), `github_file_content` (fetches a file's complete,
+   CURRENT content straight from GitHub), and `github_file_dependencies`
+   (live import re-scan — see the Git tracing rules below).
 
 Tool-call policy — read carefully:
 
@@ -180,6 +207,39 @@ calls on dependency lookups — budget the remaining hops for it. Before
 writing your final answer, check: for every function/procedure named
 in your draft, did you actually call `sql_object_definition` on it? If
 not, call it now, before responding.
+
+Git/GitHub tracing rules — read carefully when the question asks what a
+Git file imports, what would break if a file changed, or asks you to
+trace/explain behavior defined in another file:
+* Prefer `github_file_dependencies` over `git_dependency_graph` for the
+  "what does this file import" direction when you need certainty about
+  current repo state — it re-fetches and re-scans the file live, so it
+  reflects the repo's current content, not just what was true at the
+  last ingestion. For "what imports this file" (blast-radius questions),
+  there is no live equivalent (it would require scanning the whole
+  repo), so both tools fall back to the same static ingested graph for
+  that direction — treat an empty result as inconclusive, not proof of
+  no dependency, since neither tool can see dynamic imports.
+* For "what breaks if I change/rename this file" (blast-radius
+  questions), call one of these with `direction="downstream"` BEFORE
+  answering from RAG context alone — RAG retrieval is top-K similarity
+  search and has no guarantee it surfaced every file that imports this
+  one. For "what does this file depend on" (lineage questions), use
+  `direction="upstream"` the same way.
+* Name EVERY intermediate file in an import chain explicitly. Never
+  summarize or skip past an intermediate hop even if it seems minor.
+
+MANDATORY rule for any function, class, or module named as defining
+behavior in a Python/JS/TS file (anything you'd otherwise just name,
+e.g. "helper() comes from shared/utils.py"): you MUST call
+`github_file_content` on that file and quote its actual relevant
+code in your answer. This is a SEPARATE step from checking
+dependencies — confirming a file is *imported* via
+`github_file_dependencies`/`git_dependency_graph` does NOT satisfy this
+rule, and stopping there is a failure. Before writing your final answer,
+check: for every file named in your draft as defining behavior, did you
+actually call `github_file_content` on it? If not, call it now, before
+responding.
 """
 
 
@@ -303,6 +363,28 @@ def _execute_tool_call(
             direction=args.get("direction", "both"),
             max_hops=args.get("max_hops"),
         )
+    elif name == "git_dependency_graph":
+        result = client.git_dependency_graph(
+            user_id=user_id,
+            git_scope=args.get("git_scope", ""),
+            file_path=args.get("file_path", ""),
+            direction=args.get("direction", "both"),
+            max_hops=args.get("max_hops"),
+        )
+    elif name == "github_file_content":
+        result = client.github_file_content(
+            user_id=user_id,
+            git_scope=args.get("git_scope", ""),
+            file_path=args.get("file_path", ""),
+        )
+    elif name == "github_file_dependencies":
+        result = client.github_file_dependencies(
+            user_id=user_id,
+            git_scope=args.get("git_scope", ""),
+            file_path=args.get("file_path", ""),
+            direction=args.get("direction", "both"),
+            max_hops=args.get("max_hops"),
+        )
     else:
         return f"ERROR: unknown tool {name!r}", None
 
@@ -349,6 +431,29 @@ def _called_definition_targets(messages: list[Any]) -> set[str]:
             object_name = (args or {}).get("object_name")
             if object_name:
                 targets.add(object_name)
+    return targets
+
+
+def _called_content_targets(messages: list[Any]) -> set[str]:
+    """Every `file_path` argument passed to `github_file_content` in any
+    `AIMessage.tool_calls` entry in `messages` so far this turn — Git
+    analog of `_called_definition_targets`."""
+    targets: set[str] = set()
+    for msg in messages:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for call in tool_calls:
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
+            if name != "github_file_content":
+                continue
+            args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:  # noqa: BLE001
+                    args = {}
+            file_path = (args or {}).get("file_path")
+            if file_path:
+                targets.add(file_path)
     return targets
 
 
@@ -560,23 +665,29 @@ def answer_question_with_mcp(
             # _FORCED_RETRY_HOP_RESERVE's comment for why that's 2 hops,
             # not 1).
             if not forced_retry_used and hop < MAX_TOOL_HOPS - _FORCED_RETRY_HOP_RESERVE:
-                unopened = missing_definition_calls(
+                unopened_sql = missing_definition_calls(
                     hits, _called_definition_targets(messages)
                 )
-                if unopened:
+                unopened_git = missing_content_opens(
+                    hits, _called_content_targets(messages)
+                )
+                if unopened_sql or unopened_git:
                     forced_retry_used = True
+                    retry_tools = (
+                        (["sql_object_definition"] if unopened_sql else [])
+                        + (["github_file_content"] if unopened_git else [])
+                    )
                     record_step_timing(
                         steps,
-                        "forced_retry:sql_object_definition",
+                        "forced_retry:" + "+".join(retry_tools),
                         duration_ms=0,
                         hop=hop,
-                        missing=unopened,
+                        missing_sql=unopened_sql,
+                        missing_git=unopened_git,
                     )
                     messages.append(
                         HumanMessage(
-                            content=_FORCED_RETRY_TEMPLATE.format(
-                                names=", ".join(unopened)
-                            )
+                            content=_forced_retry_message(unopened_sql, unopened_git)
                         )
                     )
                     continue  # spend one more hop letting the model comply
@@ -612,6 +723,17 @@ def answer_question_with_mcp(
                         "were named but never opened via "
                         "`sql_object_definition`: "
                         + ", ".join(still_unopened)
+                        + "._"
+                    )
+                still_unopened_git = missing_content_opens(
+                    hits, _called_content_targets(messages)
+                )
+                t_post.extra["missing_content_opens"] = still_unopened_git
+                if still_unopened_git:
+                    text += (
+                        "\n\n_Note: the following file(s) were referenced "
+                        "but never opened via `github_file_content`: "
+                        + ", ".join(still_unopened_git)
                         + "._"
                     )
                 join_findings = join_shape_findings(question, hits)
@@ -731,6 +853,17 @@ def answer_question_with_mcp(
                 "\n\n_Note: the following function(s)/procedure(s) were "
                 "named but never opened via `sql_object_definition`: "
                 + ", ".join(still_unopened)
+                + "._"
+            )
+        still_unopened_git = missing_content_opens(
+            hits, _called_content_targets(messages)
+        )
+        t_post.extra["missing_content_opens"] = still_unopened_git
+        if still_unopened_git:
+            text += (
+                "\n\n_Note: the following file(s) were referenced but "
+                "never opened via `github_file_content`: "
+                + ", ".join(still_unopened_git)
                 + "._"
             )
         join_findings = join_shape_findings(question, hits)

@@ -520,10 +520,11 @@ class BaseIngestor(ABC):
 
         No-ops (returns 0) unless `settings.ENABLE_ENTITY_GRAPH` is set,
         or this is a SQL ingestor with `settings.ENABLE_SQL_DEPENDENCY_GRAPH`
-        set (see `app.ingestion.sql_ingestor` — a separate flag since the
-        SQL dependency graph is a deterministic, zero-cost regex pass,
-        not the LLM-relationship feature `ENABLE_ENTITY_GRAPH` gates).
-        The LLM extraction pass fails OPEN — an extraction error is
+        set, or a Git ingestor with `settings.ENABLE_GIT_DEPENDENCY_GRAPH`
+        set (see `app.ingestion.sql_ingestor` / `git_ingestor` — separate
+        flags since both dependency graphs are deterministic, zero-cost
+        parse passes, not the LLM-relationship feature `ENABLE_ENTITY_GRAPH`
+        gates). The LLM extraction pass fails OPEN — an extraction error is
         logged and skipped; deterministic edges (and the resource's
         chunks) still persist normally.
 
@@ -538,11 +539,23 @@ class BaseIngestor(ABC):
         edges alongside 67 clean deterministic ones from
         `core.sql_dependency_extraction.find_references`. SQL's
         dependency graph relies on the deterministic edges only.
+
+        Same reasoning carves out Git *file* resources (source code is the
+        same class of noise as a SQL object body) — but not Git *commit*
+        resources, whose text is a natural-language commit message, the
+        shape `core.entity_extraction`'s prompt is actually designed for.
         """
         sql_dependency_graph_active = (
             self.source == "sql" and settings.ENABLE_SQL_DEPENDENCY_GRAPH
         )
-        if not settings.ENABLE_ENTITY_GRAPH and not sql_dependency_graph_active:
+        git_dependency_graph_active = (
+            self.source == "git" and settings.ENABLE_GIT_DEPENDENCY_GRAPH
+        )
+        if (
+            not settings.ENABLE_ENTITY_GRAPH
+            and not sql_dependency_graph_active
+            and not git_dependency_graph_active
+        ):
             return 0
 
         edges: list[tuple[str, str, str, str]] = [
@@ -550,7 +563,10 @@ class BaseIngestor(ABC):
             for subject, predicate, obj in resource.entity_edges
         ]
 
-        if settings.ENABLE_ENTITY_EXTRACTION_LLM and self.source != "sql":
+        skip_llm_extraction = self.source == "sql" or (
+            self.source == "git" and resource.metadata.get("git_type") == "file"
+        )
+        if settings.ENABLE_ENTITY_EXTRACTION_LLM and not skip_llm_extraction:
             from core.entity_extraction import extract_entities
 
             # extract_entities() already fails open (logs + returns []),

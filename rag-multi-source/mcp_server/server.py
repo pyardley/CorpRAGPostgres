@@ -12,6 +12,9 @@ Exposes the tools defined in :mod:`mcp_server.tools.sql_tools` and
 * ``POST /mcp/tools/sql_dependency_graph`` — traverse the static SQL dependency graph
 * ``POST /mcp/tools/sql_object_definition`` — fetch a live, unchunked object body
 * ``POST /mcp/tools/sql_object_dependencies`` — traverse live SQL dependency DMVs
+* ``POST /mcp/tools/git_dependency_graph`` — traverse the static Git import graph
+* ``POST /mcp/tools/github_file_content`` — fetch a file's live content from GitHub
+* ``POST /mcp/tools/github_file_dependencies`` — live/static Git import-dependency check
 
 All ``/mcp/*`` endpoints require the ``X-MCP-Token`` header to match
 :attr:`mcp_server.config.mcp_settings.MCP_SHARED_TOKEN`.
@@ -36,7 +39,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from mcp_server.config import generate_token, mcp_settings
-from mcp_server.tools import entity_graph_tools, sql_schema_tools, sql_tools
+from mcp_server.tools import _git_engine, entity_graph_tools, git_dependency_tools, sql_schema_tools, sql_tools
 
 
 # Shared on-disk token location — kept in sync with app/mcp_manager.py so
@@ -146,6 +149,36 @@ class SQLObjectDependenciesRequest(BaseModel):
     )
 
 
+class GitDependencyGraphRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    git_scope: str = Field(..., description="Repo scope, e.g. 'owner/repo@branch'.")
+    file_path: str = Field(..., description="Repo-relative file path.")
+    direction: str = Field(
+        default="both", description="'upstream' | 'downstream' | 'both'."
+    )
+    max_hops: Optional[int] = Field(
+        default=None, description="Optional hop cap; clamped server-side."
+    )
+
+
+class GithubFileContentRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    git_scope: str = Field(..., description="Repo scope, e.g. 'owner/repo@branch'.")
+    file_path: str = Field(..., description="Repo-relative file path.")
+
+
+class GithubFileDependenciesRequest(BaseModel):
+    user_id: str = Field(..., description="Calling user's UUID.")
+    git_scope: str = Field(..., description="Repo scope, e.g. 'owner/repo@branch'.")
+    file_path: str = Field(..., description="Repo-relative file path.")
+    direction: str = Field(
+        default="both", description="'upstream' | 'downstream' | 'both'."
+    )
+    max_hops: Optional[int] = Field(
+        default=None, description="Optional hop cap; clamped server-side."
+    )
+
+
 class ToolEnvelope(BaseModel):
     """Uniform response envelope returned by every tool endpoint."""
 
@@ -193,6 +226,7 @@ async def lifespan(_: FastAPI):
     finally:
         logger.info("MCP server shutting down — disposing SQL engines.")
         sql_tools.shutdown()
+        _git_engine.shutdown()
 
 
 app = FastAPI(
@@ -222,6 +256,7 @@ async def list_tools() -> dict[str, Any]:
         "tools": sql_tools.TOOL_SPECS
         + entity_graph_tools.TOOL_SPECS
         + sql_schema_tools.TOOL_SPECS
+        + git_dependency_tools.TOOL_SPECS
     }
 
 
@@ -304,6 +339,52 @@ async def call_sql_object_dependencies(req: SQLObjectDependenciesRequest) -> Too
         user_id=req.user_id,
         db_name=req.db_name,
         object_name=req.object_name,
+        direction=req.direction,
+        max_hops=req.max_hops,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/git_dependency_graph",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_git_dependency_graph(req: GitDependencyGraphRequest) -> ToolEnvelope:
+    result = git_dependency_tools.dependency_graph(
+        user_id=req.user_id,
+        git_scope=req.git_scope,
+        file_path=req.file_path,
+        direction=req.direction,
+        max_hops=req.max_hops,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/github_file_content",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_github_file_content(req: GithubFileContentRequest) -> ToolEnvelope:
+    result = git_dependency_tools.file_content(
+        user_id=req.user_id,
+        git_scope=req.git_scope,
+        file_path=req.file_path,
+    )
+    return ToolEnvelope(**result.to_dict())
+
+
+@app.post(
+    "/mcp/tools/github_file_dependencies",
+    response_model=ToolEnvelope,
+    dependencies=[Depends(require_token)],
+)
+async def call_github_file_dependencies(req: GithubFileDependenciesRequest) -> ToolEnvelope:
+    result = git_dependency_tools.file_dependencies(
+        user_id=req.user_id,
+        git_scope=req.git_scope,
+        file_path=req.file_path,
         direction=req.direction,
         max_hops=req.max_hops,
     )

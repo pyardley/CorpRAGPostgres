@@ -148,6 +148,44 @@ class Settings(BaseSettings):
     # of seeing repeated tool-call failures.
     ENABLE_SQL_DEPENDENCY_MCP_TOOLS: bool = True
 
+    # Git/GitHub counterpart to ENABLE_SQL_DEPENDENCY_GRAPH (README
+    # "Possible enhancements" §9 -- applying the SQL impact-analysis
+    # lessons to Git repos): when on, GitIngestor statically parses each
+    # ingested Python/JS/TS file's import statements for references to
+    # other *ingested* files in the same repo (see
+    # `core.git_dependency_extraction.find_imports`, a real tree-sitter
+    # parse rather than the regex `find_references` uses for SQL -- an
+    # import node is structurally unambiguous, so there's no
+    # keyword-collision class of bug to work around here) and writes them
+    # to `entity_edges`, tagged `source="git", predicate="imports"`.
+    # Queryable via the `git_dependency_graph` MCP tool
+    # (`mcp_server/tools/git_dependency_tools.py`).
+    #
+    # Default on, unlike ENABLE_ENTITY_GRAPH, for the same reason as
+    # ENABLE_SQL_DEPENDENCY_GRAPH: a deterministic, zero-marginal-cost
+    # parse pass over content already fetched during ingestion, not an
+    # LLM call.
+    ENABLE_GIT_DEPENDENCY_GRAPH: bool = True
+
+    # Live-catalog counterpart to ENABLE_GIT_DEPENDENCY_GRAPH: binds two
+    # additional MCP tools on the hybrid chat path -- `github_file_content`
+    # (fetches a file's current content straight from GitHub, not the
+    # possibly-stale ingested copy) and `github_file_dependencies`
+    # (live-rescans a file's own imports, and for the reverse "what
+    # imports this" direction, falls back to the static graph above --
+    # GitHub has no DMV equivalent to defer to the way the SQL tools defer
+    # to sys.dm_sql_referenced_entities). See
+    # `mcp_server/tools/git_dependency_tools.py`.
+    #
+    # Separate flag, default on but easy to disable: unlike
+    # ENABLE_SQL_DEPENDENCY_MCP_TOOLS there's no extra DB permission this
+    # needs beyond what ingestion already required (a git PAT that can
+    # read repo contents for ingestion can also read them live) -- kept as
+    # its own flag anyway so an operator can turn off live per-turn GitHub
+    # API calls independently of the ingestion-time graph, same precedent
+    # as the SQL pair.
+    ENABLE_GIT_DEPENDENCY_MCP_TOOLS: bool = True
+
     # ── SQL impact-analysis engine ────────────────────────────────────────────
     #
     # Both SQL "impact analysis" subsystems above -- dependency-graph edge

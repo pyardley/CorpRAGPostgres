@@ -157,6 +157,93 @@ def missing_definition_calls(
     )
 
 
+def git_anchor(hits: list[RetrievedChunk]) -> Optional[RetrievedChunk]:
+    """
+    Git-file analog of `sql_anchor`: the single highest-scored ingested
+    Git *file* hit (excludes commit resources, which have no "imports"
+    concept). Same "anchor's own text is the only thing searched" stance,
+    for the same false-positive reason `sql_anchor`'s docstring explains.
+    """
+    git_hits = [
+        h
+        for h in hits
+        if h.source == "git" and (h.metadata or {}).get("git_type") == "file"
+    ]
+    return git_hits[0] if git_hits else None
+
+
+def _file_reference_tokens(file_path: str) -> list[str]:
+    """
+    Candidate textual forms a source file might use to reference
+    `file_path` in an import statement — unlike SQL, where the reference
+    syntax (`EXEC dbo.usp_Foo`) literally is the object's qualified name,
+    each language spells "a reference to this file" differently:
+    Python's `from pkg import module` / `import pkg.module` use a
+    dotted, extension-less form; JS/TS's `from './module'` uses a
+    slash-separated, usually extension-less relative path. Returns every
+    plausible form (basename without extension, full path without
+    extension, and the dotted-path form) so a substring check against
+    the anchor's raw text catches whichever one the language actually
+    used.
+    """
+    stem = file_path[: -len("." + file_path.rsplit(".", 1)[-1])] if "." in file_path.rsplit("/", 1)[-1] else file_path
+    basename = stem.rsplit("/", 1)[-1]
+    dotted = stem.replace("/", ".")
+    return sorted({basename, stem, dotted}, key=len, reverse=True)
+
+
+def candidate_referenced_files(hits: list[RetrievedChunk]) -> set[str]:
+    """
+    Same anchor-containment pattern as `candidate_callable_names`, keyed
+    on file path instead of SQL object name: other retrieved Git-file
+    hits any of whose `_file_reference_tokens` literally appears in the
+    anchor's own text — "should `github_file_content` have been called
+    on this file" (the MANDATORY rule in
+    `core.mcp_chain.HYBRID_SYSTEM_PROMPT`'s Git section).
+    """
+    anchor = git_anchor(hits)
+    if anchor is None:
+        return set()
+
+    anchor_text = anchor.text or ""
+    anchor_path = (anchor.metadata or {}).get("file_path")
+
+    paths: set[str] = set()
+    for hit in hits:
+        if hit.source != "git" or (hit.metadata or {}).get("git_type") != "file":
+            continue
+        file_path = (hit.metadata or {}).get("file_path")
+        if not file_path or file_path == anchor_path:
+            continue
+        if any(token in anchor_text for token in _file_reference_tokens(file_path)):
+            paths.add(file_path)
+    return paths
+
+
+def _bare_file_name(path: str) -> str:
+    """Basename of a repo-relative path, lowercased — mirrors
+    `_bare_object_name`'s "compare on the identifying tail" approach so a
+    tool-call argument's exact path form doesn't have to match byte-for-byte."""
+    return path.strip().rsplit("/", 1)[-1].lower()
+
+
+def missing_content_opens(
+    hits: list[RetrievedChunk], opened_paths: Iterable[str]
+) -> list[str]:
+    """
+    Git-file analog of `missing_definition_calls`: paths from
+    `candidate_referenced_files(hits)` not covered (by basename match) by
+    `opened_paths` — the `file_path` arguments actually passed to
+    `github_file_content` this turn.
+    """
+    opened_bare = {_bare_file_name(p) for p in opened_paths}
+    return sorted(
+        path
+        for path in candidate_referenced_files(hits)
+        if _bare_file_name(path) not in opened_bare
+    )
+
+
 def check_trace_completeness(
     question: str, hits: list[RetrievedChunk], answer: str
 ) -> list[str]:
