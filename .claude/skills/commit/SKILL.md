@@ -20,6 +20,7 @@ description: Summarise staged/unstaged changes, propose a conventional commit me
 
    Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
    ```
-5. Show the proposed message to the user and ask for confirmation or edits before proceeding.
-6. Once confirmed, stage any unstaged changes (`git add` the relevant files — do not use `git add .` unless the user approves), commit with the confirmed message, and push to the current branch.
-7. Report the resulting commit hash and the push status.
+5. Show the proposed message to the user, then use the AskUserQuestion tool with a single Yes/No-style question (e.g. header "Commit msg", options "Yes, commit" / "No, edit") to get confirmation — do not ask in plain text and wait for a free-form reply.
+6. If the user picks "Yes, commit", proceed immediately through staging, committing, and pushing without any further confirmation prompts. If they pick "No, edit" (or use the free-text option to request changes), revise the message and repeat step 5.
+7. Stage any unstaged changes (`git add` the relevant files — do not use `git add .` unless the user approves), commit with the confirmed message, and push to the current branch.
+8. Report the resulting commit hash and the push status.
