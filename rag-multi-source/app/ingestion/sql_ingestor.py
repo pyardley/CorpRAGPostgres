@@ -27,7 +27,7 @@ from loguru import logger
 from app.config import settings
 from app.ingestion.base import BaseIngestor, SourceResource
 from core.sql_ddl import render_table_ddl
-from core.sql_dependency_extraction import find_references
+from core.sql_impact_engine import find_references
 
 
 _SQL_ROUTINES = """

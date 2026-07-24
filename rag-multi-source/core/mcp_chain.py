@@ -63,6 +63,7 @@ from core.llm import get_llm
 from core.mcp_client import build_mcp_tools, get_mcp_client
 from core.rag_chain import RAGAnswer, _format_context  # type: ignore[attr-defined]
 from core.retriever import RetrievedChunk, deduplicate_by_resource
+from core.sql_impact_engine import column_lineage_findings, join_shape_findings
 from core.trace_completeness import check_trace_completeness, missing_definition_calls
 
 
@@ -613,6 +614,20 @@ def answer_question_with_mcp(
                         + ", ".join(still_unopened)
                         + "._"
                     )
+                join_findings = join_shape_findings(question, hits)
+                t_post.extra["join_shape_finding_count"] = len(join_findings)
+                if join_findings:
+                    text += (
+                        "\n\n_Note: possible row-inclusion risk from this "
+                        "object's own JOINs — " + "; ".join(join_findings) + "._"
+                    )
+                lineage_findings = column_lineage_findings(question, hits)
+                t_post.extra["column_lineage_finding_count"] = len(lineage_findings)
+                if lineage_findings:
+                    text += (
+                        "\n\n_Note: column-level lineage (sqlglot) — "
+                        + "; ".join(lineage_findings) + "._"
+                    )
             final_citations = citations + extra_citations
             logger.info(
                 "[mcp.chain] done after {} hop(s). tokens={} cost=${:.5f} "
@@ -717,6 +732,20 @@ def answer_question_with_mcp(
                 "named but never opened via `sql_object_definition`: "
                 + ", ".join(still_unopened)
                 + "._"
+            )
+        join_findings = join_shape_findings(question, hits)
+        t_post.extra["join_shape_finding_count"] = len(join_findings)
+        if join_findings:
+            text += (
+                "\n\n_Note: possible row-inclusion risk from this object's "
+                "own JOINs — " + "; ".join(join_findings) + "._"
+            )
+        lineage_findings = column_lineage_findings(question, hits)
+        t_post.extra["column_lineage_finding_count"] = len(lineage_findings)
+        if lineage_findings:
+            text += (
+                "\n\n_Note: column-level lineage (sqlglot) — "
+                + "; ".join(lineage_findings) + "._"
             )
 
     # The hop loop is the most likely place we'd want to know which step

@@ -2090,6 +2090,12 @@ rediscovering:
 
 ### 10. Full SQL AST parsing with `sqlglot` (column-level lineage)
 
+**Implemented and compared — see [§11](#11-sqlglot-vs-legacy-sql-impact-analysis-engine-built-and-compared)
+for what was actually found.** The discussion below is the original
+speculative cost/benefit analysis; it held up well against real testing,
+but read §11 for the measured outcome and the reasoning behind the
+default that was actually chosen.
+
 Both `core.sql_dependency_extraction` (the static dependency graph) and
 the join-shape awareness work in
 `plans/DataflowShapeAwarenessForSQLImpactPlan.md` deliberately parse
@@ -2130,3 +2136,117 @@ feature genuinely needs column-level lineage rather than table/JOIN-level
 structure — see the "not needed either" call in
 `DataflowShapeAwarenessForSQLImpactPlan.md`'s scope-decisions section
 for why the join-shape feature itself didn't reach for it.
+
+### 11. sqlglot vs. legacy SQL impact-analysis engine: built and compared
+
+`settings.SQL_IMPACT_ANALYSIS_ENGINE` (`app/config.py`) switches between
+the original regex/`sqlparse` engine (`"legacy"`, default) and a new
+`sqlglot`-AST-based one (`"sqlglot"`) for both `core.sql_dependency_extraction`
+and `core.sql_join_shape` together, plus a new capability neither engine
+had before: real column-level lineage (`core.sql_column_lineage`,
+`sqlglot`-only). Every call site imports from `core.sql_impact_engine`,
+the single dispatcher that reads the setting, rather than choosing an
+engine itself.
+
+**Spike findings** (against all 5 real report-building procedures in
+`fixtures/sql/06_reports.sql`, before writing any of the engine code):
+`sqlglot`'s `tsql` dialect parsed every one of them cleanly on the first
+try — `CREATE OR ALTER PROCEDURE ... AS BEGIN ... END`, `SELECT ... INTO
+#TempTable`, `;WITH CteName AS (...)` leading-semicolon CTEs, `EXEC
+dbo.proc`, `IF OBJECT_ID(...) IS NOT NULL DROP TABLE ...`, `TRUNCATE
+TABLE`, and `ROW_NUMBER()`/`LAG() OVER (PARTITION BY ...)` window
+functions all produced correct, structured AST nodes (`Select`, `Join`,
+`Where`, `With`, `Into`, `Execute`, `TruncateTable`), a materially
+cleaner result than `sqlparse` gave the join-shape feature (whose own
+`Where`-grouping was found to swallow far more than expected, crossing
+statement boundaries in undocumented ways — see §10's plan reference).
+One quirk found and designed around rather than fought: a single-line
+`IF cond stmt;` with no `BEGIN`/`END` gets parsed with every *subsequent*
+statement nested inside its `true` branch, recursively — harmless for a
+tree-walking approach (`find_all(...)` finds every `Select`/`Join`/etc.
+node regardless of nesting depth), but would have broken a design that
+assumed a flat top-level statement list.
+
+**Dependency-graph parity** (`core/sql_dependency_extraction_sqlglot.py`):
+all 8 of `tests/test_sql_dependency_extraction.py`'s cases mirrored
+exactly against the sqlglot engine, including the exact-set edge
+assertion on the churn-risk fixture — identical results. One structural
+improvement free of charge: the legacy engine's documented `RETURNS
+DECIMAL(12,2)` vs. a table literally named `dbo.Returns` false-positive
+(a whole keyword-adjacency workaround + regression test) cannot occur
+under a real AST at all, since `RETURNS` is a clause keyword and never
+an `exp.Table` node.
+
+**JOIN-shape parity + extra coverage** (`core/sql_join_shape_sqlglot.py`):
+11 of `tests/test_sql_join_shape.py`'s 12 cases mirrored exactly (the
+omitted one, tracing the procedure's own trailing CTE in isolation, is
+subsumed by the deliberate-CTE-skip test also mirrored), byte-identical
+finding wording on every overlapping case — confirmed not
+just in unit tests but live, through a real LLM call (see below), where
+both engines produced the identical JOIN-risk footer sentence for the
+same question against the same procedure. The sqlglot engine additionally
+surfaces RIGHT/FULL JOIN findings (two new templates) that the legacy
+engine recognizes but deliberately stays silent on — free under a real
+AST (`Join.side` already distinguishes LEFT/RIGHT/FULL), so there was no
+reason to withhold it just to stay artificially parity-locked. CTEs stay
+silent in both engines, unchanged.
+
+**Column-level lineage** (`core/sql_column_lineage.py`, new capability):
+rather than use `sqlglot.lineage.lineage()` directly — designed for
+lineage *within one query against a known schema*, not for chaining
+through several separate `SELECT ... INTO #Temp` statements with no
+external schema available — this hand-walks each output expression's
+leaf `Column` nodes, resolving each one's table alias via that
+statement's own FROM/JOIN alias map and recursing into an earlier stage
+whenever a leaf's table is itself a temp table (or CTE) the same
+procedure produced. Successfully chained the full 5-hop case on the
+first working version: tracing `Report_CustomerChurnRisk.TotalNetAmount`
+correctly walks back through the `Scored` CTE → `#Enriched` → `#RFM` →
+`#ActiveCustomerOrders` → the `dbo.fn_NetLineAmount(...)` call → the
+real base-table columns behind it
+(`dbo.OrderLines.{Quantity,UnitPrice,DiscountPct}`), rendered as one
+arrow-chain sentence. 7 tests cover this, from a simple 2-hop sanity
+case up through the full CTE-spanning chain (exact-string asserted) and
+silent-failure cases (unparseable text, no temp-table stages, ambiguous
+unqualified columns). Known limitation, by design: an expression's leaf
+columns are reported together, not attributed to a specific `CASE`
+branch or window-function partition — `lineage()`'s automatic branch
+attribution is traded away for not depending on schema-dict accuracy.
+
+**Live end-to-end comparison**: the same real tracing question used for
+the join-shape feature's own live verification — *"Show how
+Report_CustomerChurnRisk.TotalNetAmount is derived. Go right back to
+original source tables."* — run through `core.rag_chain.answer_question`
+twice against the identical literal procedure text, once per engine
+setting, with a real `gpt-4o-mini` call each time:
+
+| | `legacy` | `sqlglot` |
+|---|---|---|
+| `join_shape_finding_count` | 1 | 1 (identical wording) |
+| `column_lineage_finding_count` | 0 (no capability) | 1 |
+
+Both engines produced the byte-identical JOIN-risk footer sentence. The
+`sqlglot` run additionally appended a third footer: *"Note: column-level
+lineage (sqlglot) — `dbo.Report_CustomerChurnRisk.TotalNetAmount` ←
+`Scored.TotalNetAmount` ← `#Enriched.TotalNetAmount`
+(ISNULL(r.TotalNetAmount, 0)) ← `#RFM.TotalNetAmount` (SUM(NetAmount)) ←
+`#ActiveCustomerOrders.NetAmount`
+(dbo.fn_NetLineAmount(ol.Quantity, ol.UnitPrice, ol.DiscountPct)) ←
+`dbo.OrderLines.DiscountPct`, `dbo.OrderLines.Quantity`,
+`dbo.OrderLines.UnitPrice`."* (Live testing against the MCP/hybrid path
+with a real SQL Server + MCP server was not attempted — that
+infrastructure wasn't reachable in this session, same gap the join-shape
+feature's own live verification hit; the wiring is code-identical to the
+proven `rag_chain.py` path and covered by `tests/test_sql_impact_engine.py`'s
+dispatcher-routing tests.)
+
+**Default kept at `"legacy"`**, despite the sqlglot engine handling
+every real fixture procedure cleanly and matching (or exceeding) the
+legacy engine on every measured dimension. Reasoning: "handled this
+one fixture cleanly" is not the same evidence base `RETRIEVAL_MODE`'s
+`"hybrid"` default rests on (measured recall improvement across real
+production traffic), and this flag's own comment in `app/config.py`
+already sets that bar — dialect fidelity against *your own* schema and
+T-SQL idioms, not just this codebase's fixture, is what should justify
+flipping the default. Flip it once you've run both engines against your
+own production schema and confirmed the same parity/improvement holds.

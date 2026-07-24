@@ -1,7 +1,7 @@
 """
 Unit tests for core.trace_completeness.
 
-Covers the anchor-based candidate-name logic (_candidate_names,
+Covers the anchor-based candidate-name logic (candidate_names,
 candidate_callable_names) and the new missing_definition_calls check
 used by core.mcp_chain's forced-retry gate for the MANDATORY
 sql_object_definition rule.
@@ -11,8 +11,10 @@ from core.retriever import RetrievedChunk
 from core.trace_completeness import (
     _bare_object_name,
     candidate_callable_names,
+    candidate_names,
     check_trace_completeness,
     missing_definition_calls,
+    sql_anchor,
 )
 
 
@@ -145,3 +147,19 @@ def test_check_trace_completeness_unaffected_by_new_helpers():
     missing = check_trace_completeness(question, hits, answer_missing_enrichment)
     assert "#ActiveCustomerOrders" in missing
     assert "dbo.usp_BuildReport_MonthlySalesByRegion" not in missing
+
+
+def test_sql_anchor_and_candidate_names_rename_unchanged_behavior():
+    """Regression: renaming _sql_anchor -> sql_anchor and _candidate_names
+    -> candidate_names (to make them importable by core.sql_join_shape)
+    must not change either function's behavior — pure mechanical rename,
+    same call sites, same results as before."""
+    hits = _fixture_hits()
+    anchor = sql_anchor(hits)
+    assert anchor is not None
+    assert anchor.metadata["object_name"] == "dbo.usp_BuildReport_CustomerChurnRisk"
+
+    names = candidate_names(hits)
+    assert "#ActiveCustomerOrders" in names
+    assert "dbo.usp_BuildReport_CustomerChurnRisk" not in names  # self excluded
+    assert "dbo.usp_BuildReport_MonthlySalesByRegion" not in names  # unrelated sibling

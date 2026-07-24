@@ -43,7 +43,7 @@ def is_tracing_question(question: str) -> bool:
     return bool(_TRACING_KEYWORDS_RE.search(question or ""))
 
 
-def _sql_anchor(hits: list[RetrievedChunk]) -> Optional[RetrievedChunk]:
+def sql_anchor(hits: list[RetrievedChunk]) -> Optional[RetrievedChunk]:
     """
     The single highest-scored SQL hit — `hits` arrives pre-sorted by
     score, descending, from `core.retriever.retrieve` regardless of
@@ -65,17 +65,17 @@ def _sql_anchor(hits: list[RetrievedChunk]) -> Optional[RetrievedChunk]:
     return sql_hits[0] if sql_hits else None
 
 
-def _candidate_names(hits: list[RetrievedChunk]) -> set[str]:
+def candidate_names(hits: list[RetrievedChunk]) -> set[str]:
     """
     Candidates worth flagging if absent from the answer — deliberately
-    narrow, favoring silence over noise. See `_sql_anchor` for why only
+    narrow, favoring silence over noise. See `sql_anchor` for why only
     the anchor's own text is searched. Its own internal temp tables are
     always fair candidates; another retrieved object's name only counts
     if the anchor's own text literally references it. The anchor's own
     name is never a candidate against itself; not restating "I am now
     explaining X" isn't an omission.
     """
-    anchor = _sql_anchor(hits)
+    anchor = sql_anchor(hits)
     if anchor is None:
         return set()
 
@@ -96,14 +96,14 @@ def _candidate_names(hits: list[RetrievedChunk]) -> set[str]:
 
 def candidate_callable_names(hits: list[RetrievedChunk]) -> set[str]:
     """
-    Same anchor-containment pattern as `_candidate_names`, narrowed to
+    Same anchor-containment pattern as `candidate_names`, narrowed to
     hits whose `object_type` is `"procedure"`/`"function"` and dropping
     the temp-table half — this answers "should `sql_object_definition`
     have been called on this name" (the MANDATORY rule in
     `core.mcp_chain.HYBRID_SYSTEM_PROMPT`), not "was this name mentioned
-    in the answer text" (which `_candidate_names` already covers).
+    in the answer text" (which `candidate_names` already covers).
     """
-    anchor = _sql_anchor(hits)
+    anchor = sql_anchor(hits)
     if anchor is None:
         return set()
 
@@ -173,7 +173,7 @@ def check_trace_completeness(
     if not is_tracing_question(question):
         return []
 
-    candidates = _candidate_names(hits)
+    candidates = candidate_names(hits)
     if not candidates:
         return []
 

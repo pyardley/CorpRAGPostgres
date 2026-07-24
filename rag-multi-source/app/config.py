@@ -148,6 +148,49 @@ class Settings(BaseSettings):
     # of seeing repeated tool-call failures.
     ENABLE_SQL_DEPENDENCY_MCP_TOOLS: bool = True
 
+    # ── SQL impact-analysis engine ────────────────────────────────────────────
+    #
+    # Both SQL "impact analysis" subsystems above -- dependency-graph edge
+    # extraction (core.sql_dependency_extraction.find_references, feeding
+    # entity_edges at ingestion time and a live text-fallback in
+    # mcp_server/tools/sql_schema_tools.py) and the JOIN-direction
+    # row-inclusion-risk footer (core.sql_join_shape.join_shape_findings) --
+    # are regex/sqlparse (tokenizer, not a real parser) based by design. This
+    # flag switches BOTH together to a sqlglot-based engine instead: a real
+    # SQL AST parser with a dialect-aware tsql mode. All call sites import
+    # from core.sql_impact_engine, the single dispatcher that reads this
+    # setting, rather than reading it themselves.
+    #
+    # ``"legacy"`` -- current regex/sqlparse implementation for both
+    #     subsystems. No column-lineage footer at all (sqlglot-only
+    #     capability, see core.sql_column_lineage).
+    # ``"sqlglot"`` -- sqlglot-AST-based implementation for both subsystems,
+    #     plus the new column-lineage footer (which output column derives
+    #     from which input column/expression). Requires the ``sqlglot``
+    #     dependency (see requirements.txt).
+    #
+    # Affects the two subsystems on different timelines: dependency-graph
+    # edges are written to entity_edges once at ingestion time, so flipping
+    # this only changes what a FUTURE re-ingestion writes -- already-persisted
+    # edges don't retroactively change (same caveat ENABLE_SQL_DEPENDENCY_GRAPH
+    # already carries). The JOIN-shape and column-lineage footers re-parse the
+    # retrieved hit's text fresh every chat turn, so a flip takes effect on
+    # the very next turn.
+    #
+    # Default "legacy": unlike RETRIEVAL_MODE's "hybrid" default (backed by
+    # measured recall improvement), sqlglot's tsql dialect hasn't been
+    # validated against this codebase's own T-SQL fixtures the way the regex
+    # engine has (see README "SQL Server impact analysis: gaps found and
+    # closed"). A parser that throws or mis-groups on an untested construct is
+    # worse here than sqlparse's "silence over noise" default. See README
+    # "sqlglot vs. legacy SQL impact-analysis engine" for the measured
+    # comparison this flag resolves.
+    #
+    # Not sidebar-exposed, same category as ENABLE_ENTITY_GRAPH: a
+    # structural/architectural choice with re-ingestion and new-dependency
+    # implications, not a cheap per-query UI toggle like FTS_LANGUAGE.
+    SQL_IMPACT_ANALYSIS_ENGINE: Literal["legacy", "sqlglot"] = "legacy"
+
     # ── Semantic response cache ───────────────────────────────────────────────
     #
     # Repeated or near-duplicate questions currently re-run the full

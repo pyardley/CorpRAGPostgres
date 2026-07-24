@@ -51,7 +51,7 @@ from sqlalchemy import text as sql_text
 from app.utils import get_db, list_accessible
 from core.live_acl import revalidate
 from core.sql_ddl import render_table_ddl
-from core.sql_dependency_extraction import find_references
+from core.sql_impact_engine import find_references
 from mcp_server.config import mcp_settings
 from mcp_server.tools._sql_engine import get_engine
 

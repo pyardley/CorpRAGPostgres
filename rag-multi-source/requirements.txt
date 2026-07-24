@@ -70,6 +70,13 @@ fastapi>=0.115.0,<1.0
 uvicorn[standard]>=0.32.0,<1.0
 sqlparse>=0.5.1,<1.0
 
+# ── SQL impact-analysis engine (optional) ───────────────────────────────────
+# Only required when SQL_IMPACT_ANALYSIS_ENGINE=sqlglot (app/config.py) -- a
+# real SQL AST parser, alternative to the sqlparse-based default engine,
+# adding column-level lineage. See core/sql_impact_engine.py. Version
+# verified against this codebase's own T-SQL fixtures this session.
+sqlglot>=25.0.0,<31.0
+
 # ── HTML/content parsing ───────────────────────────────────────────────────
 beautifulsoup4>=4.12.0
 lxml>=5.3.0

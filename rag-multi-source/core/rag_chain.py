@@ -36,6 +36,7 @@ from app.utils import StepTimer, estimate_cost, extract_usage
 from core.corrective_retrieval import is_low_confidence
 from core.llm import get_llm
 from core.retriever import RetrievedChunk, deduplicate_by_resource
+from core.sql_impact_engine import column_lineage_findings, join_shape_findings
 from core.trace_completeness import check_trace_completeness
 
 
@@ -294,6 +295,20 @@ def answer_question(
                 "in the source but not mentioned above: "
                 + ", ".join(missing)
                 + "._"
+            )
+        join_findings = join_shape_findings(question, hits)
+        t_post.extra["join_shape_finding_count"] = len(join_findings)
+        if join_findings:
+            text += (
+                "\n\n_Note: possible row-inclusion risk from this object's own "
+                "JOINs — " + "; ".join(join_findings) + "._"
+            )
+        lineage_findings = column_lineage_findings(question, hits)
+        t_post.extra["column_lineage_finding_count"] = len(lineage_findings)
+        if lineage_findings:
+            text += (
+                "\n\n_Note: column-level lineage (sqlglot) — "
+                + "; ".join(lineage_findings) + "._"
             )
 
     logger.info(
