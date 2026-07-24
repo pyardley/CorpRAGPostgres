@@ -165,7 +165,14 @@ def _badges(state: SelectionState) -> str:
     if "confluence" in state.sources and state.confluence_spaces:
         parts.append(f"\U0001F7E2 Confluence ({len(state.confluence_spaces)})")
     if "sql" in state.sources and state.sql_databases:
-        suffix = " + ⚡MCP" if state.use_mcp_sql else ""
+        # Same "hybrid/MCP path is active" condition as used_mcp_path
+        # below, minus the ENABLE_ENTITY_GRAPH env-flag arm — that one's
+        # a pre-existing invisible admin setting and stays unreflected
+        # here. fts_language, unlike that flag, is a sidebar control the
+        # user just set, so silently changing answer behavior without
+        # visible feedback here would be confusing.
+        mcp_active = state.use_mcp_sql or state.fts_language == "simple"
+        suffix = " + ⚡MCP" if mcp_active else ""
         parts.append(f"\U0001F7E0 SQL ({len(state.sql_databases)}){suffix}")
     if "git" in state.sources and state.git_scopes:
         parts.append(f"\U0001F7E3 Git ({len(state.git_scopes)})")
@@ -241,8 +248,19 @@ def render_chat(state: SelectionState) -> None:
     # .env-level flag). Once an operator sets ENABLE_ENTITY_GRAPH=true,
     # every turn takes the hybrid/MCP path so the tool is available,
     # independent of whether the user has "Use Live SQL" on.
+    #
+    # "simple" search language is the user's own signal that they want
+    # literal/identifier matching over SQL objects (proc names, column
+    # names, error codes) rather than prose stemming — the same shape of
+    # question the SQL impact-analysis MCP tools (sql_dependency_graph /
+    # sql_object_definition / sql_object_dependencies) answer best. This
+    # augments retrieval rather than replacing it: `hits` below is
+    # computed identically either way, this only decides whether the LLM
+    # also gets the MCP tools bound.
     used_mcp_path = bool(
-        (state.use_mcp_sql and "sql" in state.sources) or settings.ENABLE_ENTITY_GRAPH
+        (state.use_mcp_sql and "sql" in state.sources)
+        or settings.ENABLE_ENTITY_GRAPH
+        or (state.fts_language == "simple" and "sql" in state.sources)
     )
 
     # Wall-clock the entire answer-generation cycle (retrieval + reasoning

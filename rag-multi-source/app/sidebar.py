@@ -523,8 +523,12 @@ def render_sidebar() -> SelectionState:
                 "retriever's keyword side, for this search only. "
                 "**english** stems and removes stop-words (best for "
                 "prose). **simple** lower-cases only (best for code, "
-                "identifiers, error codes). Both are always indexed — "
-                "switch any time."
+                "identifiers, error codes) — and for SQL Server, also "
+                "switches this turn onto the hybrid/MCP answering path "
+                "*in addition to* normal retrieval, giving the LLM the "
+                "impact-analysis tools (dependency graph, live object "
+                "definitions) alongside the usual results. Both configs "
+                "are always indexed — switch any time."
             ),
         )
 
