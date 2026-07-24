@@ -1502,7 +1502,19 @@ Every chat prompt produces two pieces of durable telemetry:
    (`"rag"` | `"hybrid"` | `"mcp_only"`), `fts_language` (`"english"` |
    `"simple"` | `NULL` — whichever the sidebar's "🔤 Search language" picker
    was set to for that turn; `NULL` for rows logged before this column
-   existed).
+   existed), plus a nine-column snapshot of the feature flags that were
+   live in `app.config.settings` when the row was written —
+   `response_cache_enabled`, `entity_graph_enabled`,
+   `query_rewrite_enabled`, `multimodal_ingestion_enabled`,
+   `rerank_enabled`, `corrective_retrieval_enabled`,
+   `live_acl_revalidation_enabled`, `sql_dependency_graph_enabled`,
+   `sql_dependency_mcp_tools_enabled` (all `BOOLEAN NULL`, populated by
+   `app.utils.log_query_audit` reading `settings` directly rather than
+   being passed in, since — unlike `fts_language` — they're global env
+   config, not a per-turn user choice; `NULL` for rows logged before
+   these columns existed). Lets a later look back at an old answer
+   correlate its behaviour with which optional pipeline stages were
+   actually active, without cross-referencing `.env` history.
 
 2. **`query_step_timings`** — N child rows per audit entry, one per measured
    step in the answer pipeline. Each row carries `step_name`, `duration_ms`,
@@ -2037,6 +2049,23 @@ rediscovering:
   collided with an identically-named language keyword/table). Only
   count a match when it directly follows `import`/`from`/`require(`,
   not anywhere the module name string happens to appear.
+- **Consider a real parser instead of regex for the scan itself,
+  rather than inheriting SQL's original mistake.** No single tool
+  plays `sqlglot`'s role for general-purpose languages — they diverge
+  too much for one shared grammar — but
+  [tree-sitter](https://tree-sitter.github.io/tree-sitter/) is the
+  closest equivalent: one host library with a uniform query API, and
+  per-language grammars (Python, JS/TS, and anything else this repo
+  might ingest) available as prebuilt bindings (`tree-sitter-languages`
+  in Python) with no per-language toolchain to install — notably the
+  same technology GitHub itself uses for code navigation. An
+  `ImportStatement` node is unambiguous in a way no keyword-adjacency
+  regex rule can be, so it sidesteps the bare-match bug above entirely
+  rather than requiring the fix-after-the-fact discipline. It's still
+  syntactic only, not semantic, though — resolving `import foo.bar` to
+  the specific ingested `git_scope`/`file_path` in the graph would
+  still be work this codebase writes itself, the same relationship
+  `find_references` has to the SQL DMVs.
 - **Build a test fixture with the same deliberate structure**: a small
   multi-file demo repo where several files import one shared utility
   module, and at least one file that looks similar but deliberately
@@ -2058,3 +2087,46 @@ rediscovering:
   mandatory, failure-framed instruction. A `github_file_dependencies`
   tool should assume the same will be true rather than treating a
   quiet rollout as sufficient.
+
+### 10. Full SQL AST parsing with `sqlglot` (column-level lineage)
+
+Both `core.sql_dependency_extraction` (the static dependency graph) and
+the join-shape awareness work in
+`plans/DataflowShapeAwarenessForSQLImpactPlan.md` deliberately parse
+SQL with `sqlparse` — a tokenizer/grouper, not a real parser — trading
+structural precision for a dependency already pinned in this codebase
+and a design that stays silent rather than guesses on anything it
+can't cleanly handle (CTEs, comma-joins, window functions, `APPLY`).
+
+`sqlglot` would remove that ceiling. It's a full parser that builds a
+typed AST per statement — `Select`, `Join`, `From`, `Where` as real
+node classes with structured arguments — so join type/table/condition
+come from `select.args["joins"]` directly instead of hand-walking a
+token stream and bailing at anything unrecognized. It understands
+dialect-specific SQL Server syntax (a `tsql` dialect) including
+`#temp` tables, `MERGE`/`OUTPUT`, `PIVOT`, CTEs, and window functions
+as first-class structure rather than constructs to detect-and-skip.
+Most notably, its `sqlglot.optimizer`/`lineage` modules can resolve
+**column-level lineage** — which output column derives from which
+input column, `*` expansion, alias resolution — a materially different
+(and more useful) capability than the table/JOIN-level structure this
+codebase currently extracts.
+
+Costs: it's a second SQL-parsing dependency alongside the
+already-pinned `sqlparse` (used in `core/sql_dependency_extraction.py`,
+`mcp_server/tools/sql_tools.py`), maintained indefinitely rather than
+reused; a much heavier package (parser generator + dialect tables +
+optimizer) than `sqlparse`'s lightweight tokenizer; and a
+dialect-fidelity risk — its T-SQL support, while solid, isn't
+guaranteed against every construct in this codebase's live schemas and
+fixtures, and a parser that throws or mis-groups on an edge case is
+worse here than `sqlparse`'s tolerant grouping, given this codebase's
+"silence over noise" design goal (see `core/trace_completeness.py`,
+`_candidate_names`'s docstring). Adopting it "properly" would also
+invite migrating the existing `sqlparse` call sites rather than
+running two parsers side by side — a materially bigger change than any
+single feature that would motivate it. Worth it only if a future
+feature genuinely needs column-level lineage rather than table/JOIN-level
+structure — see the "not needed either" call in
+`DataflowShapeAwarenessForSQLImpactPlan.md`'s scope-decisions section
+for why the join-shape feature itself didn't reach for it.

@@ -112,6 +112,23 @@ def _additive_columns() -> tuple[tuple[str, str, str], ...]:
         # Nullable so rows logged before this column existed just show
         # as unknown rather than a misleading default.
         ("query_audit_logs", "fts_language", "VARCHAR(16) NULL"),
+        # Snapshot of select feature-flag settings at the moment each row
+        # was written (see models.query_audit_log.QueryAuditLog for the
+        # full rationale). Nullable for the same "unknown, not a
+        # misleading default" reason as fts_language above.
+        ("query_audit_logs", "response_cache_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "entity_graph_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "query_rewrite_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "multimodal_ingestion_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "rerank_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "corrective_retrieval_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "live_acl_revalidation_enabled", "BOOLEAN NULL"),
+        ("query_audit_logs", "sql_dependency_graph_enabled", "BOOLEAN NULL"),
+        (
+            "query_audit_logs",
+            "sql_dependency_mcp_tools_enabled",
+            "BOOLEAN NULL",
+        ),
     )
 
 

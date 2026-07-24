@@ -1152,6 +1152,19 @@ def _load_audit_rows(
                         "model": audit.llm_model or "",
                         "error_message": audit.error_message or "",
                         "fts_language": audit.fts_language or "",
+                        # Feature-flag snapshot -- kept as True/False/None
+                        # (not coerced) so the detail view can distinguish
+                        # "off" from "unknown, logged before this column
+                        # existed".
+                        "response_cache_enabled": audit.response_cache_enabled,
+                        "entity_graph_enabled": audit.entity_graph_enabled,
+                        "query_rewrite_enabled": audit.query_rewrite_enabled,
+                        "multimodal_ingestion_enabled": audit.multimodal_ingestion_enabled,
+                        "rerank_enabled": audit.rerank_enabled,
+                        "corrective_retrieval_enabled": audit.corrective_retrieval_enabled,
+                        "live_acl_revalidation_enabled": audit.live_acl_revalidation_enabled,
+                        "sql_dependency_graph_enabled": audit.sql_dependency_graph_enabled,
+                        "sql_dependency_mcp_tools_enabled": audit.sql_dependency_mcp_tools_enabled,
                     }
                 )
     except Exception:  # noqa: BLE001
@@ -1380,6 +1393,27 @@ def _render_audit_log(self_user_id: str) -> None:
             f"**Completion tokens:** {chosen_row['tokens_completion']:,}  \n"
             f"**Cost:** {_format_cost_usd(chosen_row['cost_usd'])}"
         )
+
+    _FEATURE_FLAG_LABELS = {
+        "response_cache_enabled": "Response cache",
+        "entity_graph_enabled": "Entity graph",
+        "query_rewrite_enabled": "Query rewrite",
+        "multimodal_ingestion_enabled": "Multimodal ingestion",
+        "rerank_enabled": "Reranking",
+        "corrective_retrieval_enabled": "Corrective retrieval",
+        "live_acl_revalidation_enabled": "Live ACL revalidation",
+        "sql_dependency_graph_enabled": "SQL dependency graph",
+        "sql_dependency_mcp_tools_enabled": "SQL dependency MCP tools",
+    }
+    # True/False/None -> on/off/unknown (rows logged before these columns
+    # existed). Rendered as one caption line rather than a table row per
+    # flag to avoid crowding the two-column summary above.
+    flag_bits = []
+    for key, label in _FEATURE_FLAG_LABELS.items():
+        value = chosen_row.get(key)
+        icon = "✅" if value is True else ("❌" if value is False else "—")
+        flag_bits.append(f"{label}: {icon}")
+    st.caption("**Feature flags at query time:** " + " · ".join(flag_bits))
 
     if chosen_row["error_message"]:
         st.error(chosen_row["error_message"])

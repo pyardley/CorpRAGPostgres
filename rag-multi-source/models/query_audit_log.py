@@ -107,6 +107,26 @@ class QueryAuditLog(Base):
     # than a misleading default.
     fts_language = Column(String(16), nullable=True)
 
+    # Snapshot of select ``app.config.settings`` feature flags *at the
+    # moment this row was written* — unlike ``fts_language`` above these
+    # aren't a per-turn user choice, they're live env config that can
+    # change between deployments without a user knowing. Captured so a
+    # later look back at an old answer's behaviour (e.g. "why didn't
+    # reranking catch this?") doesn't require cross-referencing `.env`
+    # history. All nullable so rows logged before these columns existed
+    # show as unknown rather than a misleading default; populated by
+    # ``app.utils.log_query_audit`` reading ``settings`` directly, not
+    # passed in by the caller.
+    response_cache_enabled = Column(Boolean, nullable=True)
+    entity_graph_enabled = Column(Boolean, nullable=True)
+    query_rewrite_enabled = Column(Boolean, nullable=True)
+    multimodal_ingestion_enabled = Column(Boolean, nullable=True)
+    rerank_enabled = Column(Boolean, nullable=True)
+    corrective_retrieval_enabled = Column(Boolean, nullable=True)
+    live_acl_revalidation_enabled = Column(Boolean, nullable=True)
+    sql_dependency_graph_enabled = Column(Boolean, nullable=True)
+    sql_dependency_mcp_tools_enabled = Column(Boolean, nullable=True)
+
     user = relationship("User")
     step_timings = relationship(
         "QueryStepTiming",

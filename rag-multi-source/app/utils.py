@@ -669,6 +669,14 @@ def log_query_audit(
     fts_language
         ``"english"`` | ``"simple"`` — the sidebar's per-query "Search
         language" picker value for this turn (``SelectionState.fts_language``).
+
+    In addition to the parameters above, this also stamps each row with a
+    snapshot of select ``settings.*`` feature flags (response cache, entity
+    graph, query rewriting, multimodal ingestion, reranking, corrective
+    retrieval, live ACL revalidation, SQL dependency graph/MCP tools) —
+    read directly from the settings singleton, not passed in, since they're
+    global config rather than per-call data. See
+    ``models.query_audit_log.QueryAuditLog`` for the rationale.
     """
     if not settings.AUDIT_LOG_ENABLED:
         return None
@@ -697,6 +705,20 @@ def log_query_audit(
                 error_message=truncated_error,
                 source_type=source_type or "rag",
                 fts_language=fts_language or None,
+                # Feature-flag snapshot, read straight from the settings
+                # singleton (not a caller-supplied parameter, unlike
+                # fts_language above) since these are global env config,
+                # identical for every row written by this process. See
+                # models.query_audit_log.QueryAuditLog for why.
+                response_cache_enabled=settings.RESPONSE_CACHE_ENABLED,
+                entity_graph_enabled=settings.ENABLE_ENTITY_GRAPH,
+                query_rewrite_enabled=settings.QUERY_REWRITE_ENABLED,
+                multimodal_ingestion_enabled=settings.ENABLE_MULTIMODAL_INGESTION,
+                rerank_enabled=settings.RERANK_ENABLED,
+                corrective_retrieval_enabled=settings.CORRECTIVE_RETRIEVAL_ENABLED,
+                live_acl_revalidation_enabled=settings.LIVE_ACL_REVALIDATION_ENABLED,
+                sql_dependency_graph_enabled=settings.ENABLE_SQL_DEPENDENCY_GRAPH,
+                sql_dependency_mcp_tools_enabled=settings.ENABLE_SQL_DEPENDENCY_MCP_TOOLS,
             )
             db.add(row)
             db.flush()  # populate row.id
